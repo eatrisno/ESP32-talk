@@ -1,0 +1,2 @@
+# ESP32-S3 Walkie-Talkie Terminal Requirements
+pyserial>=3.5
