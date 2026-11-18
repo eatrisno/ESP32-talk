@@ -45,6 +45,7 @@ enum MsgType : uint8_t {
     MSG_RANGE_REQ  = 7,
     MSG_RANGE_RESP = 8,
     MSG_DISTRESS   = 9,
+    MSG_VOICEMAIL  = 10,
 };
 
 #pragma pack(push, 1)
@@ -53,7 +54,19 @@ struct DistressPayload {
     uint8_t  active; // 1 = SOS active, 0 = all-clear / cancelled
     char     name[12];
 };
+
+struct VoicemailPayload {
+    uint32_t vm_id;        // unique token for this voice message
+    uint16_t frame_index;  // 0 .. total_frames - 1
+    uint16_t total_frames; // total count of frames in this message
+    char     name[12];     // sender node name
+    int16_t  adpcm_pred;   // IMA ADPCM state
+    int8_t   adpcm_index;
+    uint8_t  data_len;     // bytes of ADPCM data (usually 160)
+    uint8_t  data[kAdpcmBytes]; // 160 bytes
+};
 #pragma pack(pop)
+static_assert(sizeof(VoicemailPayload) <= kMaxPlain, "VoicemailPayload exceeds max plain size");
 
 struct Header {
     uint8_t  type = 0;

@@ -19,6 +19,12 @@ bool talking();
 bool sending();          // mic open and voice detected right now
 bool receiving();        // somebody is being played
 
+// Voice mail recording hook
+typedef void (*VoicemailRecordCb)(const wt::AudioPayload& a);
+void set_recording_vm(bool on);
+bool recording_vm();
+void set_voicemail_cb(VoicemailRecordCb cb);
+
 // Local test: mic goes through the codec and jitter buffer straight back to the speaker.
 void set_loopback(bool on);
 bool loopback();

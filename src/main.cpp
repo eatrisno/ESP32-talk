@@ -259,17 +259,25 @@ void radar_check() {
     if (count == 0) printf("  No peers in range.\n\n");
     else printf("\n");
 
-    // Audio acoustic telemetry in headset using intuitive beep length:
-    // - Kuat (>= -70 dBm): Beep Panjang (~350ms)
-    // - Sedang (-71 s/d -88 dBm): Beep Sedang (~160ms)
-    // - Lemah (< -88 dBm / relay): Beep Pendek (~50ms)
-    // - 0 peer: descending double-boop
+    // Audio acoustic telemetry in headset:
+    // 1. Tell peer count with N distinct pips
+    // 2. Pause
+    // 3. Tell distance with intuitive beep duration
     if (count == 0) {
         // 0 peers: soft low descending tone (350Hz 80ms, gap 20ms, 250Hz 100ms)
         audio::tone(350, 80, 380);
         audio::tone(0, 20);
         audio::tone(250, 100, 380);
     } else {
+        // Step 1: N clear distinct pips for peer count (550Hz, 45ms each, gap 85ms)
+        int pips = count > 5 ? 5 : count;
+        for (int i = 0; i < pips; i++) {
+            audio::tone(550, 45, 380);
+            audio::tone(0, 85);
+        }
+        // Step 2: Pause 220ms so count is clearly separated from distance
+        audio::tone(0, 220);
+        // Step 3: Distance / signal strength beep length
         if (has_direct && best_rssi >= -70) {
             // Signal Kuat: BEEP PANJANG (620Hz, 350ms)
             audio::tone(620, 350, 400);
@@ -283,8 +291,154 @@ void radar_check() {
     }
 }
 
+// --- voice mail ------------------------------------------------------------------------
+
+struct VmFrame {
+    int16_t adpcm_pred;
+    int8_t  adpcm_index;
+    uint8_t data_len;
+    uint8_t data[wt::kAdpcmBytes]; // 160 bytes
+};
+
+struct VmStorage {
+    uint32_t vm_id = 0;
+    uint16_t total_frames = 0;
+    char name[12] = {};
+    VmFrame frames[250]; // up to 10 seconds (250 * 40ms = 10s)
+};
+
+static VmStorage* s_vm_storage = nullptr;
+static bool s_vm_recording = false;
+static bool s_vm_outbox_pending = false;
+static uint32_t s_last_played_vm_id = 0;
+
+void chime_voicemail_prompt() {
+    // Rising 3-tone record start prompt: 440Hz -> 660Hz -> 880Hz
+    audio::tone(440, 40, 380);
+    audio::tone(0, 20);
+    audio::tone(660, 40, 380);
+    audio::tone(0, 20);
+    audio::tone(880, 60, 400);
+}
+
+void chime_voicemail_send() {
+    // Rising confirmation swoosh: 600Hz -> 900Hz
+    audio::tone(600, 45, 380);
+    audio::tone(0, 20);
+    audio::tone(900, 75, 420);
+}
+
+void chime_voicemail_received() {
+    // Distinct answering-machine / dispatcher chime: C5 (523Hz) -> E5 (659Hz) -> G5 (784Hz)
+    audio::tone(523, 70, 400);
+    audio::tone(0, 30);
+    audio::tone(659, 70, 400);
+    audio::tone(0, 30);
+    audio::tone(784, 100, 420);
+}
+
+void on_voicemail_captured_frame(const wt::AudioPayload& a) {
+    if (!s_vm_recording || !s_vm_storage) return;
+    if (s_vm_storage->total_frames >= 250) {
+        // 10 seconds maximum reached: stop recording automatically
+        s_vm_recording = false;
+        audio::set_recording_vm(false);
+        audio::tone(700, 50, 400);
+        printf("[Voice Mail] Max 10s recording reached. Press 1x to send.\n");
+        return;
+    }
+    VmFrame& f = s_vm_storage->frames[s_vm_storage->total_frames++];
+    f.adpcm_pred = a.adpcm_pred;
+    f.adpcm_index = static_cast<int8_t>(a.adpcm_index);
+    f.data_len = a.data_len > wt::kAdpcmBytes ? wt::kAdpcmBytes : a.data_len;
+    memcpy(f.data, a.data, f.data_len);
+}
+
+void start_voicemail_recording() {
+    if (s_vm_recording) return;
+    if (!s_vm_storage) {
+        s_vm_storage = static_cast<VmStorage*>(malloc(sizeof(VmStorage)));
+        if (!s_vm_storage) {
+            ESP_LOGE(TAG, "Not enough RAM for voice mail recording");
+            audio::tone(250, 80, 400);
+            return;
+        }
+    }
+    s_vm_storage->vm_id = esp_random();
+    s_vm_storage->total_frames = 0;
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    memcpy(s_vm_storage->name, s_name, sizeof(s_vm_storage->name));
+    xSemaphoreGive(s_app_mtx);
+
+    s_vm_recording = true;
+    audio::set_voicemail_cb(on_voicemail_captured_frame);
+    audio::set_recording_vm(true);
+
+    chime_voicemail_prompt();
+    led::flash(led::Color::Amber, 200);
+    printf("\n*** [VOICE MAIL RECORDING] Speak your message now (max 10s). Click button 1x when done to SEND. ***\n\n");
+}
+
+void flush_voicemail_to_mesh() {
+    if (!s_vm_storage || s_vm_storage->total_frames == 0) return;
+    uint16_t total = s_vm_storage->total_frames;
+    printf("[Voice Mail] Broadcasting %u frames (%.1fs) to mesh...\n", total, total * 0.04f);
+    for (uint16_t i = 0; i < total; i++) {
+        wt::VoicemailPayload vp;
+        vp.vm_id = s_vm_storage->vm_id;
+        vp.frame_index = i;
+        vp.total_frames = total;
+        memcpy(vp.name, s_vm_storage->name, sizeof(vp.name));
+        vp.adpcm_pred = s_vm_storage->frames[i].adpcm_pred;
+        vp.adpcm_index = s_vm_storage->frames[i].adpcm_index;
+        vp.data_len = s_vm_storage->frames[i].data_len;
+        memcpy(vp.data, s_vm_storage->frames[i].data, vp.data_len);
+
+        radio::send(wt::MSG_VOICEMAIL, reinterpret_cast<const uint8_t*>(&vp), sizeof(vp));
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    printf("[Voice Mail] Transmission complete.\n");
+    free(s_vm_storage);
+    s_vm_storage = nullptr;
+    s_vm_outbox_pending = false;
+}
+
+void send_voicemail() {
+    if (s_vm_recording) {
+        s_vm_recording = false;
+        audio::set_recording_vm(false);
+    }
+    if (!s_vm_storage || s_vm_storage->total_frames == 0) {
+        printf("[Voice Mail] No audio recorded.\n");
+        if (s_vm_storage) { free(s_vm_storage); s_vm_storage = nullptr; }
+        return;
+    }
+    chime_voicemail_send();
+
+    uint32_t now = now_ms();
+    int active_peers = 0;
+    radio::peers_lock();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (p->used && (now - p->last_ms <= 15000)) active_peers++;
+    }
+    radio::peers_unlock();
+
+    if (active_peers > 0) {
+        flush_voicemail_to_mesh();
+        led::flash(led::Color::Cyan, 120);
+        audio::tone(800, 30, 350);
+    } else {
+        s_vm_outbox_pending = true;
+        audio::tone(500, 60, 380);
+        audio::tone(0, 30);
+        audio::tone(400, 80, 380);
+        printf("[Voice Mail] Out of range (0 peers). Saved to outbox (%u frames, %.1fs). Will auto-send when a node is detected!\n",
+               s_vm_storage->total_frames, s_vm_storage->total_frames * 0.04f);
+    }
+}
+
 static uint32_t s_last_talk_click_ms = 0;
-static bool s_pending_single_talk = false;
+static uint8_t  s_talk_click_count = 0;
 
 void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
@@ -293,20 +447,29 @@ void handle_press(wt::Press p, int which) {
     if (which == 0) {
         if (s_distress_active) {
             // Any click or press while distress is active immediately cancels it!
-            s_pending_single_talk = false;
+            s_talk_click_count = 0;
             toggle_distress();
             return;
         }
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
-            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 450)) {
-                // Double click: cancel single click and run radar check
-                s_pending_single_talk = false;
-                ESP_LOGI(TAG, "Double click: radar check");
-                radar_check();
+            if (s_vm_recording) {
+                // In voice mail recording mode: click means STOP & SEND!
+                s_talk_click_count = 0;
+                send_voicemail();
+                return;
+            }
+            if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= 450)) {
+                s_talk_click_count++;
+                s_last_talk_click_ms = now;
+                if (s_talk_click_count >= 3) {
+                    // Triple click: start Voice Mail record!
+                    s_talk_click_count = 0;
+                    ESP_LOGI(TAG, "Triple click: start Voice Mail recording");
+                    start_voicemail_recording();
+                }
             } else {
-                // First click: wait up to 450ms to see if a second click arrives
-                s_pending_single_talk = true;
+                s_talk_click_count = 1;
                 s_last_talk_click_ms = now;
             }
         } else if (p == wt::Press::Long) {
@@ -316,7 +479,7 @@ void handle_press(wt::Press p, int which) {
             audio::tone(750, 25, 350);
         } else if (p == wt::Press::Hold) {
             // 2.5s hold: trigger distress signal!
-            s_pending_single_talk = false;
+            s_talk_click_count = 0;
             toggle_distress();
         }
     }
@@ -425,6 +588,29 @@ void on_rx(const radio::Rx& rx) {
                            dp.name, (unsigned long)dp.sender);
                     sound_all_clear();
                 }
+            }
+            break;
+        }
+        case wt::MSG_VOICEMAIL: {
+            if (rx.len >= sizeof(wt::VoicemailPayload)) {
+                wt::VoicemailPayload vp;
+                memcpy(&vp, rx.plain, sizeof(vp));
+                vp.name[sizeof(vp.name) - 1] = 0;
+                if (vp.vm_id != s_last_played_vm_id) {
+                    s_last_played_vm_id = vp.vm_id;
+                    chime_voicemail_received();
+                    led::flash(led::Color::Cyan, 150);
+                    printf("\n*** [VOICE MAIL RECEIVED] from %-11s (%u frames, %.1fs) ***\n\n",
+                           vp.name[0] ? vp.name : "?", vp.total_frames, vp.total_frames * 0.04f);
+                }
+                wt::AudioPayload a;
+                a.voice_id = static_cast<uint8_t>(vp.vm_id & 0xFF);
+                a.frame_no = vp.frame_index;
+                a.adpcm_pred = vp.adpcm_pred;
+                a.adpcm_index = static_cast<uint8_t>(vp.adpcm_index);
+                a.data_len = vp.data_len > wt::kAdpcmBytes ? wt::kAdpcmBytes : vp.data_len;
+                a.data = vp.data;
+                audio::on_audio(id, a);
             }
             break;
         }
@@ -585,6 +771,8 @@ void selftest() {
 void help() {
     printf("\n  t          talk on/off (same as BOOT or headset button click)\n"
            "  r / c      radar: check peer count and distance (same as double click)\n"
+           "  vm         record voice mail / send (same as triple click, then click to send)\n"
+           "  send       send recorded voice mail (or flush outbox)\n"
            "  sos        distress SOS on/off (same as holding button 2.5s)\n"
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
@@ -616,6 +804,11 @@ void console_task(void*) {
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
+        else if (!strcmp(line, "vm") || !strcmp(line, "record")) {
+            if (s_vm_recording) send_voicemail();
+            else start_voicemail_recording();
+        }
+        else if (!strcmp(line, "send")) send_voicemail();
         else if (!strcmp(line, "sos") || !strcmp(line, "distress")) toggle_distress();
         else if (!strncmp(line, "range", 5) || !strcmp(line, "test")) {
             int count = 20;
@@ -772,10 +965,34 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Handle pending single talk click timeout (450 ms)
-        if (s_pending_single_talk && (now - s_last_talk_click_ms > 450)) {
-            s_pending_single_talk = false;
-            toggle_talk();
+        // Handle pending click evaluation (450 ms after last click)
+        if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > 450)) {
+            uint8_t count = s_talk_click_count;
+            s_talk_click_count = 0;
+            if (count == 1) {
+                toggle_talk();
+            } else if (count == 2) {
+                ESP_LOGI(TAG, "Double click: radar check");
+                radar_check();
+            }
+        }
+
+        // Voice mail outbox: automatically deliver stored voice mail when a peer reconnects
+        if (s_vm_outbox_pending && s_vm_storage && s_vm_storage->total_frames > 0) {
+            uint32_t now_check = now;
+            bool has_peer = false;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used && (now_check - p->last_ms <= 15000)) { has_peer = true; break; }
+            }
+            radio::peers_unlock();
+            if (has_peer) {
+                printf("\n[Voice Mail] Peer detected! Automatically sending outbox voice mail...\n");
+                flush_voicemail_to_mesh();
+                audio::tone(750, 40, 380);
+                audio::tone(0, 20);
+                audio::tone(850, 50, 380);
+            }
         }
 
         // Auto-mute a mic that has been left open too long (disabled when kMaxTalkMs == 0).

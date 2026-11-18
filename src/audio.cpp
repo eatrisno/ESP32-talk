@@ -34,6 +34,8 @@ Talker s_talkers[kMaxTalkers];
 wt::ToneQueue s_tones;
 wt::JitterBuffer s_loop;           // loopback path
 volatile bool s_talking = false, s_sending = false, s_receiving = false, s_loopback = false;
+volatile bool s_recording_vm = false;
+VoicemailRecordCb s_vm_cb = nullptr;
 volatile uint8_t s_volume = 70;
 Stats s_stats;
 
@@ -100,7 +102,7 @@ void mic_task(void*) {
             peak_blocks = 0;
         }
         size_t m = rs.process(mono, n, v8, 512);
-        bool active = s_talking || s_loopback;
+        bool active = s_talking || s_loopback || s_recording_vm;
         for (size_t i = 0; i < m; i++) {
             frame[fill++] = v8[i];
             if (fill < wt::kFrameSamples) continue;
@@ -110,6 +112,18 @@ void mic_task(void*) {
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
             agc.process(frame, wt::kFrameSamples, gate.speech_now());
             if (!active) continue;
+            if (s_recording_vm) {
+                wt::AudioPayload a;
+                uint8_t bytes[wt::kAdpcmBytes];
+                a.voice_id = voice_id;
+                a.frame_no = frame_no++;
+                a.adpcm_pred = enc.predictor;
+                a.adpcm_index = static_cast<uint8_t>(enc.index);
+                a.data_len = wt::adpcm_encode(frame, wt::kFrameSamples, bytes, enc);
+                a.data = bytes;
+                if (s_vm_cb) s_vm_cb(a);
+                continue;
+            }
             if (!cfg::kContinuousStream && !voice && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
@@ -241,6 +255,10 @@ bool loopback() { return s_loopback; }
 
 void set_volume(uint8_t p) { s_volume = p > 100 ? 100 : p; }
 uint8_t volume() { return s_volume; }
+
+void set_recording_vm(bool on) { s_recording_vm = on; }
+bool recording_vm() { return s_recording_vm; }
+void set_voicemail_cb(VoicemailRecordCb cb) { s_vm_cb = cb; }
 
 void tone(uint16_t freq, uint16_t ms, uint16_t amp) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
