@@ -22,8 +22,11 @@ PROMPT_MAP = [
     ('PROMPT_NEARBY',        'nearby.wav'),
     ('PROMPT_MIDDLE',        'middle.wav'),
     ('PROMPT_FAR',           'far.wav'),
-    ('PROMPT_MIC_ON',        'microphone enabled.wav'),
-    ('PROMPT_MIC_OFF',       'microphone muted.wav'),
+    ('PROMPT_MIC_ON',        ('microphone.wav', 'enabled.wav')),
+    ('PROMPT_MIC_OFF',       ('microphone.wav', 'disabled.wav')),
+    ('PROMPT_MICROPHONE',    'microphone.wav'),
+    ('PROMPT_ENABLED',       'enabled.wav'),
+    ('PROMPT_DISABLED',      'disabled.wav'),
     ('PROMPT_VM_RECORDING',  'voice note recording.wav'),
     ('PROMPT_VM_SENT',       'message sent.wav'),
     ('PROMPT_VM_OUTBOX',     'saved to outbox.wav'),
@@ -39,7 +42,7 @@ PROMPT_MAP = [
 TARGET_SR = 16000
 TARGET_PEAK = 24000.0  # Safe headroom below 32767
 
-def process_file(path):
+def process_single_file(path):
     with wave.open(path, 'rb') as w:
         sr_in = w.getframerate()
         ch = w.getnchannels()
@@ -53,8 +56,8 @@ def process_file(path):
         threshold = 500
         idx = np.where(np.abs(raw) > threshold)[0]
         if len(idx) > 0:
-            start = max(0, idx[0] - int(0.03 * sr_in))
-            end = min(len(raw), idx[-1] + int(0.04 * sr_in))
+            start = max(0, idx[0] - int(0.02 * sr_in))
+            end = min(len(raw), idx[-1] + int(0.03 * sr_in))
             raw = raw[start:end]
 
         # Resample to 16,000 Hz
@@ -72,12 +75,37 @@ def process_file(path):
             resampled[:fade_len] = (resampled[:fade_len] * fade_in).astype(np.int16)
             resampled[-fade_len:] = (resampled[-fade_len:] * fade_out).astype(np.int16)
 
-        # Normalize volume
-        peak = np.max(np.abs(resampled))
-        if peak > 0:
-            resampled = (resampled * (TARGET_PEAK / peak)).astype(np.int16)
-
         return resampled
+
+def process_prompt(assets_dir, item):
+    if isinstance(item, (list, tuple)):
+        pieces = []
+        label = " + ".join(item)
+        gap = np.zeros(int(0.035 * TARGET_SR), dtype=np.int16)  # 35ms pause between words
+        for idx, subfile in enumerate(item):
+            fpath = os.path.join(assets_dir, subfile)
+            if not os.path.exists(fpath):
+                print(f"Warning: Missing {subfile}, skipping")
+                return None, None
+            samples = process_single_file(fpath)
+            if idx > 0:
+                pieces.append(gap)
+            pieces.append(samples)
+        combined = np.concatenate(pieces)
+        peak = np.max(np.abs(combined))
+        if peak > 0:
+            combined = (combined * (TARGET_PEAK / peak)).astype(np.int16)
+        return label, combined
+    else:
+        fpath = os.path.join(assets_dir, item)
+        if not os.path.exists(fpath):
+            print(f"Warning: Missing {item}, skipping")
+            return None, None
+        samples = process_single_file(fpath)
+        peak = np.max(np.abs(samples))
+        if peak > 0:
+            samples = (samples * (TARGET_PEAK / peak)).astype(np.int16)
+        return item, samples
 
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,15 +117,13 @@ def main():
     total_bytes = 0
 
     print("Processing audio files from:", assets_dir)
-    for p_enum, fname in PROMPT_MAP:
-        fpath = os.path.join(assets_dir, fname)
-        if not os.path.exists(fpath):
-            print(f"Warning: Missing {fname}, skipping")
+    for p_enum, item in PROMPT_MAP:
+        label, samples = process_prompt(assets_dir, item)
+        if samples is None:
             continue
-        samples = process_file(fpath)
-        processed[p_enum] = (fname, samples)
+        processed[p_enum] = (label, samples)
         total_bytes += len(samples) * 2
-        print(f"  {p_enum:22s} ({fname:24s}): {len(samples)/TARGET_SR:.2f}s ({len(samples)} samples, {len(samples)*2/1024:.1f} KB)")
+        print(f"  {p_enum:22s} ({label:35s}): {len(samples)/TARGET_SR:.2f}s ({len(samples)} samples, {len(samples)*2/1024:.1f} KB)")
 
     print(f"\nTotal Prompts Size: {total_bytes / 1024:.1f} KB ({total_bytes} bytes)\n")
 
