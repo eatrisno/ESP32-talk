@@ -32,6 +32,7 @@ struct Talker {
 SemaphoreHandle_t s_mtx;           // guards talkers, tones, loopback buffer
 Talker s_talkers[kMaxTalkers];
 wt::ToneQueue s_tones;
+wt::PromptQueue s_prompts;
 wt::JitterBuffer s_loop;           // loopback path
 volatile bool s_talking = false, s_sending = false, s_receiving = false, s_loopback = false;
 volatile bool s_recording_vm = false;
@@ -213,6 +214,7 @@ void spk_task(void*) {
         if (any) s_stats.frames_played++;
         float tone_vol = 0.3f + 0.7f * g;  // scales with volume, but stays softly audible
         s_tones.render(mix, wt::kFrameSamples, tone_vol);
+        s_prompts.render(mix, wt::kFrameSamples, tone_vol);
         xSemaphoreGive(s_mtx);
         s_receiving = talkers > 0;
         s_stats.talkers = talkers;
@@ -263,6 +265,18 @@ void set_voicemail_cb(VoicemailRecordCb cb) { s_vm_cb = cb; }
 void tone(uint16_t freq, uint16_t ms, uint16_t amp) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_tones.push(freq, ms, amp);
+    xSemaphoreGive(s_mtx);
+}
+
+void prompt(wt::PromptId id) {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_prompts.push(id);
+    xSemaphoreGive(s_mtx);
+}
+
+void prompt_clear() {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_prompts.clear();
     xSemaphoreGive(s_mtx);
 }
 

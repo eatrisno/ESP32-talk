@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "protocol.hpp"
+#include "voice_prompts.hpp"
 
 namespace audio {
 
@@ -34,6 +35,10 @@ uint8_t volume();
 
 // Feedback beep, mixed into the speaker output.
 void tone(uint16_t freq, uint16_t ms, uint16_t amp = 450);
+
+// Human voice prompt playback
+void prompt(wt::PromptId id);
+void prompt_clear();
 
 // From the radio task.
 void on_audio(uint32_t sender, const wt::AudioPayload& a);

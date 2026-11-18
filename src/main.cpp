@@ -197,7 +197,8 @@ void toggle_talk() {
     bool on = !audio::talking();
     audio::set_talking(on);
     xSemaphoreGive(s_app_mtx);
-    on ? chime_join() : chime_leave();
+    audio::prompt_clear();
+    audio::prompt(on ? wt::PROMPT_MIC_ON : wt::PROMPT_MIC_OFF);
     broadcast_state();
     ESP_LOGI(TAG, "mic %s", on ? "OPEN" : "muted");
 }
@@ -297,34 +298,32 @@ void radar_check() {
     }
     printf("\n");
 
-    // Audio acoustic telemetry in headset:
-    // 1. Tell peer count with N distinct pips
-    // 2. Pause
-    // 3. Tell distance with intuitive beep duration
+    // Voice prompt acoustic telemetry in headset:
+    audio::prompt_clear();
     if (count == 0) {
-        // 0 peers: soft low descending tone (350Hz 80ms, gap 20ms, 250Hz 100ms)
-        audio::tone(350, 80, 380);
-        audio::tone(0, 20);
-        audio::tone(250, 100, 380);
+        audio::prompt(wt::PROMPT_ZERO);
+        audio::prompt(wt::PROMPT_DEVICES);
+        audio::prompt(wt::PROMPT_NEARBY);
     } else {
-        // Step 1: N clear distinct pips for peer count (550Hz, 45ms each, gap 85ms)
-        int pips = count > 5 ? 5 : count;
-        for (int i = 0; i < pips; i++) {
-            audio::tone(550, 45, 380);
-            audio::tone(0, 85);
-        }
-        // Step 2: Pause 220ms so count is clearly separated from distance
-        audio::tone(0, 220);
-        // Step 3: Distance / signal strength beep length
-        if (has_direct && best_rssi >= -70) {
-            // Signal Kuat: BEEP PANJANG (620Hz, 350ms)
-            audio::tone(620, 350, 400);
-        } else if (has_direct && best_rssi >= -88) {
-            // Signal Sedang: BEEP SEDANG (540Hz, 160ms)
-            audio::tone(540, 160, 380);
+        if (count == 1) {
+            audio::prompt(wt::PROMPT_ONE);
+            audio::prompt(wt::PROMPT_DEVICE);
+        } else if (count == 2) {
+            audio::prompt(wt::PROMPT_TWO);
+            audio::prompt(wt::PROMPT_DEVICES);
+        } else if (count == 3) {
+            audio::prompt(wt::PROMPT_THREE);
+            audio::prompt(wt::PROMPT_DEVICES);
         } else {
-            // Signal Lemah / Multi-hop: BEEP PENDEK (440Hz, 50ms)
-            audio::tone(440, 50, 360);
+            audio::prompt(wt::PROMPT_FOUR);
+            audio::prompt(wt::PROMPT_DEVICES);
+        }
+        if (has_direct && best_rssi >= -70) {
+            audio::prompt(wt::PROMPT_NEARBY);
+        } else if (has_direct && best_rssi >= -88) {
+            audio::prompt(wt::PROMPT_MIDDLE);
+        } else {
+            audio::prompt(wt::PROMPT_FAR);
         }
     }
 }
@@ -332,31 +331,19 @@ void radar_check() {
 
 
 // Simple, intuitive Low-Medium-High harmonic notes:
-// Low: 400Hz | Medium: 550Hz | High: 750Hz (comfortable, warm, and clearly articulated)
-
 void chime_voicemail_prompt() {
-    // Start recording: Low -> Medium -> High ("Voice - Note - Start!")
-    audio::tone(400, 85, 380);
-    audio::tone(0, 35);
-    audio::tone(550, 85, 380);
-    audio::tone(0, 35);
-    audio::tone(750, 140, 400);
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_VM_RECORDING);
 }
 
 void chime_voicemail_send() {
-    // Send immediate (peers online): Medium -> High ("Mes - sage Sent!")
-    audio::tone(550, 85, 380);
-    audio::tone(0, 35);
-    audio::tone(750, 130, 400);
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_VM_SENT);
 }
 
 void chime_voicemail_received() {
-    // Received incoming voice note: Low -> Med -> High ("Voice - Note - In!")
-    audio::tone(400, 85, 380);
-    audio::tone(0, 35);
-    audio::tone(550, 85, 380);
-    audio::tone(0, 35);
-    audio::tone(750, 140, 400);
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_VM_INCOMING);
 }
 
 void on_voicemail_captured_frame(const wt::AudioPayload& a) {
@@ -450,10 +437,8 @@ void send_voicemail() {
         led::flash(led::Color::Cyan, 150);
     } else {
         s_vm_outbox_pending = true;
-        // Offline / Outbox saved: Medium -> Low ("Out - box!")
-        audio::tone(550, 85, 380);
-        audio::tone(0, 35);
-        audio::tone(400, 130, 380);
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_VM_OUTBOX);
         printf("[Voice Mail] Out of range (0 peers). Saved to outbox (%u frames, %.1fs). Will auto-send when a node is detected!\n",
                s_vm_storage->total_frames, s_vm_storage->total_frames * 0.04f);
     }
@@ -1012,10 +997,8 @@ extern "C" void app_main() {
             if (has_peer) {
                 printf("\n[Voice Mail] Peer detected! Automatically sending outbox voice mail...\n");
                 flush_voicemail_to_mesh();
-                // Delivery confirmation: Low -> High ("Sent out!")
-                audio::tone(400, 75, 380);
-                audio::tone(0, 30);
-                audio::tone(750, 120, 400);
+                audio::prompt_clear();
+                audio::prompt(wt::PROMPT_VM_SENT);
             }
         }
 
