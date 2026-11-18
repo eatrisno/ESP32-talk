@@ -27,7 +27,7 @@ void set_volume(uint8_t percent);
 uint8_t volume();
 
 // Feedback beep, mixed into the speaker output.
-void tone(uint16_t freq, uint16_t ms);
+void tone(uint16_t freq, uint16_t ms, uint16_t amp = 450);
 
 // From the radio task.
 void on_audio(uint32_t sender, const wt::AudioPayload& a);

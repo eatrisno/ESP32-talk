@@ -36,6 +36,7 @@ uint8_t hid_usage_to_button(uint16_t page, uint16_t usage) {
         switch (usage) {
             case 0xCD:  // Play/Pause
             case 0xB0:  // Play
+            case 0xCF:  // Voice Command
             case 0xE2:  // Mute
                 return HID_BTN_TALK;
             case 0xE9: return HID_BTN_VOL_UP;

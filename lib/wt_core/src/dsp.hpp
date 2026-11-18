@@ -91,14 +91,14 @@ void mix_into(float* dst, const int16_t* src, size_t n);
 class ToneQueue {
 public:
     // Appends a tone; freq 0 = silence gap. Drops the tone if the queue is full.
-    void push(uint16_t freq, uint16_t ms);
+    void push(uint16_t freq, uint16_t ms, uint16_t amp = 9000);
     void clear() { head_ = tail_ = 0; pos_ = 0; }
     bool busy() const { return head_ != tail_; }
     // Adds tone samples into out. Returns true if anything was rendered.
-    bool render(int16_t* out, size_t n);
+    bool render(int16_t* out, size_t n, float vol_scale = 1.0f);
 
 private:
-    struct Seg { uint16_t freq, ms; };
+    struct Seg { uint16_t freq, ms, amp; };
     static constexpr int kCap = 8;
     Seg q_[kCap] = {};
     int head_ = 0, tail_ = 0;

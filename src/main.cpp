@@ -15,6 +15,7 @@
 #include "esp_event.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -67,11 +68,11 @@ uint32_t next_session() {
 
 // --- feedback --------------------------------------------------------------------------
 
-// Same chimes for every input (BOOT, external button, headset button, console).
-void chime_join() { audio::tone(800, 50); audio::tone(0, 20); audio::tone(1200, 70); }
-void chime_leave() { audio::tone(1100, 50); audio::tone(0, 20); audio::tone(600, 70); }
-void chime_peer_joined() { audio::tone(1000, 40); }
-void chime_peer_left() { audio::tone(500, 40); }
+// Soft, gentle "pi.." feedback
+void chime_join() { audio::tone(550, 45, 450); }
+void chime_leave() { audio::tone(420, 45, 400); }
+void chime_peer_joined() { audio::tone(550, 30, 400); }
+void chime_peer_left() { audio::tone(400, 30, 350); }
 
 void update_led() {
     using led::Color;
@@ -116,7 +117,7 @@ void send_ping() {
     s_ping_ms = now_ms();
     xSemaphoreGive(s_app_mtx);
     radio::send(wt::MSG_PING, reinterpret_cast<uint8_t*>(&tok), 4);
-    audio::tone(1800, 30);
+    audio::tone(650, 30, 400);
     printf("ping sent\n");
 }
 
@@ -126,13 +127,116 @@ void volume_step(int d) {
     v = v < 0 ? 0 : (v > 100 ? 100 : v);
     audio::set_volume(static_cast<uint8_t>(v));
     nvs_put_u8("vol", static_cast<uint8_t>(v));
-    audio::tone(limit ? (d > 0 ? 2200 : 400) : (d > 0 ? 1500 : 750), 35);
+    printf("Volume: %d%%\n", v);
+    // Soft, pleasant volume feedback: gentle pip (350 amp), warm frequencies (550Hz up, 420Hz down)
+    uint16_t freq = limit ? (d > 0 ? 650 : 350) : (d > 0 ? 550 : 420);
+    audio::tone(freq, 25, 350);
 }
+
+void radar_check() {
+    uint32_t now = now_ms();
+    struct PeerInfo {
+        char name[12];
+        int8_t rssi;
+        uint8_t hops;
+        uint32_t age_s;
+    };
+    PeerInfo active[wt::kMaxPeers];
+    int count = 0;
+    int best_rssi = -128;
+    bool has_direct = false;
+
+    radio::peers_lock();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (!p->used) continue;
+        uint32_t age = (now - p->last_ms) / 1000;
+        if (age > 15) continue;  // active within 15 seconds
+        PeerInfo& pi = active[count++];
+        memcpy(pi.name, p->name, sizeof pi.name);
+        pi.rssi = p->rssi;
+        pi.hops = p->hops;
+        pi.age_s = age;
+        if (p->hops == 0) {
+            has_direct = true;
+            if (p->rssi > best_rssi) best_rssi = p->rssi;
+        }
+    }
+    radio::peers_unlock();
+
+    printf("\n[Radar] %d peer(s) connected:\n", count);
+    for (int i = 0; i < count; i++) {
+        const char* dist = "far";
+        if (active[i].hops == 0) {
+            if (active[i].rssi >= -65) dist = "close (<25m)";
+            else if (active[i].rssi >= -80) dist = "medium (~50m)";
+            else dist = "far (>80m)";
+        } else {
+            dist = "relayed via mesh";
+        }
+        printf("  - %-11s %s  RSSI %4d dBm  (%s)\n",
+               active[i].name[0] ? active[i].name : "?",
+               active[i].hops ? "mesh relay" : "direct    ",
+               active[i].rssi, dist);
+    }
+    if (count == 0) printf("  No peers in range.\n\n");
+    else printf("\n");
+
+    // Audio acoustic telemetry in headset
+    if (count == 0) {
+        // 0 peers: soft low descending tone (350Hz 60ms, gap 20ms, 280Hz 80ms)
+        audio::tone(350, 60, 400);
+        audio::tone(0, 20);
+        audio::tone(280, 80, 400);
+    } else {
+        // 1 to N peers: play N soft pips (550Hz, 35ms with 75ms gap)
+        int pips = count > 6 ? 6 : count;
+        for (int i = 0; i < pips; i++) {
+            audio::tone(550, 35, 450);
+            audio::tone(0, 75);
+        }
+        // Short pause before distance indicator
+        audio::tone(0, 150);
+        // Distance chime based on closest direct peer
+        if (has_direct && best_rssi >= -65) {
+            // Close: bright high double-chime (750Hz 40ms, gap 30ms, 850Hz 50ms)
+            audio::tone(750, 40, 450);
+            audio::tone(0, 30);
+            audio::tone(850, 50, 450);
+        } else if (has_direct && best_rssi >= -80) {
+            // Medium: single warm mid chime (550Hz 60ms)
+            audio::tone(550, 60, 400);
+        } else {
+            // Far or multi-hop: low soft tone (380Hz 80ms)
+            audio::tone(380, 80, 400);
+        }
+    }
+}
+
+static uint32_t s_last_talk_click_ms = 0;
+static bool s_pending_single_talk = false;
 
 void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
     if (p == wt::Press::None) return;
-    if (which == 0) p == wt::Press::Click ? toggle_talk() : send_ping();
+    ESP_LOGI(TAG, "Button %d event: %s", which, p == wt::Press::Click ? "Click" : "Long");
+    if (which == 0) {
+        if (p == wt::Press::Click) {
+            uint32_t now = now_ms();
+            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 350)) {
+                // Double click: cancel single click and run radar check
+                s_pending_single_talk = false;
+                ESP_LOGI(TAG, "Double click: radar check");
+                radar_check();
+            } else {
+                // First click: wait up to 350ms to see if a second click arrives
+                s_pending_single_talk = true;
+                s_last_talk_click_ms = now;
+            }
+        } else if (p == wt::Press::Long) {
+            s_pending_single_talk = false;
+            send_ping();
+        }
+    }
     if (which == 1 && p == wt::Press::Click) volume_step(+10);
     if (which == 2 && p == wt::Press::Click) volume_step(-10);
 }
@@ -227,6 +331,11 @@ void print_status() {
         printf("    %-11s %08lx  %s  rssi %4d  seen %lus ago%s\n", rows[i].name[0] ? rows[i].name : "?",
                (unsigned long)rows[i].id, rows[i].relay ? "relay " : "direct", rows[i].rssi,
                (unsigned long)rows[i].age, rows[i].talking ? "  talking" : "");
+    int8_t pwr = 0;
+    esp_wifi_get_max_tx_power(&pwr);
+    printf("  radio: mode %s  tx-power %d (%.2f dBm)\n",
+           cfg::kLongRange ? "ESP-NOW Long Range (LR 500k, -105 dBm)" : "802.11g 6M (-90 dBm)",
+           pwr, pwr * 0.25f);
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
            (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
@@ -271,6 +380,7 @@ void selftest() {
 
 void help() {
     printf("\n  t        talk on/off (same as BOOT or headset button click)\n"
+           "  r / c    radar: check peer count and distance (same as double click)\n"
            "  + / -    volume\n"
            "  p        ping all nodes (same as long press)\n"
            "  s        status, peers, counters\n"
@@ -298,6 +408,7 @@ void console_task(void*) {
         line[n] = 0;
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
+        else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
         else if (!strcmp(line, "+")) volume_step(+10);
         else if (!strcmp(line, "-")) volume_step(-10);
         else if (!strcmp(line, "p")) send_ping();
@@ -328,7 +439,10 @@ void console_task(void*) {
 
 // --- buttons ---------------------------------------------------------------------------
 
-void on_hid_buttons(uint8_t down) { s_hid_down = down; }
+void on_hid_buttons(uint8_t down) {
+    if (down != s_hid_down) ESP_LOGI(TAG, "HID raw: 0x%02x", down);
+    s_hid_down = down;
+}
 
 void on_headset_state(bool connected) {
     if (connected) {
@@ -388,22 +502,59 @@ extern "C" void app_main() {
 
     wt::ButtonDetector talk, up, down;
     uint8_t last_toggle = 0;
+    uint8_t last_hid = 0;
+    uint32_t hid_talk_start = 0;
+    bool hid_talk_long_sent = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
         uint8_t hid = s_hid_down;
+
+        // Latching hook/mute control: every change is one click
         uint8_t tog = hid & wt::HID_BTN_TALK_TOGGLE;
-        if (tog != last_toggle) {  // latching hook/mute control: every change is one click
+        if (tog != last_toggle) {
             last_toggle = tog;
             handle_press(wt::Press::Click, 0);
         }
-        handle_press(talk.update(low(cfg::kPinBoot) || low(cfg::kPinTalk) ||
-                                     (hid & wt::HID_BTN_TALK), now), 0);
-        handle_press(up.update(low(cfg::kPinVolUp) || (hid & wt::HID_BTN_VOL_UP), now), 1);
-        handle_press(down.update(low(cfg::kPinVolDown) || (hid & wt::HID_BTN_VOL_DOWN), now), 2);
 
-        // Auto-mute a mic that has been left open too long.
-        if (audio::talking()) {
+        // USB HID buttons: packets are digital and bounce-free; act directly on edge
+        if ((hid & wt::HID_BTN_VOL_UP) && !(last_hid & wt::HID_BTN_VOL_UP)) {
+            handle_press(wt::Press::Click, 1);
+        }
+        if ((hid & wt::HID_BTN_VOL_DOWN) && !(last_hid & wt::HID_BTN_VOL_DOWN)) {
+            handle_press(wt::Press::Click, 2);
+        }
+
+        // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
+        // Click on release (< 1.5s), Long press when held (>= 1.5s)
+        if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
+            hid_talk_start = now;
+            hid_talk_long_sent = false;
+        }
+        if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= wt::ButtonDetector::kLongMs)) {
+            hid_talk_long_sent = true;
+            handle_press(wt::Press::Long, 0);
+        }
+        if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
+            if (!hid_talk_long_sent) {
+                handle_press(wt::Press::Click, 0);
+            }
+        }
+        last_hid = hid;
+
+        // Physical GPIO buttons (BOOT, external pins) use debouncer
+        handle_press(talk.update(low(cfg::kPinBoot) || low(cfg::kPinTalk), now), 0);
+        handle_press(up.update(low(cfg::kPinVolUp), now), 1);
+        handle_press(down.update(low(cfg::kPinVolDown), now), 2);
+
+        // Handle pending single talk click timeout (350 ms)
+        if (s_pending_single_talk && (now - s_last_talk_click_ms > 350)) {
+            s_pending_single_talk = false;
+            toggle_talk();
+        }
+
+        // Auto-mute a mic that has been left open too long (disabled when kMaxTalkMs == 0).
+        if (cfg::kMaxTalkMs > 0 && audio::talking()) {
             if (!talk_since) talk_since = now;
             if (now - talk_since > cfg::kMaxTalkMs) {
                 ESP_LOGW(TAG, "mic open for %lus, muting", (unsigned long)(cfg::kMaxTalkMs / 1000));

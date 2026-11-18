@@ -226,22 +226,32 @@ void hid_if_cb(hid_host_device_handle_t h, const hid_host_interface_event_t ev, 
         if (ev == HID_HOST_INTERFACE_EVENT_DISCONNECTED) hid_host_device_close(h);
         return;
     }
+    ESP_LOGI(TAG, "HID event: %d", (int)ev);
     if (ev == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
         uint8_t r[64];
         size_t len = 0;
-        if (hid_host_device_get_raw_input_report_data(h, r, sizeof r, &len) != ESP_OK) return;
+        esp_err_t err = hid_host_device_get_raw_input_report_data(h, r, sizeof r, &len);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "HID get raw err: %d", err);
+            return;
+        }
         uint8_t mask = 0;
         uint8_t now = d->parser.decode(r, len, &mask);
+        ESP_LOGI(TAG, "HID in (%u B): now=0x%02x mask=0x%02x data=[%02x %02x %02x %02x]",
+                 (unsigned)len, now, mask, len > 0 ? r[0] : 0, len > 1 ? r[1] : 0,
+                 len > 2 ? r[2] : 0, len > 3 ? r[3] : 0);
         // A report only says something about the buttons it carries: keep the others.
         d->down = static_cast<uint8_t>((d->down & ~mask) | now);
         report_buttons();
     } else if (ev == HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR) {
+        ESP_LOGW(TAG, "HID transfer error");
         // Not resubmitted by the driver: restart polling, release anything held.
         d->down = 0;
         report_buttons();
         hid_host_device_stop(h);
         hid_host_device_start(h);
     } else if (ev == HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
+        ESP_LOGI(TAG, "HID disconnected");
         hid_host_device_close(h);
         d->h = nullptr;
         d->down = 0;
@@ -276,7 +286,8 @@ void open_hid(hid_host_device_handle_t h) {
         *d = HidIf();
         return;
     }
-    ESP_LOGI(TAG, "headset buttons found (%d fields)", d->parser.field_count());
+    ESP_LOGI(TAG, "headset buttons found (%d fields), desc len=%u", d->parser.field_count(), (unsigned)dlen);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, desc, dlen, ESP_LOG_INFO);
 }
 
 void worker(void*) {
@@ -301,6 +312,13 @@ void start(ButtonCb on_buttons, StateCb on_state) {
     usb_host_config_t hc = {};
     hc.skip_phy_setup = false;
     hc.intr_flags = ESP_INTR_FLAG_LOWMED;
+    // Hardware FIFO total depth on ESP32-S3 is 200 lines (800 bytes).
+    // Default balanced bias only allocates 32 lines (128 B) to periodic OUT (speaker),
+    // which fails for 48kHz stereo (MPS 384).
+    // Allocate 96 lines (384 B) for periodic OUT, 16 lines (64 B) for control, and 88 lines (344 B) for RX (mic).
+    hc.fifo_settings_custom.rx_fifo_lines = 88;
+    hc.fifo_settings_custom.nptx_fifo_lines = 16;
+    hc.fifo_settings_custom.ptx_fifo_lines = 96;
     ESP_ERROR_CHECK(usb_host_install(&hc));
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, nullptr, 10, nullptr, 0);
 

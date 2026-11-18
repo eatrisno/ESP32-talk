@@ -11,19 +11,19 @@ constexpr gpio_num_t kPinVolUp = GPIO_NUM_1;
 constexpr gpio_num_t kPinVolDown = GPIO_NUM_2;
 
 constexpr gpio_num_t kPinLed = GPIO_NUM_48;     // WS2812 on ESP32-S3-DevKitC-1 (v1.0: 48, v1.1: 38)
-constexpr uint8_t kLedBrightness = 16;          // of 255; the LED is very bright and noisy on 3V3
+constexpr uint8_t kLedBrightness = 2;           // of 255; dim to eliminate 3V3 power rail noise and save power
 
 // Radio
 constexpr uint8_t kDefaultChannel = 1;
-constexpr int8_t  kTxPowerQdBm = 80;            // 20 dBm. Check your local limit.
-// Send at Espressif LR 500 kbit/s instead of 6 Mbit/s OFDM. About 2x the range, but each
-// voice frame takes ~4 ms of air instead of ~0.3 ms, so 3 talkers plus relays fill the
-// channel. All nodes must use the same setting.
-constexpr bool    kLongRange = false;
+constexpr int8_t  kTxPowerQdBm = 84;            // 21 dBm (maximum hardware power).
+// Send at Espressif LR 500 kbit/s instead of 6 Mbit/s OFDM. Gives up to ~105 dBm sensitivity
+// (vs -90 dBm on OFDM) for dramatically improved range through obstacles and distance.
+constexpr bool    kLongRange = true;
 constexpr uint32_t kBeaconMs = 3000;
 
 // Talk
-constexpr uint32_t kMaxTalkMs = 120000;         // auto-mute after 2 min of continuous open mic
+constexpr uint32_t kMaxTalkMs = 0;              // 0 = disabled (never auto-mute, stay ON until user turns it OFF)
+constexpr bool     kContinuousStream = true;    // stream audio continuously while ON without voice-gate auto-muting
 constexpr uint8_t  kDefaultVolume = 70;
 
 // Network key: 16 bytes, same on every node. Set WT_NETWORK_KEY_HEX (32 hex chars) as a
