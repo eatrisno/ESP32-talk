@@ -53,6 +53,7 @@ static volatile uint32_t s_distress_peer = 0;
 static char s_distress_peer_name[12] = "";
 static uint32_t s_last_distress_tx_ms = 0;
 static uint32_t s_last_distress_beep_ms = 0;
+static volatile bool s_vm_recording = false;
 static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
@@ -116,6 +117,19 @@ void update_led() {
             s_red_on = !s_red_on;
         }
         led::set(s_red_on ? Color::Red : Color::Off);
+        return;
+    }
+
+    // Voice Note recording: gentle soft Amber pulse to clearly show recording in progress
+    if (s_vm_recording) {
+        static uint32_t s_last_vm_flash = 0;
+        static bool s_amber_on = false;
+        uint32_t now = now_ms();
+        if (now - s_last_vm_flash >= 300) {
+            s_last_vm_flash = now;
+            s_amber_on = !s_amber_on;
+        }
+        led::set(s_amber_on ? Color::Amber : Color::Off);
         return;
     }
 
@@ -228,7 +242,6 @@ struct VmStorage {
 };
 
 static VmStorage* s_vm_storage = nullptr;
-static bool s_vm_recording = false;
 static bool s_vm_outbox_pending = false;
 static uint32_t s_last_played_vm_id = 0;
 
@@ -319,19 +332,20 @@ void radar_check() {
 
 
 void chime_voicemail_prompt() {
-    // Rising 3-tone record start prompt: 440Hz -> 660Hz -> 880Hz
-    audio::tone(440, 40, 380);
+    // Distinct, high-register modern voice memo prompt: C6 (1046Hz) -> F#6 (1480Hz)
+    // Instant clear separation from walkie-talkie 550Hz/420Hz PTT beeps
+    audio::tone(1046, 35, 380);
     audio::tone(0, 20);
-    audio::tone(660, 40, 380);
-    audio::tone(0, 20);
-    audio::tone(880, 60, 400);
+    audio::tone(1480, 55, 420);
 }
 
 void chime_voicemail_send() {
-    // Rising confirmation swoosh: 600Hz -> 900Hz
-    audio::tone(600, 45, 380);
-    audio::tone(0, 20);
-    audio::tone(900, 75, 420);
+    // Crisp modern messenger swoosh: 1480Hz -> 1046Hz -> 1660Hz
+    audio::tone(1480, 30, 380);
+    audio::tone(0, 15);
+    audio::tone(1046, 30, 380);
+    audio::tone(0, 15);
+    audio::tone(1660, 65, 420);
 }
 
 void chime_voicemail_received() {
@@ -352,6 +366,10 @@ void on_voicemail_captured_frame(const wt::AudioPayload& a) {
         audio::tone(700, 50, 400);
         printf("[Voice Mail] Max 10s recording reached. Press 1x to send.\n");
         return;
+    }
+    // Subtle low-volume soft tick every 50 frames (2.0s) so user knows recording is running
+    if (s_vm_storage->total_frames > 0 && (s_vm_storage->total_frames % 50 == 0)) {
+        audio::tone(1300, 10, 200);
     }
     VmFrame& f = s_vm_storage->frames[s_vm_storage->total_frames++];
     f.adpcm_pred = a.adpcm_pred;
@@ -419,7 +437,6 @@ void send_voicemail() {
         if (s_vm_storage) { free(s_vm_storage); s_vm_storage = nullptr; }
         return;
     }
-    chime_voicemail_send();
 
     uint32_t now = now_ms();
     int active_peers = 0;
@@ -430,14 +447,15 @@ void send_voicemail() {
     radio::peers_unlock();
 
     if (active_peers > 0) {
+        chime_voicemail_send();
         flush_voicemail_to_mesh();
-        led::flash(led::Color::Cyan, 120);
-        audio::tone(800, 30, 350);
+        led::flash(led::Color::Cyan, 150);
     } else {
         s_vm_outbox_pending = true;
-        audio::tone(500, 60, 380);
-        audio::tone(0, 30);
-        audio::tone(400, 80, 380);
+        // Distinct offline outbox stored sound: 680Hz (45ms) -> 480Hz (75ms)
+        audio::tone(680, 45, 380);
+        audio::tone(0, 25);
+        audio::tone(480, 75, 380);
         printf("[Voice Mail] Out of range (0 peers). Saved to outbox (%u frames, %.1fs). Will auto-send when a node is detected!\n",
                s_vm_storage->total_frames, s_vm_storage->total_frames * 0.04f);
     }
@@ -996,9 +1014,10 @@ extern "C" void app_main() {
             if (has_peer) {
                 printf("\n[Voice Mail] Peer detected! Automatically sending outbox voice mail...\n");
                 flush_voicemail_to_mesh();
-                audio::tone(750, 40, 380);
+                // Bright delivery confirmation: 1046Hz -> 1480Hz
+                audio::tone(1046, 35, 380);
                 audio::tone(0, 20);
-                audio::tone(850, 50, 380);
+                audio::tone(1480, 50, 420);
             }
         }
 
