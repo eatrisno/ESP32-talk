@@ -1,592 +1,366 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <Preferences.h>
-#include "config.h"
-#include "messages.h"
-#include "security.h"
-#include "esp_now_comm.h"
-#include "usb_headset.h"
+// ESP32-S3 mesh walkie-talkie: USB-C headset, ESP-NOW, every node in range joins one
+// conference automatically. See README.md.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 
-// Preferences for non-volatile storage (NVS)
-static Preferences prefs;
+#include "audio.hpp"
+#include "button.hpp"
+#include "config.hpp"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "hid_buttons.hpp"
+#include "led.hpp"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "radio.hpp"
+#include "usb_headset.hpp"
+#include "voice_gate.hpp"
 
-// Node Identity & Network State
-static char     g_deviceName[16]    = "";
-static uint8_t  g_channel           = CHANNEL_DEFAULT;
-static uint32_t g_lastBeaconMs      = 0;
-static uint32_t g_ledOffMs          = 0;
-static uint32_t g_buzzerOffMs       = 0;
+namespace {
 
-// Fleet Discovery Ping State
-#define PING_COLLECTION_WINDOW_MS 450
-static bool     g_pingCollecting    = false;
-static uint32_t g_pendingPingToken  = 0;
-static uint32_t g_pingSentMs        = 0;
-static uint8_t  g_pongDirectCount   = 0;
-static uint8_t  g_pongRelayCount    = 0;
+const char* TAG = "app";
 
-struct PingResponder {
-    uint8_t mac[6];
-    char    name[16];
-    uint8_t hops;
-    int8_t  remoteRssi;
-    int8_t  localRssi;
-    uint32_t rtt;
-};
-static PingResponder g_responders[MAX_PEERS];
-static uint8_t       g_numResponders = 0;
+char s_name[12] = "";
+nvs_handle_t s_nvs;
+volatile uint8_t s_hid_down = 0;
+uint32_t s_ping_token = 0, s_ping_ms = 0;
 
-// Auto-Channel Search State
-static bool     g_isScanning        = false;
-static uint8_t  g_scanChannel       = CHANNEL_MIN;
-static uint32_t g_scanDwellStartMs  = 0;
-static uint8_t  g_origChannel       = CHANNEL_DEFAULT;
+uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
-// Remote Voice State
-static bool     g_remoteVoiceActive = false;
-static uint32_t g_remoteVoiceExpiry = 0;
-static char     g_remoteSpeakerName[16] = "Remote";
+// --- persistent settings ---------------------------------------------------------------
 
-// WS2812 RGB LED Driver (Gentle ~6% Dimming to prevent RF / 3.3V rail noise)
-static uint8_t s_lastR = 255, s_lastG = 255, s_lastB = 255;
-
-static void rawRgbWrite(uint8_t r, uint8_t g, uint8_t b) {
-    r = (r * 16) / 255;
-    g = (g * 16) / 255;
-    b = (b * 16) / 255;
-
-    if (r == s_lastR && g == s_lastG && b == s_lastB) {
-        return;
-    }
-    s_lastR = r;
-    s_lastG = g;
-    s_lastB = b;
-
-    #ifdef RGB_BUILTIN
-    neopixelWrite(RGB_BUILTIN, r, g, b);
-    #else
-    neopixelWrite(48, r, g, b);
-    #endif
+uint8_t nvs_u8(const char* k, uint8_t def) {
+    uint8_t v = def;
+    nvs_get_u8(s_nvs, k, &v);
+    return v;
+}
+void nvs_put_u8(const char* k, uint8_t v) {
+    nvs_set_u8(s_nvs, k, v);
+    nvs_commit(s_nvs);
 }
 
-void setStatusLed(LedColor color, uint32_t autoOffMs) {
-    g_ledOffMs = (autoOffMs > 0) ? (millis() + autoOffMs) : 0;
+uint32_t next_session() {
+    uint32_t s = 0;
+    nvs_get_u32(s_nvs, "session", &s);
+    s++;
+    nvs_set_u32(s_nvs, "session", s);
+    nvs_commit(s_nvs);  // must hit flash before the first packet: it is the nonce prefix
+    return s;
+}
 
-    switch (color) {
-        case LED_COLOR_OFF:
-            rawRgbWrite(0, 0, 0);
+// --- feedback --------------------------------------------------------------------------
+
+// Same chimes for every input (BOOT, external button, headset button, console).
+void chime_join() { audio::tone(800, 50); audio::tone(0, 20); audio::tone(1200, 70); }
+void chime_leave() { audio::tone(1100, 50); audio::tone(0, 20); audio::tone(600, 70); }
+void chime_peer_joined() { audio::tone(1000, 40); }
+void chime_peer_left() { audio::tone(500, 40); }
+
+void update_led() {
+    using led::Color;
+    if (audio::loopback()) led::set(Color::White);
+    else if (audio::sending()) led::set(Color::Red);
+    else if (audio::receiving()) led::set(Color::Green);
+    else if (audio::talking()) led::set(Color::Amber);  // mic open, waiting for speech
+    else if (!usb_headset::spk_ready()) led::set(Color::Blue);
+    else led::set(Color::Off);
+}
+
+// --- actions ---------------------------------------------------------------------------
+
+void broadcast_state() {
+    uint8_t p[1 + sizeof s_name];
+    p[0] = audio::talking();
+    memcpy(p + 1, s_name, sizeof s_name);
+    radio::send(audio::talking() ? wt::MSG_JOIN : wt::MSG_LEAVE, p, sizeof p);
+}
+
+void toggle_talk() {
+    bool on = !audio::talking();
+    audio::set_talking(on);
+    on ? chime_join() : chime_leave();
+    broadcast_state();
+    ESP_LOGI(TAG, "mic %s", on ? "OPEN" : "muted");
+}
+
+void send_ping() {
+    s_ping_token = static_cast<uint32_t>(esp_timer_get_time());
+    s_ping_ms = now_ms();
+    radio::send(wt::MSG_PING, reinterpret_cast<uint8_t*>(&s_ping_token), 4);
+    audio::tone(1800, 30);
+    printf("ping sent\n");
+}
+
+void volume_step(int d) {
+    int v = audio::volume() + d;
+    bool limit = v < 0 || v > 100;
+    v = v < 0 ? 0 : (v > 100 ? 100 : v);
+    audio::set_volume(static_cast<uint8_t>(v));
+    nvs_put_u8("vol", static_cast<uint8_t>(v));
+    audio::tone(limit ? (d > 0 ? 2200 : 400) : (d > 0 ? 1500 : 750), 35);
+}
+
+void handle_press(wt::Press p, int which) {
+    // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
+    if (p == wt::Press::None) return;
+    if (which == 0) p == wt::Press::Click ? toggle_talk() : send_ping();
+    if (which == 1 && p == wt::Press::Click) volume_step(+10);
+    if (which == 2 && p == wt::Press::Click) volume_step(-10);
+}
+
+// --- radio rx --------------------------------------------------------------------------
+
+void on_rx(const radio::Rx& rx) {
+    const uint32_t id = rx.hdr.sender;
+    switch (rx.hdr.type) {
+        case wt::MSG_AUDIO: {
+            wt::AudioPayload a;
+            if (wt::read_audio(rx.plain, rx.len, a)) audio::on_audio(id, a);
             break;
-        case LED_COLOR_RED:    // SENDER: Voice Transmit Active
-            rawRgbWrite(255, 0, 0);
-            break;
-        case LED_COLOR_BLUE:   // Transmit complete blip
-            rawRgbWrite(0, 80, 255);
-            break;
-        case LED_COLOR_GREEN:  // TARGET: Incoming Voice Playing / Peer Found
-            rawRgbWrite(0, 255, 0);
-            break;
-        case LED_COLOR_AMBER:  // AUTO-SEARCH: Scanning channels
-            rawRgbWrite(255, 120, 0);
-            break;
-        case LED_COLOR_CYAN:   // PING: Ping in flight / Channel locked
-            rawRgbWrite(0, 255, 200);
-            break;
-    }
-}
-
-static void blinkPattern(LedColor color, int count, uint16_t onMs = 120, uint16_t offMs = 80) {
-    for (int i = 0; i < count; i++) {
-        setStatusLed(color);
-        delay(onMs);
-        setStatusLed(LED_COLOR_OFF);
-        if (i < count - 1) delay(offMs);
-    }
-}
-
-static void triggerAlertAsync(uint16_t durationMs = 60) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    g_buzzerOffMs = millis() + durationMs;
-}
-
-static void triggerAlert(uint16_t durationMs = 60, uint16_t count = 1) {
-    for (uint16_t i = 0; i < count; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        delay(durationMs);
-        digitalWrite(BUZZER_PIN, LOW);
-        if (i < count - 1) delay(50);
-    }
-}
-
-// Fleet Discovery Ping Trigger
-static void triggerFleetPing(uint32_t now) {
-    if (g_pingCollecting) return;
-    g_pendingPingToken = now;
-    g_pingSentMs = now;
-    g_pingCollecting = true;
-    g_numResponders = 0;
-    g_pongDirectCount = 0;
-    g_pongRelayCount = 0;
-
-    Serial.println("\n[MESH-PING] ========================================");
-    Serial.printf("[MESH-PING] Probing fleet on channel %d [token=%u]...\n", g_channel, g_pendingPingToken);
-    Serial.println("[MESH-PING] Listening for direct and relayed responses (450ms)...");
-    Serial.println("[MESH-PING] ========================================");
-
-    setStatusLed(LED_COLOR_CYAN, 80);
-    EspNowComm::getInstance().sendPing(g_pendingPingToken);
-}
-
-// Auto-Channel Search
-static void startAutoChannelSearch() {
-    if (g_isScanning) return;
-    Serial.println("\n[AUTO-SEARCH] ========================================");
-    Serial.println("[AUTO-SEARCH] Starting 13-channel peer search...");
-    Serial.println("[AUTO-SEARCH] ========================================");
-
-    g_isScanning = true;
-    g_origChannel = g_channel;
-    g_scanChannel = CHANNEL_MIN;
-    g_scanDwellStartMs = millis();
-
-    setStatusLed(LED_COLOR_AMBER);
-    EspNowComm::getInstance().setChannel(g_scanChannel);
-    EspNowComm::getInstance().sendChannelBeacon(g_scanChannel, millis() / 1000);
-}
-
-static void processAutoChannelSearch() {
-    if (!g_isScanning) return;
-
-    uint32_t now = millis();
-    if (now - g_scanDwellStartMs >= CHANNEL_SCAN_DWELL_MS) {
-        g_scanChannel++;
-        if (g_scanChannel > CHANNEL_MAX) {
-            Serial.printf("[AUTO-SEARCH] Scan cycle complete without discovery. Reverting to ch%d\n", g_origChannel);
-            g_isScanning = false;
-            g_channel = g_origChannel;
-            EspNowComm::getInstance().setChannel(g_channel);
-            setStatusLed(LED_COLOR_OFF);
-            return;
         }
-
-        g_scanDwellStartMs = now;
-        setStatusLed(LED_COLOR_AMBER);
-        EspNowComm::getInstance().setChannel(g_scanChannel);
-        EspNowComm::getInstance().sendChannelBeacon(g_scanChannel, millis() / 1000);
-        Serial.printf("[AUTO-SEARCH] Probing channel %d...\n", g_scanChannel);
-    }
-}
-
-static void onPeerDiscoveredOnChannel(uint8_t channel) {
-    if (g_isScanning) {
-        g_isScanning = false;
-        g_channel = channel;
-        prefs.putUChar(NVS_KEY_CHANNEL, g_channel);
-        Serial.println("\n[AUTO-SEARCH] ****************************************");
-        Serial.printf("[AUTO-SEARCH] PEER FOUND! Locked to Channel %d\n", g_channel);
-        Serial.println("[AUTO-SEARCH] ****************************************\n");
-        blinkPattern(LED_COLOR_CYAN, 2, 150, 100);
-        triggerAlert(100, 2);
-    }
-}
-
-// Dynamic Callsign Pool (Auto-assigned without hardcoding)
-static const char* CALLSIGN_POOL[] = { "Peto", "Bubu", "Wawa" };
-static const int POOL_SIZE = sizeof(CALLSIGN_POOL) / sizeof(CALLSIGN_POOL[0]);
-
-static void saveDeviceName(const char* name) {
-    if (!name || strlen(name) == 0) return;
-    strncpy(g_deviceName, name, sizeof(g_deviceName) - 1);
-    g_deviceName[sizeof(g_deviceName) - 1] = '\0';
-    prefs.putString(NVS_KEY_DEVICE_NAME, g_deviceName);
-    EspNowComm::getInstance().setDeviceName(g_deviceName);
-    Serial.printf("\n[NVS] Callsign saved to flash: %s\n\n", g_deviceName);
-}
-
-// ESP-NOW Receive Callback (Encrypted & Authenticated)
-static void onEspNowDecryptedReceived(const EspNowMessage& header,
-                                     const uint8_t* decryptedPayload,
-                                     uint16_t decryptedLen,
-                                     int rssi) {
-    if (g_isScanning) {
-        onPeerDiscoveredOnChannel(header.channel);
-    }
-
-    switch (header.type) {
-        case MSG_PING: {
-            if (decryptedLen >= sizeof(PingPayload)) {
-                const PingPayload* ping = (const PingPayload*)decryptedPayload;
-                // Zero-turnaround: send Pong reply immediately
-                EspNowComm::getInstance().sendPong(header.sender_mac, ping->pingToken, rssi);
-                setStatusLed(LED_COLOR_CYAN, 300);
-                triggerAlertAsync(40);
-                Serial.printf("[PING] Received Ping from %s [token=%u]\n", header.sender_name, ping->pingToken);
+        case wt::MSG_BEACON:
+        case wt::MSG_JOIN:
+        case wt::MSG_LEAVE: {
+            if (rx.len < 1 + sizeof s_name) break;
+            char name[sizeof s_name];
+            memcpy(name, rx.plain + 1, sizeof name);
+            name[sizeof name - 1] = 0;
+            radio::peers_lock();
+            wt::Peer* p = radio::peers().find(id);
+            bool was = p && p->talking, now = rx.plain[0] != 0;
+            radio::peers().set_name(id, name);
+            radio::peers().set_talking(id, now);
+            radio::peers_unlock();
+            if (now != was && rx.hdr.type != wt::MSG_BEACON) {
+                now ? chime_peer_joined() : chime_peer_left();
+                ESP_LOGI(TAG, "%s %s", name, now ? "joined" : "left");
             }
             break;
         }
-
-        case MSG_PONG: {
-            if (decryptedLen >= sizeof(PongPayload)) {
-                const PongPayload* pong = (const PongPayload*)decryptedPayload;
-                if (g_pingCollecting && (pong->pingToken == g_pendingPingToken)) {
-                    uint32_t rtt = millis() - g_pingSentMs;
-                    bool exists = false;
-                    for (int i = 0; i < g_numResponders; i++) {
-                        if (memcmp(g_responders[i].mac, header.sender_mac, 6) == 0) {
-                            exists = true;
-                            break;
-                        }
-                    }
-                    if (!exists && g_numResponders < MAX_PEERS) {
-                        PingResponder& r = g_responders[g_numResponders++];
-                        memcpy(r.mac, header.sender_mac, 6);
-                        strncpy(r.name, header.sender_name, sizeof(r.name) - 1);
-                        r.name[sizeof(r.name) - 1] = '\0';
-                        r.hops = header.hops;
-                        r.remoteRssi = pong->rssi;
-                        r.localRssi = rssi;
-                        r.rtt = rtt;
-
-                        if (header.hops == 0) g_pongDirectCount++;
-                        else g_pongRelayCount++;
-
-                        Serial.printf("[PING-FLEET] RX Pong from %s (%s, hops=%u, RTT=%ums)\n",
-                                      header.sender_name, (header.hops == 0 ? "🟢 Direct" : "🩵 Relayed"),
-                                      header.hops, (unsigned int)rtt);
-                    }
-                }
-            }
+        case wt::MSG_PING:
+            if (rx.len >= 4) radio::send(wt::MSG_PONG, rx.plain, 4);
+            led::flash(led::Color::Cyan, 150);
+            break;
+        case wt::MSG_PONG: {
+            uint32_t tok;
+            if (rx.len < 4) break;
+            memcpy(&tok, rx.plain, 4);
+            if (tok != s_ping_token) break;
+            radio::peers_lock();
+            wt::Peer* p = radio::peers().find(id);
+            printf("pong %-11s %3lu ms  %s  rssi %d\n", p && p->name[0] ? p->name : "?",
+                   (unsigned long)(now_ms() - s_ping_ms), rx.hops ? "via relay" : "direct", rx.rssi);
+            radio::peers_unlock();
             break;
         }
-
-        case MSG_PTT_START: {
-            g_remoteVoiceActive = true;
-            strncpy(g_remoteSpeakerName, header.sender_name, sizeof(g_remoteSpeakerName) - 1);
-            g_remoteSpeakerName[sizeof(g_remoteSpeakerName) - 1] = '\0';
-            g_remoteVoiceExpiry = millis() + 1000;
-            setStatusLed(LED_COLOR_GREEN);
-            Serial.printf("[HT-VOICE] 👥 Peer JOINED voice channel: %s\n", header.sender_name);
-            break;
-        }
-
-        case MSG_PTT_STOP: {
-            g_remoteVoiceActive = false;
-            g_remoteVoiceExpiry = 0;
-            UsbHeadset::getInstance().onRemotePttStop(header.sender_mac);
-            if (!UsbHeadset::getInstance().isTransmitting()) {
-                setStatusLed(LED_COLOR_OFF);
-            }
-            Serial.printf("[HT-VOICE] 👥 Peer LEFT voice channel: %s\n", header.sender_name);
-            break;
-        }
-
-        case MSG_AUDIO: {
-            if (decryptedLen > AUDIO_CHUNK_HEADER_SIZE) {
-                g_remoteVoiceActive = true;
-                g_remoteVoiceExpiry = millis() + 800;
-
-                uint8_t msgId       = decryptedPayload[2];
-                uint8_t chunkIdx    = decryptedPayload[3];
-                uint8_t totalChunks = decryptedPayload[4];
-                uint8_t mimeType    = decryptedPayload[5];
-                const uint8_t* audioData = &decryptedPayload[AUDIO_CHUNK_HEADER_SIZE];
-                uint16_t dataLen = decryptedLen - AUDIO_CHUNK_HEADER_SIZE;
-
-                // Deliver to Headset Full Duplex Jitter Queue & Mixer
-                UsbHeadset::getInstance().receiveAudioChunk(
-                    header.sender_mac, msgId, chunkIdx, totalChunks, mimeType, audioData, dataLen
-                );
-
-                if (!UsbHeadset::getInstance().isTransmitting()) {
-                    setStatusLed(LED_COLOR_GREEN, 500);
-                }
-            }
-            break;
-        }
-
-        case MSG_CHANNEL_BEACON:
-            break;
-
-        default:
-            break;
     }
 }
 
-// Setup
-void setup() {
-    // Lock CPU to 240 MHz for real-time AES crypto and DSP
-    setCpuFrequencyMhz(240);
+// --- console ---------------------------------------------------------------------------
 
-    Serial.begin(115200);
-    delay(400);
-
-    Serial.println("\n=======================================================");
-    Serial.println("   ESP32-S3 HT Full Duplex Mesh Walkie-Talkie");
-    Serial.printf("   Firmware: %s\n", FIRMWARE_VERSION);
-    Serial.println("   Engine: ESP-NOW LR Mesh + AES-128 Crypto + Type-C Headset");
-    Serial.println("=======================================================");
-
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
-    pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(PTT_EXT_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(VOL_UP_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(VOL_DOWN_BUTTON_PIN, INPUT_PULLUP);
-
-    // Visual Power-On Self Test: Red -> Green -> Blue -> Off
-    setStatusLed(LED_COLOR_RED);
-    delay(100);
-    setStatusLed(LED_COLOR_GREEN);
-    delay(100);
-    setStatusLed(LED_COLOR_BLUE);
-    delay(100);
-    setStatusLed(LED_COLOR_OFF);
-
-    // Boot chirp
-    triggerAlert(60, 2);
-
-    // Initialize Preferences
-    prefs.begin(NVS_NAMESPACE, false);
-    String savedName = prefs.getString(NVS_KEY_DEVICE_NAME, "");
-
-    if (savedName.length() > 0) {
-        strncpy(g_deviceName, savedName.c_str(), sizeof(g_deviceName) - 1);
-        Serial.printf("[NVS] Callsign: %s\n", g_deviceName);
-    } else {
-        uint8_t mac[6];
-        WiFi.macAddress(mac);
-        uint32_t seed = (mac[3] << 16) | (mac[4] << 8) | mac[5];
-        const char* candidate = CALLSIGN_POOL[seed % POOL_SIZE];
-        saveDeviceName(candidate);
-        Serial.printf("[NVS] Auto-assigned callsign: %s\n", g_deviceName);
+void print_status() {
+    radio::Stats r = radio::stats();
+    audio::Stats a = audio::stats();
+    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s%s\n", s_name, (unsigned long)radio::self_id(),
+           radio::channel(), audio::volume(), audio::talking() ? "OPEN" : "muted",
+           audio::loopback() ? "  [loopback]" : "");
+    usb_headset::print_info();
+    printf("  peers:\n");
+    radio::peers_lock();
+    uint32_t now = now_ms();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (!p->used) continue;
+        printf("    %-11s %08lx  %s  rssi %4d  seen %lus ago%s\n", p->name[0] ? p->name : "?",
+               (unsigned long)p->id, p->hops ? "relay " : "direct", p->rssi,
+               (unsigned long)((now - p->last_ms) / 1000), p->talking ? "  talking" : "");
     }
-
-    g_channel = prefs.getUChar(NVS_KEY_CHANNEL, CHANNEL_DEFAULT);
-    if (g_channel < CHANNEL_MIN || g_channel > CHANNEL_MAX) {
-        g_channel = CHANNEL_DEFAULT;
-    }
-
-    // Load saved volume (default 80%)
-    uint8_t savedVol = prefs.getUChar(NVS_KEY_VOLUME, 80);
-    if (savedVol > 100) savedVol = 80;
-    UsbHeadset::getInstance().setVolume(savedVol);
-
-    // 1. Initialize ESP-NOW Mesh Subsystem
-    EspNowComm& comm = EspNowComm::getInstance();
-    if (g_deviceName[0] != '\0') {
-        comm.setDeviceName(g_deviceName);
-    }
-    comm.setReceiveCallback(onEspNowDecryptedReceived);
-    comm.init(g_channel, ESPNOW_ENABLE_LR);
-
-    // 2. Initialize USB Host Type-C Headset Audio Driver
-    UsbHeadset::getInstance().begin();
-
-    Serial.println("\n[SETUP] Node Ready!");
-    Serial.printf("[SETUP] Callsign: %s | Channel: %d | MAC: %s\n", g_deviceName, g_channel, comm.getMacString().c_str());
-    Serial.printf("[SETUP] Audio Volume: %u%%\n", UsbHeadset::getInstance().getVolume());
-    Serial.println("[SETUP] Headset Button (GPIO 4) / BOOT (GPIO 0): Press to Join / Leave Voice (HT Full Duplex)");
-    Serial.println("[SETUP] Volume UP Button (GPIO 1) / Volume DOWN Button (GPIO 2)");
-    Serial.println("[SETUP] BOOT Click: Fleet Discovery Ping | BOOT Double Click: Auto-Search Channels 1..13\n");
+    radio::peers_unlock();
+    printf("  radio: tx %lu rx %lu relayed %lu dup %lu auth-fail %lu tx-fail %lu\n",
+           (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
+           (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
+    printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
+           (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
+           (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
 }
 
-// Main Loop
-void loop() {
-    uint32_t now = millis();
-    EspNowComm& comm = EspNowComm::getInstance();
+void selftest() {
+    bool ok = true;
+    auto check = [&](bool c, const char* what) {
+        printf("  %s  %s\n", c ? "PASS" : "FAIL", what);
+        ok &= c;
+    };
+    printf("selftest\n");
+    wt::StreamFormat m = usb_headset::mic_format(), s = usb_headset::spk_format();
+    check(usb_headset::mic_ready(), "headset microphone streaming");
+    check(usb_headset::spk_ready(), "headset speaker streaming");
+    uint32_t b0 = audio::stats().mic_bytes;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    uint32_t got = audio::stats().mic_bytes - b0;
+    uint32_t expect = m.valid() ? m.rate * m.frame_bytes() / 2 : 1;
+    check(m.valid() && got > expect * 8 / 10 && got < expect * 12 / 10,
+          "mic delivers samples at its nominal rate (+/-20%)");
+    if (m.valid() && s.valid()) {
+        float snr = wt::pipeline_selftest(m.rate, s.rate);
+        char line[80];
+        snprintf(line, sizeof line, "1 kHz tone through the voice path at %lu->%lu Hz: %.1f dB SNR",
+                 (unsigned long)m.rate, (unsigned long)s.rate, snr);
+        check(snr > 18.f, line);
+    }
+    check(radio::stats().tx_fail == 0 || radio::stats().tx > radio::stats().tx_fail * 20,
+          "radio send failures under 5%");
+    printf("%s. Then: 'loop' and speak, you should hear yourself ~150 ms later.\n",
+           ok ? "ALL PASS" : "FAILED");
+}
 
-    // ============================================================
-    // Non-blocking Interactive Serial Terminal
-    // ============================================================
-    static char   s_serialBuf[128];
-    static size_t s_serialIdx = 0;
+void help() {
+    printf("\n  t        talk on/off (same as BOOT or headset button click)\n"
+           "  + / -    volume\n"
+           "  p        ping all nodes (same as long press)\n"
+           "  s        status, peers, counters\n"
+           "  ch N     radio channel 1..13 (all nodes must match)\n"
+           "  name X   set this node's name\n"
+           "  loop     loopback test: hear your own voice through the codec\n"
+           "  selftest check headset streams and the audio path\n"
+           "  reboot\n\n");
+}
 
-    while (Serial.available()) {
-        int c = Serial.read();
-        if (c < 0) break;
+void console_task(void*) {
+    char line[48];
+    size_t n = 0;
+    for (;;) {
+        int c = getchar();
+        if (c == EOF) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         if (c == '\r') continue;
-        if (c == '\n') {
-            s_serialBuf[s_serialIdx] = '\0';
-            if (s_serialIdx > 0) {
-                char* line = s_serialBuf;
-                size_t len = s_serialIdx;
+        if (c != '\n') {
+            if (n < sizeof line - 1) line[n++] = static_cast<char>(c);
+            continue;
+        }
+        line[n] = 0;
+        n = 0;
+        if (!strcmp(line, "t")) toggle_talk();
+        else if (!strcmp(line, "+")) volume_step(+10);
+        else if (!strcmp(line, "-")) volume_step(-10);
+        else if (!strcmp(line, "p")) send_ping();
+        else if (!strcmp(line, "s")) print_status();
+        else if (!strcmp(line, "loop")) {
+            audio::set_loopback(!audio::loopback());
+            printf("loopback %s\n", audio::loopback() ? "ON (speak now)" : "off");
+        } else if (!strcmp(line, "selftest")) selftest();
+        else if (!strcmp(line, "reboot")) esp_restart();
+        else if (!strncmp(line, "ch ", 3)) {
+            int ch = atoi(line + 3);
+            if (radio::set_channel(static_cast<uint8_t>(ch))) {
+                nvs_put_u8("ch", static_cast<uint8_t>(ch));
+                printf("channel %d\n", ch);
+            } else printf("channel must be 1..13\n");
+        } else if (!strncmp(line, "name ", 5) && line[5]) {
+            strncpy(s_name, line + 5, sizeof s_name - 1);
+            s_name[sizeof s_name - 1] = 0;
+            nvs_set_str(s_nvs, "name", s_name);
+            nvs_commit(s_nvs);
+            broadcast_state();
+            printf("name %s\n", s_name);
+        } else if (line[0]) help();
+    }
+}
 
-                if (len == 1 && (line[0] == 't' || line[0] == 'T' || line[0] == ' ')) {
-                    UsbHeadset::getInstance().toggleVoice();
-                } else if (len == 1 && (line[0] == '+' || line[0] == '=' || line[0] == 'u' || line[0] == 'U')) {
-                    UsbHeadset::getInstance().volumeUp(10);
-                    prefs.putUChar(NVS_KEY_VOLUME, UsbHeadset::getInstance().getVolume());
-                } else if (len == 1 && (line[0] == '-' || line[0] == '_' || line[0] == 'd' || line[0] == 'D')) {
-                    UsbHeadset::getInstance().volumeDown(10);
-                    prefs.putUChar(NVS_KEY_VOLUME, UsbHeadset::getInstance().getVolume());
-                } else if (len == 1 && (line[0] == 'p' || line[0] == 'P')) {
-                    triggerFleetPing(now);
-                } else if (len == 1 && (line[0] == 'c' || line[0] == 'C')) {
-                    startAutoChannelSearch();
-                } else if (strncasecmp(line, "ch ", 3) == 0 || strncasecmp(line, "channel ", 8) == 0) {
-                    const char* p = strchr(line, ' ');
-                    if (p) {
-                        int ch = atoi(p + 1);
-                        if (ch >= CHANNEL_MIN && ch <= CHANNEL_MAX) {
-                            g_channel = ch;
-                            prefs.putUChar(NVS_KEY_CHANNEL, g_channel);
-                            comm.setChannel(g_channel);
-                            Serial.printf("[CHANNEL] 📻 Switched to Channel %d\n", g_channel);
-                        } else {
-                            Serial.println("[CHANNEL] Invalid channel (1..13)");
-                        }
-                    }
-                } else if (strncasecmp(line, "name ", 5) == 0) {
-                    const char* name = line + 5;
-                    while (*name == ' ') name++;
-                    if (strlen(name) > 0) saveDeviceName(name);
-                } else if (len == 1 && (line[0] == '?' || line[0] == 'h' || line[0] == 'H')) {
-                    Serial.println("\n============== HT WALKIE-TALKIE COMMANDS ==============");
-                    Serial.println("  t / Space -> 🎙️ Toggle Join / Leave Voice (HT Full Duplex)");
-                    Serial.println("  + / u     -> 🔊 Volume UP (+10%)");
-                    Serial.println("  - / d     -> 🔉 Volume DOWN (-10%)");
-                    Serial.println("  p         -> 📡 Fleet Discovery Ping");
-                    Serial.println("  c         -> 🔍 Manual Channel Search (1..13)");
-                    Serial.println("  ch <1-13> -> 📻 Change Operating Channel");
-                    Serial.println("  name <str>-> 🏷️ Set Callsign Name");
-                    Serial.printf( "  Status    -> Transmitting: %s | Volume: %u%% | Ch: %d | MAC: %s\n",
-                                  UsbHeadset::getInstance().isTransmitting() ? "YES (Joined)" : "NO (Standby)",
-                                  UsbHeadset::getInstance().getVolume(), g_channel, comm.getMacString().c_str());
-                    Serial.printf( "  Headset   -> Connected: %s | DAC: %u Hz, %u-bit, %u ch | Mic: %u Hz, %u-bit, %u ch\n",
-                                  UsbHeadset::getInstance().isConnected() ? "YES" : "NO",
-                                  (unsigned int)UsbHeadset::getInstance().getSpkSampleRate(),
-                                  UsbHeadset::getInstance().getSpkBitRes(),
-                                  UsbHeadset::getInstance().getSpkChannels(),
-                                  (unsigned int)UsbHeadset::getInstance().getMicSampleRate(),
-                                  UsbHeadset::getInstance().getMicBitRes(),
-                                  UsbHeadset::getInstance().getMicChannels());
-                    Serial.println("========================================================\n");
-                }
+// --- buttons ---------------------------------------------------------------------------
+
+void on_hid_buttons(uint8_t down) { s_hid_down = down; }
+
+void on_headset_state(bool connected) {
+    if (connected) {
+        chime_join();
+        ESP_LOGI(TAG, "headset ready");
+    }
+}
+
+void init_gpio(gpio_num_t pin) {
+    gpio_config_t c = {};
+    c.pin_bit_mask = 1ULL << pin;
+    c.mode = GPIO_MODE_INPUT;
+    c.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&c);
+}
+
+bool low(gpio_num_t pin) { return gpio_get_level(pin) == 0; }
+
+}  // namespace
+
+extern "C" void app_main() {
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    size_t len = sizeof s_name;
+    if (nvs_get_str(s_nvs, "name", s_name, &len) != ESP_OK)
+        snprintf(s_name, sizeof s_name, "node-%04x", static_cast<unsigned>(esp_random() & 0xFFFF));
+    uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
+    audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
+
+    led::start();
+    led::set(led::Color::Blue);
+    for (gpio_num_t p : {cfg::kPinBoot, cfg::kPinTalk, cfg::kPinVolUp, cfg::kPinVolDown}) init_gpio(p);
+
+    if (!radio::start(ch, next_session(), on_rx)) {
+        led::set(led::Color::Red);
+        ESP_LOGE(TAG, "radio failed, halting");
+        vTaskDelay(portMAX_DELAY);
+    }
+    audio::start();
+    usb_headset::start(on_hid_buttons, on_headset_state);
+    xTaskCreatePinnedToCore(console_task, "console", 4096, nullptr, 3, nullptr, 0);
+    printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
+
+    wt::ButtonDetector talk, up, down;
+    uint32_t last_beacon = 0, talk_since = 0;
+    for (;;) {
+        uint32_t now = now_ms();
+        uint8_t hid = s_hid_down;
+        handle_press(talk.update(low(cfg::kPinBoot) || low(cfg::kPinTalk) ||
+                                     (hid & wt::HID_BTN_TALK), now), 0);
+        handle_press(up.update(low(cfg::kPinVolUp) || (hid & wt::HID_BTN_VOL_UP), now), 1);
+        handle_press(down.update(low(cfg::kPinVolDown) || (hid & wt::HID_BTN_VOL_DOWN), now), 2);
+
+        // Auto-mute a mic that has been left open too long.
+        if (audio::talking()) {
+            if (!talk_since) talk_since = now;
+            if (now - talk_since > cfg::kMaxTalkMs) {
+                ESP_LOGW(TAG, "mic open for %lus, muting", (unsigned long)(cfg::kMaxTalkMs / 1000));
+                toggle_talk();
             }
-            s_serialIdx = 0;
-        } else if (s_serialIdx < sizeof(s_serialBuf) - 1) {
-            s_serialBuf[s_serialIdx++] = (char)c;
         } else {
-            s_serialIdx = 0;
+            talk_since = 0;
         }
-    }
 
-    // USB Headset Background Loop
-    UsbHeadset::getInstance().loop();
-
-    // Channel Scanning (active only when manually triggered)
-    if (g_isScanning) {
-        processAutoChannelSearch();
-    }
-
-    // Periodic Mesh Channel Beacon (15s energy-saving, 4s startup)
-    PeerNode peers[1];
-    bool hasActivePeers = (comm.getActivePeers(peers, 1) > 0);
-    uint32_t beaconInterval = hasActivePeers ? CHANNEL_BEACON_INTERVAL_MS : CHANNEL_BEACON_FAST_MS;
-
-    if (!g_isScanning && (now - g_lastBeaconMs >= beaconInterval)) {
-        g_lastBeaconMs = now;
-        comm.pruneStalePeers();
-        comm.sendChannelBeacon(g_channel, now / 1000);
-    }
-
-    // Fleet Discovery Ping Window Processing (450ms collection window)
-    if (g_pingCollecting && (now - g_pingSentMs >= PING_COLLECTION_WINDOW_MS)) {
-        g_pingCollecting = false;
-
-        Serial.println("\n[PING-FLEET] ===================================================");
-        Serial.printf("[PING-FLEET] Discovery Complete in %u ms!\n", (unsigned int)(now - g_pingSentMs));
-        Serial.printf("[PING-FLEET] Total Nodes Reached: %u (Direct: %u, Relayed: %u)\n",
-                      g_numResponders, g_pongDirectCount, g_pongRelayCount);
-
-        for (int i = 0; i < g_numResponders; i++) {
-            const PingResponder& r = g_responders[i];
-            const char* routeStr = (r.hops == 0) ? "🟢 Direct Line-of-Sight" :
-                                   (r.hops == 1) ? "🩵 1-Hop Mesh Relay 🔁" : "🩵 2-Hop Mesh Relay 🔁🔁";
-            Serial.printf("[PING-FLEET] [%u] %-6s | RTT: %2u ms | Local RSSI: %3d dBm | Remote RSSI: %3d dBm | %s\n",
-                          i + 1, r.name, (unsigned int)r.rtt, r.localRssi, r.remoteRssi, routeStr);
+        if (now - last_beacon >= cfg::kBeaconMs) {
+            last_beacon = now;
+            uint8_t p[1 + sizeof s_name];
+            p[0] = audio::talking();
+            memcpy(p + 1, s_name, sizeof s_name);
+            radio::send(wt::MSG_BEACON, p, sizeof p);
+            radio::peers_lock();
+            radio::peers().prune(now);
+            radio::peers_unlock();
         }
-        Serial.println("[PING-FLEET] ===================================================\n");
-
-        if (g_numResponders == 0) {
-            blinkPattern(LED_COLOR_RED, 2, 120, 80);
-            triggerAlert(150, 1);
-        } else {
-            blinkPattern(LED_COLOR_GREEN, g_numResponders, 100, 60);
-        }
+        update_led();
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    // ============================================================
-    // HEADSET / EXTERNAL BUTTON (GPIO 4) & ON-BOARD BOOT (GPIO 0):
-    // Press button to JOIN voice channel, press again to LEAVE!
-    // Double click BOOT -> Auto-channel search
-    // ============================================================
-    bool pttBtnRaw = (digitalRead(PTT_BUTTON_PIN) == LOW) || (digitalRead(PTT_EXT_BUTTON_PIN) == LOW);
-    static bool     s_pttPressed     = false;
-    static uint32_t s_pttDebounceMs  = 0;
-    static uint32_t s_lastPttClickMs = 0;
-
-    if (pttBtnRaw != s_pttPressed && (now - s_pttDebounceMs >= 40)) {
-        s_pttDebounceMs = now;
-        s_pttPressed = pttBtnRaw;
-
-        if (s_pttPressed) {
-            // Check double-click for channel search (within 350ms)
-            if (now - s_lastPttClickMs < 350) {
-                s_lastPttClickMs = 0;
-                startAutoChannelSearch();
-            } else {
-                s_lastPttClickMs = now;
-                // Single Click: Toggle Voice Join / Leave (Full Duplex HT)
-                UsbHeadset::getInstance().toggleVoice();
-            }
-        }
-    }
-
-    // ============================================================
-    // Volume UP Button (GPIO 1 to GND)
-    // ============================================================
-    bool volUpRaw = (digitalRead(VOL_UP_BUTTON_PIN) == LOW);
-    static bool     s_volUpPressed    = false;
-    static uint32_t s_volUpDebounceMs = 0;
-
-    if (volUpRaw != s_volUpPressed && (now - s_volUpDebounceMs >= 40)) {
-        s_volUpDebounceMs = now;
-        s_volUpPressed = volUpRaw;
-        if (s_volUpPressed) {
-            UsbHeadset::getInstance().volumeUp(10);
-            prefs.putUChar(NVS_KEY_VOLUME, UsbHeadset::getInstance().getVolume());
-        }
-    }
-
-    // ============================================================
-    // Volume DOWN Button (GPIO 2 to GND)
-    // ============================================================
-    bool volDownRaw = (digitalRead(VOL_DOWN_BUTTON_PIN) == LOW);
-    static bool     s_volDownPressed    = false;
-    static uint32_t s_volDownDebounceMs = 0;
-
-    if (volDownRaw != s_volDownPressed && (now - s_volDownDebounceMs >= 40)) {
-        s_volDownDebounceMs = now;
-        s_volDownPressed = volDownRaw;
-        if (s_volDownPressed) {
-            UsbHeadset::getInstance().volumeDown(10);
-            prefs.putUChar(NVS_KEY_VOLUME, UsbHeadset::getInstance().getVolume());
-        }
-    }
-
-    // Auto-turn off status LED after timeout (if not actively transmitting or receiving)
-    if (g_ledOffMs > 0 && now >= g_ledOffMs) {
-        g_ledOffMs = 0;
-        if (!UsbHeadset::getInstance().isTransmitting() && !UsbHeadset::getInstance().isPlaying()) {
-            setStatusLed(LED_COLOR_OFF);
-        }
-    }
-
-    // Auto-turn off buzzer
-    if (g_buzzerOffMs > 0 && now >= g_buzzerOffMs) {
-        g_buzzerOffMs = 0;
-        digitalWrite(BUZZER_PIN, LOW);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(15));
 }

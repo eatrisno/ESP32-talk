@@ -1,134 +1,136 @@
-# ESP32-S3 HT Full Duplex Mesh Walkie-Talkie
+# ESP32-S3 Mesh Walkie-Talkie
 
-Perangkat Handy Talkie (HT) digital mandiri (*headless*), terenkripsi, dan beroperasi secara *off-grid* berbasis **ESP32-S3**. Dirancang khusus untuk komunikasi suara dua arah secara simultan (**Full Duplex**) melalui jaringan **ESP-NOW Long-Range Mesh**, menggunakan headset standar USB Type-C tanpa membutuhkan layar, internet, maupun router Wi-Fi.
-
----
-
-## ⚡ Fitur Utama (Core HT Features)
+Hands-free group voice over ESP-NOW. Plug a USB-C headset into an ESP32-S3 and every node in range joins
+one conversation automatically, with no pairing, no router and no internet. Nodes out of direct range are
+reached through the others (mesh relay, up to 2 hops).
 
 ```
-┌────────────────────────────────┐         Encrypted ESP-NOW LR          ┌────────────────────────────────┐
-│      ESP32-S3 Node: "Peto"     │◄─────────────────────────────────────►│      ESP32-S3 Node: "Bubu"     │
-│  • Pure Station (WIFI_STA)     │         Channels 1–13 (Auto-Sync)     │  • Pure Station (WIFI_STA)     │
-│  • +20 dBm TX Power (100mW)    │         AES-128 Hardware Crypto       │  • +20 dBm TX Power (100mW)    │
-│  • 50ms Live Voice Streaming   │         Voice + Discovery Ping        │  • 50ms Live Voice Streaming   │
-│  • Type-C Headset (Mic & Spk)  │          Autonomous Mesh Relay        │  • Type-C Headset (Mic & Spk)  │
-│  • HT Full Duplex Audio Mixer  │                                       │  • HT Full Duplex Audio Mixer  │
-└────────────────────────────────┘                                       └────────────────────────────────┘
-                                                ▲
-                                                │ Mesh Relay (TTL=3)
-                                                ▼
-                                 ┌────────────────────────────────┐
-                                 │      ESP32-S3 Node: "Wawa"     │
-                                 │  • Pure Station (WIFI_STA)     │
-                                 │  • Autonomous Packet Forwarder │
-                                 │  • Real-Time Audio Engine      │
-                                 └────────────────────────────────┘
+  Node A ◄──────────► Node B ◄──────────► Node C
+   (headset)            (headset)           (headset)
+        A and C cannot hear each other: B relays.
+        All three hear each other, up to 4 talkers mixed at once.
 ```
 
-1. **Jaringan Mesh ESP-NOW (Autonomous Store-and-Forward Relay):**
-   - Protokol ESP-NOW Long-Range (`WIFI_PROTOCOL_LR`) dengan daya pancar maksimum +20 dBm (100 mW).
-   - PHY rate 6 Mbps OFDM (airtime ultra-singkat ~340 µs/paket) untuk meminimalkan risiko tabrakan RF.
-   - Fitur repeater otonom antar node dengan batasan `TTL = 3` (jangkauan dapat menembus halangan hingga 1.5–2+ km).
-   - Buffer deduplikasi 64-entri untuk mencegah *broadcast storm* dan *packet loop*.
-   - Keamanan enkripsi perangkat keras **AES-128-CTR** pada setiap paket kontrol dan suara.
+## What it does
 
-2. **HT Full Duplex & Multi-Party Audio Mixer:**
-   - Komunikasi dua arah simultan: pengguna dapat berbicara dan mendengarkan suara teman secara bersamaan tanpa terpotong (*no channel lockout*).
-   - Digital mixer audio real-time dengan proteksi saturasi sinyal:
-     $$\text{Sample}_{\text{mixed}} = \text{clamp}\big(\text{Sample}_A + \text{Sample}_B, -32768, 32767\big)$$
-   - Codec suara efisien IMA-ADPCM 4:1 (kompresi 16-bit 8 kHz ke 32 kbps).
-   - Jitter buffer sirkular (8 slot $\times$ 50ms) dengan prebuffering 100ms yang berjalan di FreeRTOS Core 1 untuk output suara yang mulus tanpa putus-putus (*zero stutter*).
-   - Filter DSP *80 Hz DC-blocker* untuk menghilangkan noise napas dan letupan angin.
-
-3. **Tombol Headset / PTT Press untuk Join:**
-   - Tekan tombol headset (atau GPIO 4 / GPIO 0) untuk **JOIN** ke saluran suara (*Full Duplex Active*).
-   - Tekan kembali untuk **LEAVE** / *Mute* kembali ke mode siaga (*Standby*).
-   - Dilengkapi nada notifikasi akustik ke telinga (*ascending chime* saat Join, *descending chime* saat Leave).
-
-4. **Pengatur Volume Fisik (Up & Down):**
-   - Tombol fisik Volume UP (GPIO 1) dan Volume DOWN (GPIO 2).
-   - Pengaturan skala volume 0% – 100% (langkah 10%).
-   - Umpan balik nada suara langsung ke earphone (nada tinggi saat volume naik, nada rendah saat volume turun, nada batas saat 100% atau 0%).
-   - Level volume tersimpan permanen di memori flash NVS (*non-volatile storage*).
-
-5. **Sinkronisasi Saluran & Penemuan Node (Auto-Discovery):**
-   - Deteksi otomatis saluran RF 1–13 jika belum terhubung dengan node rekan.
-   - *Fleet Discovery Ping*: memeriksa node rekan yang aktif dan mengukur latensi round-trip (RTT) serta jalur hop (*Direct* vs *Mesh Relay*).
-
----
-
-## 🔌 Skema Pinout & Pengkabelan Hardware
-
-| ESP32-S3 Pin | Fungsi | Keterangan Sambungan |
-|---|---|---|
-| **GPIO 19** | USB OTG D- | Terhubung ke jalur D- port USB Type-C earphone |
-| **GPIO 20** | USB OTG D+ | Terhubung ke jalur D+ port USB Type-C earphone |
-| **GPIO 4** | **Headset / External Button** | Tombol Headset / tombol eksternal untuk **Join/Leave Voice** (`INPUT_PULLUP` ke GND) |
-| **GPIO 0** | **BOOT Button** | Tombol pada board DevKit (Klik: Join/Leave, Double Klik: Cari Saluran) |
-| **GPIO 1** | **Volume UP Button** | Tombol fisik untuk menaikkan volume (`INPUT_PULLUP` ke GND) |
-| **GPIO 2** | **Volume DOWN Button** | Tombol fisik untuk menurunkan volume (`INPUT_PULLUP` ke GND) |
-| **GPIO 48** | WS2812 RGB LED | Lampu indikator status on-board |
-| **GPIO 21** | Buzzer | Output buzzer alert (3.3V aktif/pasif) |
-| **5V / VBUS** | Daya Headset | Sumber tegangan 5V ke port USB Type-C headset |
-
-> [!IMPORTANT]
-> Headset USB Type-C digital memerlukan suplai daya 5V pada pin VBUS port Type-C. Pastikan jalur 5V ESP32 terhubung ke pin VBUS Type-C atau gunakan splitter/OTG adapter yang memiliki injeksi daya 5V.
-
----
-
-## 🎛️ Panduan Penggunaan Tombol
-
-| Tombol / Aksi | Fungsi | Indikator LED | Umpan Balik Nada Headset |
-|---|---|---|---|
-| **Tekan Tombol Headset (GPIO 4)** | **Toggle Join / Leave Saluran Suara** | **Merah Solid** saat Join, **Biru Singkat** saat Leave | *Ascending Chime* (Join) / *Descending Chime* (Leave) |
-| **Tekan Tombol BOOT (GPIO 0)** | **Toggle Join / Leave** (Identik dengan Headset) | **Merah Solid** saat Join | *Ascending Chime* / *Descending Chime* |
-| **Double-Click BOOT (<350ms)** | **Auto-Search Saluran** (Scan Ch 1–13) | **Kuning/Amber Berkedip** | Nada konfirmasi ganda saat saluran terkunci |
-| **Tekan Tombol Vol UP (GPIO 1)** | **Menaikkan Volume (+10%)** | — | Beep frekuensi tinggi (1500 Hz / limit 2200 Hz) |
-| **Tekan Tombol Vol DOWN (GPIO 2)** | **Menurunkan Volume (-10%)** | — | Beep frekuensi rendah (750 Hz / limit 400 Hz) |
-
----
-
-## 💡 Arti Warna Lampu Indikator LED (WS2812 RGB)
-
-| Warna LED | Status Perangkat |
+| | |
 |---|---|
-| 🔴 **Merah Solid** | **Pengirim Aktif (Joined):** Mikrofon sedang merekam dan mentransmisikan suara Full Duplex |
-| 🟢 **Hijau Solid / Kedip** | **Penerima:** Suara dari node rekan sedang masuk dan diputar ke headset / Node terdeteksi |
-| 🔵 **Biru Singkat** | **Konfirmasi Transmisi:** Selesai mentransmisikan paket suara / kembali ke Standby |
-| 🟠 **Kuning / Amber** | **Pencarian Saluran:** Sedang memindai saluran RF 1 hingga 13 |
-| 🩵 **Cyan** | **Ping:** Paket ping sedang dikirim / Saluran RF berhasil terkunci |
-| ⚪ **Mati (Off)** | **Siaga (Standby):** Siap menerima transmisi suara rekan kapan saja |
+| Conference | Every node on the same channel and key hears every talker. Up to 4 voices are mixed at once. |
+| Mesh | Each node rebroadcasts new packets once (ttl 3). A node skips its relay if a neighbour already sent it. |
+| Headset | Any USB Audio Class 1.0 headset. It picks the best format the headset offers (48/44.1/32/16 kHz…, mono or stereo, 16/24/32-bit). |
+| Headset buttons | Play/Pause, Hook and Mute on the headset act the same as the BOOT button. Its Vol+ and Vol- change volume. |
+| Voice | 8 kHz, IMA-ADPCM (32 kbit/s), 40 ms frames. Mic has a DC filter, automatic gain and a voice gate, so silence is not sent. |
+| Losses | Each frame carries its own decoder state, so a lost packet costs 40 ms and does not corrupt the frames after it. |
+| Security | AES-128-CCM on every frame (encryption and authentication). Replay protection per sender. |
 
----
+## Hardware
 
-## 🛠️ Panduan Build & Flash Firmware
+* ESP32-S3 board with native USB (tested target: ESP32-S3-DevKitC-1).
+* USB-C headset (digital, UAC 1.0), connected to the native USB port (GPIO 19/20). The headset must get
+  5 V on VBUS: use an OTG adapter with power, or wire 5 V to the port.
+* Console/flashing goes through the other USB port (UART bridge).
 
-### 1. Prasyarat
-- [PlatformIO](https://platformio.org/) (terpasang via CLI atau ekstensi VSCode/Cursor)
-- Python 3.8+
+| Pin | Use | Notes |
+|---|---|---|
+| GPIO 0 | BOOT button | Talk on/off, long press = ping |
+| GPIO 4 | External talk button | Optional, to GND |
+| GPIO 1 / 2 | Volume up / down | Optional, to GND |
+| GPIO 48 | WS2812 LED | DevKitC v1.1 uses GPIO 38. Change `cfg::kPinLed` in `src/config.hpp` |
+| GPIO 19 / 20 | USB D- / D+ | Headset |
 
-### 2. Kompilasi Firmware
-Buka terminal pada direktori `esp32-walkie-talkie` dan jalankan:
+## Using it
+
+| Action | Result |
+|---|---|
+| Click BOOT, the external button or the headset button | Mic on/off. Rising chime = on, falling chime = off. Same chime and LED for every button. |
+| Long press (1.5 s) | Ping all nodes, results on the console |
+| Vol +/- (pins or headset) | ±10 %, saved. A higher beep means louder. A beep at the limit means it can't go further. |
+| Another node turns its mic on/off | Short high/low beep |
+
+With the mic on, audio is only sent while you speak (voice gate, 400 ms hangover). The mic turns itself off
+after 2 minutes open.
+
+| LED | Meaning |
+|---|---|
+| Blue | No headset |
+| Off | Ready, mic muted |
+| Amber | Mic on, waiting for speech |
+| Red | Sending your voice |
+| Green | Playing someone else |
+| White | Loopback test |
+| Cyan flash | Answered a ping |
+
+## Build and flash
+
+Needs [PlatformIO](https://platformio.org/). The first build downloads ESP-IDF and the USB components.
+
 ```bash
-python3 -m platformio run
+# set your own network key once, the same on every node (32 hex characters)
+export PLATFORMIO_BUILD_FLAGS='-DWT_NETWORK_KEY_HEX=\"'$(openssl rand -hex 16)'\"'
+pio run -e esp32s3 -t upload -t monitor
 ```
 
-### 3. Flash ke Perangkat ESP32-S3
-Hubungkan board ESP32-S3 ke komputer menggunakan kabel data USB (port UART/USB DevKit):
-```bash
-python3 -m platformio run -t upload
+Without `WT_NETWORK_KEY_HEX` the build uses a public default key, so anyone running this firmware can listen.
+
+## Console (115200 baud)
+
+```
+t         mic on/off                 s         status, peers, counters
++ / -     volume                     ch N      channel 1..13 (same on all nodes)
+p         ping                       name X    node name
+loop      hear yourself through the codec (headset check, no second node needed)
+selftest  check the headset streams and the audio path, prints PASS/FAIL
 ```
 
-### 4. Buka Terminal Pemantau Interaktif
-Gunakan skrip Python bawaan untuk memantau status perangkat dan mengirim perintah:
+## Testing
+
 ```bash
-python3 scripts/interactive_terminal.py
-```
-Atau menggunakan serial monitor PlatformIO (115200 baud):
-```bash
-python3 -m platformio device monitor -b 115200
+pio test -e native     # 35 host tests, no hardware
 ```
 
-### 5. Hubungkan Node Kedua
-Lakukan langkah yang sama pada unit ESP32-S3 kedua. Kedua perangkat akan otomatis saling menemukan melalui jaringan ESP-NOW Mesh dan siap digunakan untuk komunikasi suara Full Duplex!
+The host tests run the same code as the firmware. A 1 kHz tone goes from the mic rate through 8 kHz, ADPCM,
+the packet format and the jitter buffer to the speaker rate. The test checks its level and SNR for every pair
+of common headset rates, and with packet loss. They also cover format selection for headsets without 48 kHz,
+stereo-mic handling, out-of-order and duplicate frames, clock drift, the replay window, the 3-node relay
+path, HID descriptors from three headset layouts, button debounce and long press, and the voice gate.
+
+On a device, run `selftest`, then `loop`, then a 3-node walk test. Things the tests cannot prove (USB
+enumeration of a given headset, RF range, how it sounds) still need the hardware.
+
+## Layout
+
+```
+lib/wt_core/src/   hardware-free core, built for both the ESP32 and the host tests
+  dsp           resampler, filters, AGC, limiter, feedback tones
+  adpcm         IMA-ADPCM codec
+  format        pick a USB stream format, PCM <-> mono
+  jitter        per-talker jitter buffer, loss concealment, drift control
+  protocol      wire format, replay window
+  mesh          peer table, relay queue
+  hid_buttons   HID report descriptor parser
+  button        debounce, click, long press
+  voice_gate    voice detection, pipeline self-test
+src/               ESP-IDF firmware
+  usb_headset   USB host: UAC mic + speaker, HID buttons
+  audio         mic task, speaker task, mixer
+  radio         ESP-NOW, AES-CCM, relay
+  led, config, main (buttons, beacons, console)
+test/test_core/    host tests
+```
+
+## Protocol (v3)
+
+16-byte header `'W' ver type ttl sender[4] session[4] seq[4]`, then the AES-128-CCM ciphertext and an
+8-byte tag. The header with ttl zeroed is authenticated. The nonce is `sender|session|seq`, and `session`
+is a boot counter in NVS, so a nonce is never reused. Not compatible with firmware 2.x.
+
+## Limits
+
+* One shared key per group. A node that leaks the key lets anyone join. Use your own key and keep it out
+  of the repo.
+* 4 simultaneous talkers. A fifth is dropped until one stops.
+* UAC 2.0-only headsets are not supported (the ESP-IDF UAC host driver is UAC 1.0). Most USB-C headsets
+  are UAC 1.0.
+* Range: 6 Mbit/s ESP-NOW at 20 dBm reaches roughly 100-300 m line of sight per hop (not measured with this
+  build). `cfg::kLongRange` switches to Espressif LR (about 2x range, but roughly 12x the airtime per
+  frame, so fewer talkers fit). Check the transmit power limit where you use it (`cfg::kTxPowerQdBm`).
