@@ -53,6 +53,7 @@ static volatile uint32_t s_distress_peer = 0;
 static char s_distress_peer_name[12] = "";
 static uint32_t s_last_distress_tx_ms = 0;
 static uint32_t s_last_distress_beep_ms = 0;
+static uint32_t s_last_distress_rx_ms = 0;
 static volatile bool s_vm_recording = false;
 static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
@@ -642,17 +643,24 @@ void on_rx(const radio::Rx& rx) {
                 memcpy(&dp, rx.plain, sizeof(dp));
                 dp.name[sizeof(dp.name) - 1] = 0;
                 if (dp.active) {
+                    bool is_new = (s_distress_peer != dp.sender);
                     s_distress_peer = dp.sender;
+                    s_last_distress_rx_ms = now_ms();
                     strncpy(s_distress_peer_name, dp.name, sizeof(s_distress_peer_name) - 1);
                     s_distress_peer_name[sizeof(s_distress_peer_name) - 1] = 0;
-                    printf("\n*** [DISTRESS ALERT] Emergency SOS from %s (%08lx)! RSSI: %d dBm ***\n\n",
-                           dp.name, (unsigned long)dp.sender, rx.rssi);
-                    sound_distress_alert();
+                    if (is_new) {
+                        printf("\n*** [DISTRESS ALERT] Emergency SOS from %s (%08lx)! RSSI: %d dBm ***\n\n",
+                               dp.name, (unsigned long)dp.sender, rx.rssi);
+                        sound_distress_alert();
+                        s_last_distress_beep_ms = now_ms();
+                    }
                 } else {
-                    if (s_distress_peer == dp.sender) s_distress_peer = 0;
-                    printf("\n[DISTRESS CLEARED] Emergency resolved by %s (%08lx).\n\n",
-                           dp.name, (unsigned long)dp.sender);
-                    sound_all_clear();
+                    if (s_distress_peer == dp.sender) {
+                        s_distress_peer = 0;
+                        printf("\n[DISTRESS CLEARED] Emergency resolved by %s (%08lx).\n\n",
+                               dp.name, (unsigned long)dp.sender);
+                        sound_all_clear();
+                    }
                 }
             }
             break;
@@ -1145,12 +1153,15 @@ extern "C" void app_main() {
                 s_last_distress_tx_ms = now;
                 send_distress_packet(true);
             }
-            if (now - s_last_distress_beep_ms >= 2500) {
+            if (now - s_last_distress_beep_ms >= 10000) {
                 s_last_distress_beep_ms = now;
-                sound_distress_alert();
+                audio::tone(800, 30, 250);
             }
         } else if (s_distress_peer != 0) {
-            if (now - s_last_distress_beep_ms >= 3000) {
+            if (now - s_last_distress_rx_ms > 8000) {
+                s_distress_peer = 0;
+                sound_all_clear();
+            } else if (now - s_last_distress_beep_ms >= 12000) {
                 s_last_distress_beep_ms = now;
                 sound_distress_alert();
             }
