@@ -22,8 +22,10 @@
 #include "hid_buttons.hpp"
 #include "led.hpp"
 #include "nvs.h"
+#include "driver/temperature_sensor.h"
 #include "nvs_flash.h"
 #include "radio.hpp"
+#include "range_test.hpp"
 #include "usb_headset.hpp"
 #include "voice_gate.hpp"
 
@@ -37,6 +39,21 @@ nvs_handle_t s_nvs;
 SemaphoreHandle_t s_app_mtx;
 volatile uint8_t s_hid_down = 0;
 uint32_t s_ping_token = 0, s_ping_ms = 0;
+
+static uint32_t s_range_token = 0;
+static wt::RangeStats s_range_stats;
+static volatile bool s_range_active = false;
+static volatile bool s_walk_mode = false;
+static volatile bool s_walk_pending = false;
+static uint32_t s_walk_probe_sent_ms = 0;
+static uint16_t s_walk_seq = 0;
+
+static volatile bool s_distress_active = false;
+static volatile uint32_t s_distress_peer = 0;
+static char s_distress_peer_name[12] = "";
+static uint32_t s_last_distress_tx_ms = 0;
+static uint32_t s_last_distress_beep_ms = 0;
+static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -74,14 +91,75 @@ void chime_leave() { audio::tone(420, 45, 400); }
 void chime_peer_joined() { audio::tone(550, 30, 400); }
 void chime_peer_left() { audio::tone(400, 30, 350); }
 
+void sound_distress_alert() {
+    // Gentle, non-deafening distress tone: warm two-tone 620Hz (130ms), gap 30ms, 480Hz (170ms) at amplitude 380
+    audio::tone(620, 130, 380);
+    audio::tone(0, 30);
+    audio::tone(480, 170, 380);
+}
+
+void sound_all_clear() {
+    // Gentle soothing all-clear chime: rising 450Hz (70ms) -> 600Hz (100ms)
+    audio::tone(450, 70, 400);
+    audio::tone(0, 20);
+    audio::tone(600, 100, 400);
+}
+
 void update_led() {
     using led::Color;
+    if (s_distress_active || s_distress_peer != 0) {
+        static uint32_t s_last_distress_flash = 0;
+        static bool s_red_on = false;
+        uint32_t now = now_ms();
+        if (now - s_last_distress_flash >= 250) {
+            s_last_distress_flash = now;
+            s_red_on = !s_red_on;
+        }
+        led::set(s_red_on ? Color::Red : Color::Off);
+        return;
+    }
+
+    static bool s_was_sending = false;
+    static bool s_was_receiving = false;
+    bool sending = audio::sending();
+    bool receiving = audio::receiving();
+
+    // Subtle edge confirmation flashes: 1 short flash at start, then OFF
+    if (sending && !s_was_sending) {
+        led::flash(Color::Red, 70);    // 1 quick red blip when you start transmitting
+    }
+    if (receiving && !s_was_receiving) {
+        led::flash(Color::Green, 70);  // 1 quick green blip when incoming voice begins
+    }
+    s_was_sending = sending;
+    s_was_receiving = receiving;
+
     if (audio::loopback()) led::set(Color::White);
-    else if (audio::sending()) led::set(Color::Red);
-    else if (audio::receiving()) led::set(Color::Green);
-    else if (audio::talking()) led::set(Color::Amber);  // mic open, waiting for speech
     else if (!usb_headset::spk_ready()) led::set(Color::Blue);
-    else led::set(Color::Off);
+    else led::set(Color::Off);  // silent & dark while speaking and listening
+}
+
+void send_distress_packet(bool active) {
+    wt::DistressPayload dp;
+    dp.sender = radio::self_id();
+    dp.active = active ? 1 : 0;
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    strncpy(dp.name, s_name, sizeof(dp.name) - 1);
+    dp.name[sizeof(dp.name) - 1] = 0;
+    xSemaphoreGive(s_app_mtx);
+    radio::send(wt::MSG_DISTRESS, reinterpret_cast<const uint8_t*>(&dp), sizeof(dp));
+}
+
+void toggle_distress() {
+    s_distress_active = !s_distress_active;
+    send_distress_packet(s_distress_active);
+    if (s_distress_active) {
+        printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
+        sound_distress_alert();
+    } else {
+        printf("\n*** [DISTRESS CANCELLED] All-clear broadcasted. ***\n\n");
+        sound_all_clear();
+    }
 }
 
 // --- actions ---------------------------------------------------------------------------
@@ -167,11 +245,11 @@ void radar_check() {
     for (int i = 0; i < count; i++) {
         const char* dist = "far";
         if (active[i].hops == 0) {
-            if (active[i].rssi >= -65) dist = "close (<25m)";
-            else if (active[i].rssi >= -80) dist = "medium (~50m)";
-            else dist = "far (>80m)";
+            if (active[i].rssi >= -70) dist = "close / strong (beep panjang)";
+            else if (active[i].rssi >= -88) dist = "medium / mid-range (beep sedang)";
+            else dist = "far / weak (beep pendek)";
         } else {
-            dist = "relayed via mesh";
+            dist = "relayed via mesh (beep pendek)";
         }
         printf("  - %-11s %s  RSSI %4d dBm  (%s)\n",
                active[i].name[0] ? active[i].name : "?",
@@ -181,33 +259,26 @@ void radar_check() {
     if (count == 0) printf("  No peers in range.\n\n");
     else printf("\n");
 
-    // Audio acoustic telemetry in headset
+    // Audio acoustic telemetry in headset using intuitive beep length:
+    // - Kuat (>= -70 dBm): Beep Panjang (~350ms)
+    // - Sedang (-71 s/d -88 dBm): Beep Sedang (~160ms)
+    // - Lemah (< -88 dBm / relay): Beep Pendek (~50ms)
+    // - 0 peer: descending double-boop
     if (count == 0) {
-        // 0 peers: soft low descending tone (350Hz 60ms, gap 20ms, 280Hz 80ms)
-        audio::tone(350, 60, 400);
+        // 0 peers: soft low descending tone (350Hz 80ms, gap 20ms, 250Hz 100ms)
+        audio::tone(350, 80, 380);
         audio::tone(0, 20);
-        audio::tone(280, 80, 400);
+        audio::tone(250, 100, 380);
     } else {
-        // 1 to N peers: play N soft pips (550Hz, 35ms with 75ms gap)
-        int pips = count > 6 ? 6 : count;
-        for (int i = 0; i < pips; i++) {
-            audio::tone(550, 35, 450);
-            audio::tone(0, 75);
-        }
-        // Short pause before distance indicator
-        audio::tone(0, 150);
-        // Distance chime based on closest direct peer
-        if (has_direct && best_rssi >= -65) {
-            // Close: bright high double-chime (750Hz 40ms, gap 30ms, 850Hz 50ms)
-            audio::tone(750, 40, 450);
-            audio::tone(0, 30);
-            audio::tone(850, 50, 450);
-        } else if (has_direct && best_rssi >= -80) {
-            // Medium: single warm mid chime (550Hz 60ms)
-            audio::tone(550, 60, 400);
+        if (has_direct && best_rssi >= -70) {
+            // Signal Kuat: BEEP PANJANG (620Hz, 350ms)
+            audio::tone(620, 350, 400);
+        } else if (has_direct && best_rssi >= -88) {
+            // Signal Sedang: BEEP SEDANG (540Hz, 160ms)
+            audio::tone(540, 160, 380);
         } else {
-            // Far or multi-hop: low soft tone (380Hz 80ms)
-            audio::tone(380, 80, 400);
+            // Signal Lemah / Multi-hop: BEEP PENDEK (440Hz, 50ms)
+            audio::tone(440, 50, 360);
         }
     }
 }
@@ -218,23 +289,35 @@ static bool s_pending_single_talk = false;
 void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
     if (p == wt::Press::None) return;
-    ESP_LOGI(TAG, "Button %d event: %s", which, p == wt::Press::Click ? "Click" : "Long");
+    ESP_LOGI(TAG, "Button %d event: %d", which, static_cast<int>(p));
     if (which == 0) {
+        if (s_distress_active) {
+            // Any click or press while distress is active immediately cancels it!
+            s_pending_single_talk = false;
+            toggle_distress();
+            return;
+        }
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
-            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 350)) {
+            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 450)) {
                 // Double click: cancel single click and run radar check
                 s_pending_single_talk = false;
                 ESP_LOGI(TAG, "Double click: radar check");
                 radar_check();
             } else {
-                // First click: wait up to 350ms to see if a second click arrives
+                // First click: wait up to 450ms to see if a second click arrives
                 s_pending_single_talk = true;
                 s_last_talk_click_ms = now;
             }
         } else if (p == wt::Press::Long) {
+            // Pre-warning soft ticks at 1.2s indicating button is being held for distress
+            audio::tone(650, 20, 350);
+            audio::tone(0, 40);
+            audio::tone(750, 25, 350);
+        } else if (p == wt::Press::Hold) {
+            // 2.5s hold: trigger distress signal!
             s_pending_single_talk = false;
-            send_ping();
+            toggle_distress();
         }
     }
     if (which == 1 && p == wt::Press::Click) volume_step(+10);
@@ -294,6 +377,119 @@ void on_rx(const radio::Rx& rx) {
                    rx.hops ? "via relay" : "direct", rx.rssi);
             break;
         }
+        case wt::MSG_RANGE_REQ: {
+            if (rx.len >= sizeof(wt::RangeReq)) {
+                wt::RangeReq req;
+                memcpy(&req, rx.plain, sizeof(req));
+                wt::RangeResp resp;
+                resp.token = req.token;
+                resp.seq = req.seq;
+                resp.req_rssi = rx.rssi;
+                radio::send(wt::MSG_RANGE_RESP, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
+                led::flash(led::Color::Cyan, 40);
+            }
+            break;
+        }
+        case wt::MSG_RANGE_RESP: {
+            if (rx.len >= sizeof(wt::RangeResp)) {
+                wt::RangeResp resp;
+                memcpy(&resp, rx.plain, sizeof(resp));
+                if (resp.token == s_range_token) {
+                    s_walk_pending = false;
+                    s_range_stats.add_sample(resp.req_rssi, rx.rssi);
+                    // Acoustic pitch proportional to link strength
+                    if (rx.rssi >= -75) audio::tone(880, 40, 450);      // Strong
+                    else if (rx.rssi >= -90) audio::tone(580, 40, 400); // Medium
+                    else audio::tone(380, 50, 400);                     // Edge of range
+                    printf("  probe #%-2u: OK | Downlink: %4d dBm | Uplink: %4d dBm\n",
+                           resp.seq, rx.rssi, resp.req_rssi);
+                }
+            }
+            break;
+        }
+        case wt::MSG_DISTRESS: {
+            if (rx.len >= sizeof(wt::DistressPayload)) {
+                wt::DistressPayload dp;
+                memcpy(&dp, rx.plain, sizeof(dp));
+                dp.name[sizeof(dp.name) - 1] = 0;
+                if (dp.active) {
+                    s_distress_peer = dp.sender;
+                    strncpy(s_distress_peer_name, dp.name, sizeof(s_distress_peer_name) - 1);
+                    s_distress_peer_name[sizeof(s_distress_peer_name) - 1] = 0;
+                    printf("\n*** [DISTRESS ALERT] Emergency SOS from %s (%08lx)! RSSI: %d dBm ***\n\n",
+                           dp.name, (unsigned long)dp.sender, rx.rssi);
+                    sound_distress_alert();
+                } else {
+                    if (s_distress_peer == dp.sender) s_distress_peer = 0;
+                    printf("\n[DISTRESS CLEARED] Emergency resolved by %s (%08lx).\n\n",
+                           dp.name, (unsigned long)dp.sender);
+                    sound_all_clear();
+                }
+            }
+            break;
+        }
+    }
+}
+
+void run_range_test(int count) {
+    if (s_range_active) {
+        printf("Range test already active.\n");
+        return;
+    }
+    s_range_active = true;
+    s_range_token = esp_random();
+    s_range_stats.reset(count);
+
+    printf("\n===========================================================\n");
+    printf("  STARTING RANGE TEST (%d probes @ LR 250k Ch %u)\n", count, radio::channel());
+    printf("===========================================================\n");
+
+    for (int i = 0; i < count; i++) {
+        wt::RangeReq req;
+        req.token = s_range_token;
+        req.seq = i + 1;
+        req.total = count;
+        uint16_t rx_before = s_range_stats.received;
+        radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        vTaskDelay(pdMS_TO_TICKS(80));
+        if (s_range_stats.received == rx_before) {
+            audio::tone(250, 30, 350);
+            printf("  probe #%-2u: [DROPPED / NO REPLY]\n", i + 1);
+        }
+    }
+
+    printf("================== RANGE TEST SUMMARY ===================\n");
+    printf("  Probes Sent:     %u\n", s_range_stats.sent);
+    printf("  Probes Received: %u\n", s_range_stats.received);
+    printf("  Packet Loss:     %.1f%%\n", s_range_stats.loss_percent());
+    if (s_range_stats.received > 0) {
+        printf("  Downlink RSSI:   Avg %.1f dBm (Min %d, Max %d)\n",
+               s_range_stats.avg_downlink_rssi(), s_range_stats.min_rssi, s_range_stats.max_rssi);
+        printf("  Uplink RSSI:     Avg %.1f dBm\n", s_range_stats.avg_uplink_rssi());
+        printf("  Link Margin:     +%.1f dB above -108 dBm sensitivity floor\n",
+               s_range_stats.margin_db(-108.0f));
+        const char* quality = "EXCELLENT";
+        if (s_range_stats.loss_percent() > 20.0f || s_range_stats.avg_downlink_rssi() < -95.0f) quality = "MARGINAL (Near limit)";
+        else if (s_range_stats.loss_percent() > 5.0f || s_range_stats.avg_downlink_rssi() < -85.0f) quality = "GOOD";
+        printf("  Link Quality:    %s\n", quality);
+    } else {
+        printf("  Result:          NO LINK (Nodes out of range or not on same channel)\n");
+    }
+    printf("=========================================================\n\n");
+    s_range_active = false;
+}
+
+void toggle_walk_mode() {
+    s_walk_mode = !s_walk_mode;
+    if (s_walk_mode) {
+        s_range_token = esp_random();
+        s_walk_seq = 0;
+        printf("\nWALK RANGE MODE: ON (emitting 1 probe/sec with acoustic pitch)\n");
+        printf("Put on headset and walk away. Tone pitch indicates signal strength!\n\n");
+        audio::tone(880, 60, 450);
+    } else {
+        printf("\nWALK RANGE MODE: OFF\n\n");
+        audio::tone(400, 60, 400);
     }
 }
 
@@ -334,11 +530,19 @@ void print_status() {
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
     printf("  radio: mode %s  tx-power %d (%.2f dBm)\n",
-           cfg::kLongRange ? "ESP-NOW Long Range (LR 500k, -105 dBm)" : "802.11g 6M (-90 dBm)",
+           cfg::kLongRange ? "ESP-NOW Long Range (LR 250k, -108 dBm)" : "802.11g 6M (-90 dBm)",
            pwr, pwr * 0.25f);
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
            (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
+    float temp_c = 0.0f;
+    if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
+    uint32_t free_ram = esp_get_free_heap_size() / 1024;
+    uint32_t min_ram = esp_get_minimum_free_heap_size() / 1024;
+    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s\n",
+           temp_c, (unsigned long)free_ram, (unsigned long)min_ram,
+           s_distress_active ? "  [DISTRESS ACTIVE]" : "",
+           s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "");
     printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
            (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
            (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
@@ -379,15 +583,18 @@ void selftest() {
 }
 
 void help() {
-    printf("\n  t        talk on/off (same as BOOT or headset button click)\n"
-           "  r / c    radar: check peer count and distance (same as double click)\n"
-           "  + / -    volume\n"
-           "  p        ping all nodes (same as long press)\n"
-           "  s        status, peers, counters\n"
-           "  ch N     radio channel 1..13 (all nodes must match)\n"
-           "  name X   set this node's name\n"
-           "  loop     loopback test: hear your own voice through the codec\n"
-           "  selftest check headset streams and the audio path\n"
+    printf("\n  t          talk on/off (same as BOOT or headset button click)\n"
+           "  r / c      radar: check peer count and distance (same as double click)\n"
+           "  sos        distress SOS on/off (same as holding button 2.5s)\n"
+           "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
+           "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
+           "  + / -      volume\n"
+           "  p          ping all nodes (same as long press)\n"
+           "  s          status, peers, counters\n"
+           "  ch N       radio channel 1..13 (all nodes must match)\n"
+           "  name X     set this node's name\n"
+           "  loop       loopback test: hear your own voice through the codec\n"
+           "  selftest   check headset streams and the audio path\n"
            "  reboot\n\n");
 }
 
@@ -409,6 +616,14 @@ void console_task(void*) {
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
+        else if (!strcmp(line, "sos") || !strcmp(line, "distress")) toggle_distress();
+        else if (!strncmp(line, "range", 5) || !strcmp(line, "test")) {
+            int count = 20;
+            if (strlen(line) > 6) count = atoi(line + 6);
+            if (count <= 0 || count > 200) count = 20;
+            run_range_test(count);
+        }
+        else if (!strcmp(line, "walk")) toggle_walk_mode();
         else if (!strcmp(line, "+")) volume_step(+10);
         else if (!strcmp(line, "-")) volume_step(-10);
         else if (!strcmp(line, "p")) send_ping();
@@ -496,6 +711,10 @@ extern "C" void app_main() {
         vTaskDelay(portMAX_DELAY);
     }
     audio::start();
+    temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+    if (temperature_sensor_install(&temp_cfg, &s_temp_sensor) == ESP_OK) {
+        temperature_sensor_enable(s_temp_sensor);
+    }
     usb_headset::start(on_hid_buttons, on_headset_state);
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
     printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
@@ -505,6 +724,7 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
+    bool hid_talk_hold_sent = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
@@ -526,17 +746,22 @@ extern "C" void app_main() {
         }
 
         // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
-        // Click on release (< 1.5s), Long press when held (>= 1.5s)
+        // Click on release (< 1.2s), Long press when held (>= 1.2s), Hold when held (>= 2.5s)
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
+            hid_talk_hold_sent = false;
         }
         if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= wt::ButtonDetector::kLongMs)) {
             hid_talk_long_sent = true;
             handle_press(wt::Press::Long, 0);
         }
+        if ((hid & wt::HID_BTN_TALK) && !hid_talk_hold_sent && (now - hid_talk_start >= wt::ButtonDetector::kHoldMs)) {
+            hid_talk_hold_sent = true;
+            handle_press(wt::Press::Hold, 0);
+        }
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
-            if (!hid_talk_long_sent) {
+            if (!hid_talk_long_sent && !hid_talk_hold_sent) {
                 handle_press(wt::Press::Click, 0);
             }
         }
@@ -547,8 +772,8 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Handle pending single talk click timeout (350 ms)
-        if (s_pending_single_talk && (now - s_last_talk_click_ms > 350)) {
+        // Handle pending single talk click timeout (450 ms)
+        if (s_pending_single_talk && (now - s_last_talk_click_ms > 450)) {
             s_pending_single_talk = false;
             toggle_talk();
         }
@@ -575,6 +800,40 @@ extern "C" void app_main() {
             radio::peers().prune(now);
             radio::peers_unlock();
         }
+
+        static uint32_t last_walk_probe = 0;
+        if (s_walk_mode && (now - last_walk_probe >= 1000)) {
+            last_walk_probe = now;
+            wt::RangeReq req;
+            req.token = s_range_token;
+            req.seq = ++s_walk_seq;
+            req.total = 0;
+            s_walk_pending = true;
+            s_walk_probe_sent_ms = now;
+            radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        }
+        if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 400)) {
+            s_walk_pending = false;
+            audio::tone(250, 40, 350);  // low warning tone: missed probe
+        }
+
+        // Distress SOS periodic broadcasting & audible reminder
+        if (s_distress_active) {
+            if (now - s_last_distress_tx_ms >= 2000) {
+                s_last_distress_tx_ms = now;
+                send_distress_packet(true);
+            }
+            if (now - s_last_distress_beep_ms >= 2500) {
+                s_last_distress_beep_ms = now;
+                sound_distress_alert();
+            }
+        } else if (s_distress_peer != 0) {
+            if (now - s_last_distress_beep_ms >= 3000) {
+                s_last_distress_beep_ms = now;
+                sound_distress_alert();
+            }
+        }
+
         update_led();
         vTaskDelay(pdMS_TO_TICKS(10));
     }

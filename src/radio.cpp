@@ -25,6 +25,7 @@ constexpr psa_algorithm_t kAlg = PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, wt
 struct Raw {
     uint8_t len;
     int8_t  rssi;
+    uint8_t mac[6];
     uint8_t data[wt::kMaxFrame];
 };
 struct Tx {
@@ -54,6 +55,8 @@ void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     Raw r;
     r.len = static_cast<uint8_t>(len);
     r.rssi = info->rx_ctrl ? static_cast<int8_t>(info->rx_ctrl->rssi) : 0;
+    if (info->src_addr) memcpy(r.mac, info->src_addr, 6);
+    else memset(r.mac, 0, 6);
     memcpy(r.data, data, len);
     if (xQueueSend(s_rxq, &r, 0) != pdTRUE) {  // queue full: shed load
         portENTER_CRITICAL(&s_stats_mux);
@@ -68,6 +71,30 @@ void on_sent(const esp_now_send_info_t*, esp_now_send_status_t st) {
         portENTER_CRITICAL(&s_stats_mux);
         s_stats.tx_fail++;
         portEXIT_CRITICAL(&s_stats_mux);
+    }
+}
+
+void register_unicast_peer(const uint8_t* mac) {
+    if (!mac || esp_now_is_peer_exist(mac)) return;
+    if (memcmp(mac, kBroadcast, 6) == 0) return;
+    bool non_zero = false;
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0) { non_zero = true; break; }
+    }
+    if (!non_zero) return;
+
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, mac, 6);
+    p.ifidx = WIFI_IF_STA;
+    p.channel = 0;  // follow current channel
+    esp_err_t err = esp_now_add_peer(&p);
+    if (err == ESP_OK) {
+        esp_now_rate_config_t rc = {};
+        rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
+        rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
+        esp_now_set_peer_rate_config(mac, &rc);
+        ESP_LOGI(TAG, "registered unicast peer %02x:%02x:%02x:%02x:%02x:%02x (hardware retries enabled)",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 }
 
@@ -94,16 +121,51 @@ bool open(const uint8_t* frame, size_t len, const wt::Header& h, uint8_t* plain,
     return st == PSA_SUCCESS;
 }
 
-void transmit(const uint8_t* frame, size_t len) {
-    esp_err_t e = esp_now_send(kBroadcast, frame, len);
-    if (e == ESP_ERR_ESPNOW_NO_MEM) {  // Wi-Fi TX queue full: one short retry
-        vTaskDelay(1);
-        e = esp_now_send(kBroadcast, frame, len);
+void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
+    uint8_t direct_macs[wt::kMaxPeers][6];
+    int n_direct = 0;
+    if (!force_broadcast) {
+        xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+        uint32_t now = now_ms();
+        for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
+            if (p->used && p->hops == 0 && (now - p->last_ms <= wt::kPeerTimeoutMs)) {
+                bool has_mac = false;
+                for (int i = 0; i < 6; i++) {
+                    if (p->mac[i] != 0) { has_mac = true; break; }
+                }
+                if (has_mac && n_direct < wt::kMaxPeers) {
+                    memcpy(direct_macs[n_direct++], p->mac, 6);
+                }
+            }
+        }
+        xSemaphoreGive(s_peers_mtx);
     }
-    portENTER_CRITICAL(&s_stats_mux);
-    if (e == ESP_OK) s_stats.tx++;
-    else s_stats.tx_fail++;
-    portEXIT_CRITICAL(&s_stats_mux);
+
+    if (n_direct > 0 && !force_broadcast) {
+        // Send unicast to each direct peer (uses 802.11 MAC ACK + hardware retries!)
+        for (int i = 0; i < n_direct; i++) {
+            esp_err_t e = esp_now_send(direct_macs[i], frame, len);
+            if (e == ESP_ERR_ESPNOW_NO_MEM) {
+                vTaskDelay(1);
+                e = esp_now_send(direct_macs[i], frame, len);
+            }
+            portENTER_CRITICAL(&s_stats_mux);
+            if (e == ESP_OK) s_stats.tx++;
+            else s_stats.tx_fail++;
+            portEXIT_CRITICAL(&s_stats_mux);
+        }
+    } else {
+        // Broadcast (for beacons, discovery, or when no direct peers are active yet)
+        esp_err_t e = esp_now_send(kBroadcast, frame, len);
+        if (e == ESP_ERR_ESPNOW_NO_MEM) {
+            vTaskDelay(1);
+            e = esp_now_send(kBroadcast, frame, len);
+        }
+        portENTER_CRITICAL(&s_stats_mux);
+        if (e == ESP_OK) s_stats.tx++;
+        else s_stats.tx_fail++;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
 }
 
 void handle_raw(Raw& r) {
@@ -134,11 +196,14 @@ void handle_raw(Raw& r) {
     rx.hops = static_cast<uint8_t>(wt::kDefaultTtl - h.ttl);
     rx.rssi = r.rssi;
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-    bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms());
+    bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms(), r.mac);
     int num_peers = s_peers.count();
     xSemaphoreGive(s_peers_mtx);
     if (!accepted) return;
     s_stats.rx++;
+    if (rx.hops == 0) {
+        register_unicast_peer(r.mac);
+    }
     // Only relay if there are other nodes that need it (peer_count > 1).
     // In a direct 2-node pair, echoing packets back to the sender causes self-collision.
     if (h.ttl > 1 && num_peers > 1) {
@@ -166,12 +231,19 @@ void task(void*) {
             h.session = s_session;
             h.seq = ++s_seq;
             size_t n;
-            if (seal(h, t.plain, t.len, frame, &n)) transmit(frame, n);
+            if (seal(h, t.plain, t.len, frame, &n)) {
+                bool force_bcast = (t.type == wt::MSG_BEACON);
+                transmit(frame, n, force_bcast);
+                if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    transmit(frame, n, false);
+                }
+            }
         }
         uint32_t now = now_ms();
         size_t n;
         while ((n = s_relay.pop_due(now, frame)) > 0) {
-            transmit(frame, n);
+            transmit(frame, n, true);
             s_stats.relayed++;
         }
     }
@@ -241,14 +313,14 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     ESP_ERROR_CHECK(esp_now_add_peer(&p));
     esp_now_rate_config_t rc = {};
     rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
-    rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_500K : WIFI_PHY_RATE_6M;
+    rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
     esp_now_set_peer_rate_config(kBroadcast, &rc);
     set_channel(ch);
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
     ESP_LOGI(TAG, "node %08lx session %lu ch %u (phy %s, tx %d = %.2f dBm)",
              (unsigned long)s_self, (unsigned long)session, ch,
-             cfg::kLongRange ? "ESP-NOW LR 500k (-105 dBm)" : "11g 6M (-90 dBm)",
+             cfg::kLongRange ? "ESP-NOW LR 250k (-108 dBm)" : "11g 6M (-90 dBm)",
              pwr, pwr * 0.25f);
     if (cfg::kDefaultKey)
         ESP_LOGW(TAG, "using the PUBLIC default network key: anyone can listen. See README.");

@@ -39,10 +39,21 @@ enum MsgType : uint8_t {
     MSG_BEACON = 1,   // presence + name, every few seconds
     MSG_JOIN   = 2,   // started talking
     MSG_LEAVE  = 3,   // stopped talking
-    MSG_AUDIO  = 4,
-    MSG_PING   = 5,
-    MSG_PONG   = 6,
+    MSG_AUDIO      = 4,
+    MSG_PING       = 5,
+    MSG_PONG       = 6,
+    MSG_RANGE_REQ  = 7,
+    MSG_RANGE_RESP = 8,
+    MSG_DISTRESS   = 9,
 };
+
+#pragma pack(push, 1)
+struct DistressPayload {
+    uint32_t sender;
+    uint8_t  active; // 1 = SOS active, 0 = all-clear / cancelled
+    char     name[12];
+};
+#pragma pack(pop)
 
 struct Header {
     uint8_t  type = 0;

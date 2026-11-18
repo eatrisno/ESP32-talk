@@ -20,7 +20,7 @@ void rgb(Color c, uint8_t& r, uint8_t& g, uint8_t& b) {
         case Color::Red: r = k; break;
         case Color::Green: g = k; break;
         case Color::Blue: b = k; break;
-        case Color::Amber: r = k; g = k / 2; break;
+        case Color::Amber: r = k; g = (k > 1) ? (k / 2) : 1; break;
         case Color::Cyan: g = k; b = k; break;
         case Color::White: r = g = b = k; break;
         case Color::Off: break;

@@ -17,6 +17,7 @@ constexpr uint32_t kPeerTimeoutMs = 15000;
 struct Peer {
     bool     used = false;
     uint32_t id = 0;
+    uint8_t  mac[6] = {};       // 6-byte MAC for unicast delivery with hardware retries
     char     name[12] = {};
     int8_t   rssi = 0;          // of the last packet heard directly from this peer
     uint8_t  hops = 0;          // 0 = heard directly
@@ -49,7 +50,7 @@ public:
     // Before decrypting: is this (sender, session, seq) new? Cheap filter for floods.
     bool fresh(const Header& h, uint32_t now_ms) const;
     // After the packet authenticated: records it. Returns false if it was a duplicate.
-    bool accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms);
+    bool accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac = nullptr);
     void set_name(uint32_t id, const char* name);
     void set_talking(uint32_t id, bool on);
     void prune(uint32_t now_ms);

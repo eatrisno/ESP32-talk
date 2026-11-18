@@ -6,12 +6,13 @@
 
 namespace wt {
 
-enum class Press : uint8_t { None, Click, Long };
+enum class Press : uint8_t { None, Click, Long, Hold };
 
 class ButtonDetector {
 public:
     static constexpr uint32_t kDebounceMs = 30;
-    static constexpr uint32_t kLongMs = 1500;
+    static constexpr uint32_t kLongMs = 1200;
+    static constexpr uint32_t kHoldMs = 2500;
     // Feed the raw level whenever it is sampled (or changes). Returns an event or None.
     Press update(bool down, uint32_t now_ms);
 
@@ -19,6 +20,7 @@ private:
     bool stable_ = false;
     bool raw_ = false;
     bool long_sent_ = false;
+    bool hold_sent_ = false;
     uint32_t changed_ms_ = 0;
     uint32_t pressed_ms_ = 0;
 };
