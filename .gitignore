@@ -22,3 +22,10 @@ env/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# ESP-IDF
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+managed_components/
+build/
