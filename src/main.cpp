@@ -184,9 +184,9 @@ void print_status() {
                (unsigned long)((now - p->last_ms) / 1000), p->talking ? "  talking" : "");
     }
     radio::peers_unlock();
-    printf("  radio: tx %lu rx %lu relayed %lu dup %lu auth-fail %lu tx-fail %lu\n",
+    printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
-           (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
+           (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
     printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
            (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
            (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
@@ -326,7 +326,7 @@ extern "C" void app_main() {
     }
     audio::start();
     usb_headset::start(on_hid_buttons, on_headset_state);
-    xTaskCreatePinnedToCore(console_task, "console", 4096, nullptr, 3, nullptr, 0);
+    xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
     printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
 
     wt::ButtonDetector talk, up, down;

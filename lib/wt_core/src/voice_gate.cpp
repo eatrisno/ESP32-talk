@@ -32,10 +32,13 @@ float pipeline_selftest(uint32_t mic_rate, uint32_t spk_rate) {
     static int16_t mic[960], v8[400], pending[kFrameSamples], frame[kFrameSamples];
     static int16_t up[kFrameSamples * 13];
     const double kHz = 1000.0, kAmp = 12000.0;
-    Resampler down, upr;
+    // Static, not on the stack: the jitter buffer alone is 11 KB and the console task that
+    // runs this on the device has 8 KB. Not reentrant (one self-test at a time).
+    static Resampler down, upr;
+    static JitterBuffer jb;
     down.init(mic_rate, kVoiceRate);
     upr.init(kVoiceRate, spk_rate);
-    JitterBuffer jb;
+    jb.reset();
     AdpcmState enc;
     size_t acc = 0, out_i = 0;
     uint16_t fno = 0;

@@ -133,12 +133,10 @@ void spk_task(void*) {
     static uint8_t raw[wt::kFrameSamples * 13 * 8];
     wt::Resampler rs;
     uint32_t cur_rate = 0;
-    TickType_t last = xTaskGetTickCount();
     for (;;) {
         if (!usb_headset::spk_ready()) {
             cur_rate = 0;
             vTaskDelay(pdMS_TO_TICKS(50));
-            last = xTaskGetTickCount();
             continue;
         }
         wt::StreamFormat f = usb_headset::spk_format();
@@ -160,7 +158,7 @@ void spk_task(void*) {
             } else if (!t.jb.active() && now - t.last_ms > 2000) {
                 s_stats.lost += t.jb.lost();
                 s_stats.late += t.jb.late();
-                t = Talker();
+                t.used = false;  // not `t = Talker()`: that builds an 11 KB temporary on this stack
             }
         }
         if (s_loopback && s_loop.pop(one)) {
@@ -172,7 +170,7 @@ void spk_task(void*) {
             for (auto& s : mix) s = wt::clip16(wt::soft_limit(s * g));
             s_stats.frames_played++;
         }
-        bool tone = s_tones.render(mix, wt::kFrameSamples);  // beeps ignore volume 0
+        s_tones.render(mix, wt::kFrameSamples);  // beeps are not scaled: audible at volume 0
         xSemaphoreGive(s_mtx);
         s_receiving = talkers > 0;
         s_stats.talkers = talkers;
@@ -180,10 +178,12 @@ void spk_task(void*) {
         // and avoids the pop some headsets make when the stream restarts.
         size_t n = rs.process(mix, wt::kFrameSamples, up, sizeof up / 2);
         size_t bytes = wt::mono_to_pcm(up, n, f, raw, sizeof raw);
-        if (!usb_headset::spk_write(raw, bytes, wt::kFrameMs * 2)) s_stats.spk_underrun++;
-        (void)tone;
-        // The speaker buffer holds ~120 ms; pace by the tick so we never run ahead of it.
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(wt::kFrameMs));
+        // Blocks until the 100 ms speaker buffer has room: the headset's own clock paces
+        // playback, so latency stays bounded and there is no drift against the CPU tick.
+        if (!usb_headset::spk_write(raw, bytes, 80)) {
+            s_stats.spk_underrun++;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }
 

@@ -80,10 +80,15 @@ bool RelayQueue::push(const uint8_t* frame, size_t len, uint32_t due_ms) {
     return false;  // full: drop the relay, never block the radio
 }
 
-void RelayQueue::cancel(uint32_t sender, uint32_t session, uint32_t seq) {
-    for (auto& it : items_)
-        if (it.used && it.sender == sender && it.session == session && it.seq == seq)
+void RelayQueue::cancel(const uint8_t* frame, size_t len) {
+    Header h;
+    if (!read_header(frame, len, h)) return;
+    for (auto& it : items_) {
+        if (!it.used || it.sender != h.sender || it.session != h.session || it.seq != h.seq) continue;
+        if (it.len != len) continue;
+        if (memcmp(it.data, frame, 3) == 0 && memcmp(it.data + 4, frame + 4, len - 4) == 0)
             it.used = false;
+    }
 }
 
 size_t RelayQueue::pop_due(uint32_t now_ms, uint8_t* out) {

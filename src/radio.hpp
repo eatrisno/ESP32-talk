@@ -33,7 +33,7 @@ void peers_lock();
 void peers_unlock();
 
 struct Stats {
-    uint32_t tx, rx, relayed, relay_cancelled, auth_fail, dup, tx_fail;
+    uint32_t tx, rx, relayed, auth_fail, dup, rx_drop, tx_fail;
 };
 Stats stats();
 

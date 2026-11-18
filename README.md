@@ -52,7 +52,7 @@ after 2 minutes open.
 
 | LED | Meaning |
 |---|---|
-| Blue | No headset |
+| Blue | No headset (also the colour at boot) |
 | Off | Ready, mic muted |
 | Amber | Mic on, waiting for speech |
 | Red | Sending your voice |
@@ -71,31 +71,45 @@ pio run -e esp32s3 -t upload -t monitor
 ```
 
 Without `WT_NETWORK_KEY_HEX` the build uses a public default key, so anyone running this firmware can listen.
+The build prints a warning and the device logs one at every boot when that happens.
+
+Every node must run this firmware: the packet format (v3) does not work with the old 2.x Arduino firmware.
 
 ## Console (115200 baud)
 
 ```
 t         mic on/off                 s         status, peers, counters
-+ / -     volume                     ch N      channel 1..13 (same on all nodes)
-p         ping                       name X    node name
++ / -     volume                     ch N      channel 1..13 (same on all nodes, saved)
+p         ping                       name X    node name, up to 11 chars (saved)
 loop      hear yourself through the codec (headset check, no second node needed)
 selftest  check the headset streams and the audio path, prints PASS/FAIL
+reboot    restart                    anything else prints this list
 ```
 
 ## Testing
 
 ```bash
-pio test -e native     # 35 host tests, no hardware
+pio test -e native     # 36 host tests, no hardware
 ```
 
 The host tests run the same code as the firmware. A 1 kHz tone goes from the mic rate through 8 kHz, ADPCM,
 the packet format and the jitter buffer to the speaker rate. The test checks its level and SNR for every pair
 of common headset rates, and with packet loss. They also cover format selection for headsets without 48 kHz,
-stereo-mic handling, out-of-order and duplicate frames, clock drift, the replay window, the 3-node relay
-path, HID descriptors from three headset layouts, button debounce and long press, and the voice gate.
+stereo-mic handling, out-of-order and duplicate frames, resync after a long gap, clock drift, the replay
+window, the 3-node relay path (including that a forged frame cannot cancel a relay), HID descriptors from
+three headset layouts, button debounce and long press, and the voice gate.
 
-On a device, run `selftest`, then `loop`, then a 3-node walk test. Things the tests cannot prove (USB
-enumeration of a given headset, RF range, how it sounds) still need the hardware.
+Not covered by any test: the ESP-IDF layer in `src/` (USB host, ESP-NOW, tasks, LED) is only checked by the
+compiler. On a device:
+
+1. `selftest`: the headset's mic and speaker streams are up, the mic delivers at its rate, and a 1 kHz tone
+   through the voice path at the headset's rates comes out above 18 dB SNR.
+2. `loop`, then speak: you hear yourself about 150-250 ms later. This checks mic and speaker by ear.
+3. Two nodes in one room: talk both ways, `s` on each shows the other as `direct`.
+4. Three nodes, A and C out of range of each other: `s` on A shows C as `relay`, and A and C hear each other.
+
+If a headset fails, the boot log lists every format it offers (`usb: mic alt 1: ...`). Include that log in a
+bug report.
 
 ## Layout
 

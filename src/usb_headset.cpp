@@ -68,19 +68,25 @@ void uac_drv_cb(uint8_t addr, uint8_t iface, const uac_host_driver_event_t ev, v
     xQueueSend(s_q, &m, 0);
 }
 
-void open_uac(const Msg& m) {
-    Stream& s = m.tx ? s_spk : s_mic;
-    if (s.h) return;
-    // Ring buffers sized for the largest format we accept (96 kHz, 2 ch, 32-bit):
-    // speaker 120 ms (enough to absorb one late 40 ms frame), mic 200 ms.
+uac_host_device_handle_t open_dev(const Msg& m, uint32_t buffer_size) {
     uac_host_device_config_t dc = {};
     dc.addr = m.addr;
     dc.iface_num = m.iface;
     dc.callback = uac_dev_cb;
-    dc.buffer_size = 96000 * 2 * 4 * (m.tx ? 120 : 200) / 1000;
+    dc.buffer_size = buffer_size;
     dc.buffer_threshold = 0;  // driver default (size / 4)
-    uac_host_device_handle_t h;
-    if (uac_host_device_open(&dc, &h) != ESP_OK) {
+    uac_host_device_handle_t h = nullptr;
+    if (uac_host_device_open(&dc, &h) != ESP_OK) return nullptr;
+    return h;
+}
+
+void open_uac(const Msg& m) {
+    Stream& s = m.tx ? s_spk : s_mic;
+    if (s.h) return;
+    // The ring buffer size is fixed at open, but the format is only known after open.
+    // Open small to read the formats, then reopen with a buffer for the chosen one.
+    uac_host_device_handle_t h = open_dev(m, 4096);
+    if (!h) {
         ESP_LOGW(TAG, "%s open failed", m.tx ? "speaker" : "mic");
         return;
     }
@@ -111,9 +117,18 @@ void open_uac(const Msg& m) {
                                                     : p.sample_freq_upper));
     }
     wt::StreamFormat f = wt::choose_format(alts, n);
+    uac_host_device_close(h);
     if (!f.valid()) {
         ESP_LOGE(TAG, "%s: no usable format (need PCM, 1-2 ch, 16/24/32-bit)", m.tx ? "speaker" : "mic");
-        uac_host_device_close(h);
+        return;
+    }
+    // Speaker: 100 ms. It is also the playback clock (the speaker task blocks on it), so it
+    // bounds the output latency. Mic: 100 ms, read every 10 ms.
+    uint32_t bytes_per_ms = f.rate / 1000 * static_cast<uint32_t>(f.frame_bytes()) + f.frame_bytes();
+    h = open_dev(m, bytes_per_ms * 100);
+    if (!h) {
+        ESP_LOGE(TAG, "%s reopen failed (%lu B buffer)", m.tx ? "speaker" : "mic",
+                 (unsigned long)(bytes_per_ms * 100));
         return;
     }
     uac_host_stream_config_t sc = {};
@@ -136,14 +151,15 @@ void open_uac(const Msg& m) {
     s.ready = true;
     ESP_LOGI(TAG, "%s %04x:%04x started: %lu Hz, %u ch, %u-bit", m.tx ? "speaker" : "mic", info.VID,
              info.PID, (unsigned long)f.rate, f.channels, f.bits);
-    if (s_on_state) s_on_state(true);
+    if (m.tx && s_on_state) s_on_state(true);  // once per headset, when it can play the chime
 }
 
 void close_uac(uac_host_device_handle_t h) {
     for (Stream* s : {&s_mic, &s_spk}) {
         if (s->h != h) continue;
         s->ready = false;
-        vTaskDelay(pdMS_TO_TICKS(20));  // let a blocked read/write return
+        // Let a read/write already inside the driver return (their timeouts are <= 80 ms).
+        vTaskDelay(pdMS_TO_TICKS(100));
         uac_host_device_close(h);
         s->h = nullptr;
         ESP_LOGI(TAG, "%s disconnected", s == &s_spk ? "speaker" : "mic");

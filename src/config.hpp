@@ -30,7 +30,10 @@ constexpr uint8_t  kDefaultVolume = 70;
 // build flag, see README. The fallback key is public: anyone can join a group using it.
 #ifdef WT_NETWORK_KEY_HEX
 constexpr const char* kNetworkKeyHex = WT_NETWORK_KEY_HEX;
+constexpr bool kDefaultKey = false;
 #else
+#warning "WT_NETWORK_KEY_HEX not set: building with the public default key (see README)"
+constexpr bool kDefaultKey = true;
 constexpr const char* kNetworkKeyHex = "57616c6b6965546f6b65725f53332121";
 #endif
 

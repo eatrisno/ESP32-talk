@@ -50,8 +50,9 @@ public:
     static constexpr int kCap = 16;
     // Schedules frame for relay at due_ms. Frame must already have ttl decremented.
     bool push(const uint8_t* frame, size_t len, uint32_t due_ms);
-    // Someone else relayed (sender, session, seq): drop our copy.
-    void cancel(uint32_t sender, uint32_t session, uint32_t seq);
+    // Someone else already relayed this frame: drop our copy. Only a byte-identical frame
+    // (ttl aside) counts, so a forged header cannot cancel relays.
+    void cancel(const uint8_t* frame, size_t len);
     // Pops the next due frame. Returns its length or 0.
     size_t pop_due(uint32_t now_ms, uint8_t* out);
     int size() const;

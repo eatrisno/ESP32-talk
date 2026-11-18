@@ -331,6 +331,33 @@ void test_jitter_frame_number_wraps() {
     TEST_ASSERT_EQUAL_UINT32(0, jb.late());
 }
 
+void test_jitter_resync_after_long_gap_prebuffers_again() {
+    // Talker jumps 196 frames ahead (e.g. we missed a burst). Must restart cleanly:
+    // pre-buffer again, then play the new frames in order with nothing counted lost.
+    // (Resync works without the explicit newest_ reset too: the new frame is always ahead
+    // of the stale newest_. This guards the behaviour, not that line.)
+    JitterBuffer jb;
+    uint8_t b[kAdpcmBytes];
+    int16_t out[kFrameSamples];
+    for (uint16_t no = 0; no < 4; no++) jb.put(frame_payload(1, no, b));
+    TEST_ASSERT_TRUE(jb.pop(out));
+    uint32_t lost0 = jb.lost();
+    jb.put(frame_payload(1, 200, b));
+    TEST_ASSERT_FALSE(jb.pop(out));  // pre-buffering again, not playing stale slots
+    jb.put(frame_payload(1, 201, b));
+    jb.put(frame_payload(1, 202, b));
+    for (uint16_t no = 200; no <= 202; no++) {
+        TEST_ASSERT_TRUE(jb.pop(out));
+        int16_t want[kFrameSamples];
+        uint8_t wb[kAdpcmBytes];
+        AudioPayload p = frame_payload(1, no, wb);
+        AdpcmState st;
+        adpcm_decode(p.data, p.data_len, want, st);
+        TEST_ASSERT_EQUAL_INT16_ARRAY(want, out, kFrameSamples);
+    }
+    TEST_ASSERT_EQUAL_UINT32(lost0, jb.lost());
+}
+
 void test_jitter_bounded_under_clock_drift() {
     // Sender 1% fast: 101 frames arrive per 100 played. Depth must stay bounded.
     JitterBuffer jb;
@@ -412,11 +439,20 @@ void test_three_nodes_mesh_relay_and_cancel() {
         if (c_peers.fresh(got) && c_peers.accept(got, 1, -70, seq * 10)) delivered++;  // echo
     }
     TEST_ASSERT_EQUAL(50, delivered);
-    // A relay already sent by a neighbour is cancelled.
+    // A relay already sent by a neighbour (same frame, any ttl) is cancelled.
     h.seq = 99;
     write_header(h, frame);
+    frame[kHeaderLen] = 0x5A;  // stands in for ciphertext
     b_relay.push(frame, sizeof frame, 1000);
-    b_relay.cancel(0xA, 1, 99);
+    uint8_t forged[sizeof frame];
+    memcpy(forged, frame, sizeof frame);
+    forged[kHeaderLen] ^= 1;   // same header, different body: must not cancel
+    b_relay.cancel(forged, sizeof forged);
+    TEST_ASSERT_EQUAL(1, b_relay.size());
+    uint8_t heard[sizeof frame];
+    memcpy(heard, frame, sizeof frame);
+    heard[3] = 1;              // neighbour's copy has a lower ttl
+    b_relay.cancel(heard, sizeof heard);
     uint8_t out[kMaxFrame];
     TEST_ASSERT_EQUAL_size_t(0, b_relay.pop_due(2000, out));
 }
@@ -640,6 +676,7 @@ int main() {
     RUN_TEST(test_jitter_reorders_and_drops_duplicates);
     RUN_TEST(test_jitter_prebuffers_then_ends_after_silence);
     RUN_TEST(test_jitter_frame_number_wraps);
+    RUN_TEST(test_jitter_resync_after_long_gap_prebuffers_again);
     RUN_TEST(test_jitter_bounded_under_clock_drift);
     RUN_TEST(test_header_roundtrip_and_rejects);
     RUN_TEST(test_aad_ignores_ttl_only);

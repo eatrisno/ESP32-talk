@@ -33,7 +33,8 @@ void tone(uint16_t freq, uint16_t ms);
 void on_audio(uint32_t sender, const wt::AudioPayload& a);
 
 struct Stats {
-    uint32_t frames_sent, frames_gated, frames_played, lost, late, mic_bytes, spk_underrun;
+    uint32_t frames_sent, frames_gated, frames_played, lost, late, mic_bytes,
+             spk_underrun;  // speaker writes that timed out (stream stalled)
     float agc_gain, noise_floor;
     int talkers;
 };

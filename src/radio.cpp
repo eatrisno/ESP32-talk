@@ -54,7 +54,7 @@ void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     r.len = static_cast<uint8_t>(len);
     r.rssi = info->rx_ctrl ? static_cast<int8_t>(info->rx_ctrl->rssi) : 0;
     memcpy(r.data, data, len);
-    if (xQueueSend(s_rxq, &r, 0) != pdTRUE) s_stats.dup++;  // queue full: shed load
+    if (xQueueSend(s_rxq, &r, 0) != pdTRUE) s_stats.rx_drop++;  // queue full: shed load
     xTaskNotifyGive(s_task);
 }
 
@@ -100,7 +100,7 @@ void handle_raw(Raw& r) {
     if (!wt::read_header(r.data, r.len, h)) return;
     if (h.sender == s_self) return;                      // our own frame, relayed back
     // A neighbour already relayed this one: our pending copy is redundant.
-    s_relay.cancel(h.sender, h.session, h.seq);
+    s_relay.cancel(r.data, r.len);
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
     bool fresh = s_peers.fresh(h);
     xSemaphoreGive(s_peers_mtx);
@@ -224,6 +224,8 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     set_channel(ch);
     xTaskCreatePinnedToCore(task, "radio", 6144, nullptr, 7, &s_task, 0);
     ESP_LOGI(TAG, "node %08lx session %lu ch %u", (unsigned long)s_self, (unsigned long)session, ch);
+    if (cfg::kDefaultKey)
+        ESP_LOGW(TAG, "using the PUBLIC default network key: anyone can listen. See README.");
     return true;
 }
 

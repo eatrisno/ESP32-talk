@@ -37,6 +37,7 @@ void JitterBuffer::put(const AudioPayload& a) {
         have_any_ = true;
         voice_id_ = a.voice_id;
         next_ = a.frame_no;
+        newest_ = a.frame_no;
     }
     Slot& s = slots_[a.frame_no % kSlots];
     if (s.full && s.frame_no == a.frame_no) return;  // duplicate
