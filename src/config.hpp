@@ -14,11 +14,12 @@ constexpr gpio_num_t kPinLed = GPIO_NUM_48;     // WS2812 on ESP32-S3-DevKitC-1 
 constexpr uint8_t kLedBrightness = 2;           // of 255; dim to eliminate 3V3 power rail noise and save power
 
 // Radio
-constexpr uint8_t kDefaultChannel = 1;
+constexpr uint8_t kDefaultChannel = 13;          // Ch 13 (2472 MHz) is quiet, far from crowded Wi-Fi channels 1, 6, 11
 constexpr int8_t  kTxPowerQdBm = 84;            // 21 dBm (maximum hardware power).
-// Send at Espressif LR 500 kbit/s instead of 6 Mbit/s OFDM. Gives up to ~105 dBm sensitivity
+// Send at Espressif LR 250 kbit/s instead of 6 Mbit/s OFDM. Gives up to ~108 dBm sensitivity
 // (vs -90 dBm on OFDM) for dramatically improved range through obstacles and distance.
 constexpr bool    kLongRange = true;
+constexpr bool    kDuplicateAudioFrames = true; // send voice frames with duplicate redundancy for resilience against packet loss at range edge
 constexpr uint32_t kBeaconMs = 3000;
 
 // Talk

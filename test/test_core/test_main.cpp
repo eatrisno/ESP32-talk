@@ -15,6 +15,7 @@
 #include "jitter.hpp"
 #include "mesh.hpp"
 #include "protocol.hpp"
+#include "range_test.hpp"
 #include "voice_gate.hpp"
 
 using namespace wt;
@@ -884,6 +885,77 @@ void test_volume_curve() {
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.25f, volume_gain(50));
 }
 
+void test_peer_table_stores_mac_address() {
+    PeerTable t;
+    Header h;
+    h.sender = 0x12345678;
+    h.session = 1;
+    h.seq = 1;
+    const uint8_t direct_mac[6] = {0x30, 0x30, 0xF9, 0x13, 0xBD, 0xAC};
+
+    // Direct frame (hops = 0) with MAC
+    TEST_ASSERT_TRUE(t.accept(h, 0, -65, 1000, direct_mac));
+    const Peer* p = t.find(0x12345678);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(direct_mac, p->mac, 6);
+    TEST_ASSERT_EQUAL_INT8(-65, p->rssi);
+
+    // Multi-hop frame (hops = 1) from someone else relaying shouldn't overwrite the direct MAC
+    h.seq = 2;
+    const uint8_t relay_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    TEST_ASSERT_TRUE(t.accept(h, 1, -85, 1040, relay_mac));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(direct_mac, p->mac, 6);
+}
+
+void test_audio_frame_duplication_resilience() {
+    // Verifies that transmitting duplicate frames (for fading protection at range edge)
+    // allows seamless acceptance when either copy arrives, but rejects the redundant copy.
+    PeerTable t;
+    Header h;
+    h.type = MSG_AUDIO;
+    h.sender = 0xCAFE;
+    h.session = 1;
+
+    int accepted_count = 0;
+    // Frame 1: both copies arrive -> exactly 1 accepted
+    h.seq = 1;
+    if (t.accept(h, 0, -85, 1000)) accepted_count++;
+    if (t.accept(h, 0, -85, 1002)) accepted_count++;
+    TEST_ASSERT_EQUAL_INT(1, accepted_count);
+
+    // Frame 2: first copy dropped (RF fading), second copy arrives -> 1 accepted
+    h.seq = 2;
+    // first copy dropped!
+    if (t.accept(h, 0, -90, 1042)) accepted_count++;
+    TEST_ASSERT_EQUAL_INT(2, accepted_count);
+
+    // Frame 3: both copies arrive
+    h.seq = 3;
+    if (t.accept(h, 0, -88, 1080)) accepted_count++;
+    if (t.accept(h, 0, -88, 1082)) accepted_count++;
+    TEST_ASSERT_EQUAL_INT(3, accepted_count);
+}
+
+void test_range_test_statistics_and_margin() {
+    RangeStats rs;
+    rs.reset(20);
+
+    // Simulate 18 received out of 20 (2 dropped = 10% loss)
+    for (int i = 0; i < 18; i++) {
+        int8_t down_rssi = -80 - (i % 10); // -80 to -89 dBm
+        int8_t up_rssi = -78 - (i % 10);
+        rs.add_sample(up_rssi, down_rssi);
+    }
+
+    TEST_ASSERT_EQUAL_UINT16(20, rs.sent);
+    TEST_ASSERT_EQUAL_UINT16(18, rs.received);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 10.0f, rs.loss_percent());
+    TEST_ASSERT_EQUAL_INT8(-89, rs.min_rssi);
+    TEST_ASSERT_EQUAL_INT8(-80, rs.max_rssi);
+    // Sensitivity floor -108 dBm, avg downlink ~ -84.5 -> margin ~ +23.5 dB
+    TEST_ASSERT_GREATER_THAN_FLOAT(20.0f, rs.margin_db(-108.0f));
+}
+
 }  // namespace
 
 void setUp() {}
@@ -937,5 +1009,8 @@ int main() {
     RUN_TEST(test_agc_raises_quiet_speech_without_clipping);
     RUN_TEST(test_tones_mix_without_clicks);
     RUN_TEST(test_volume_curve);
+    RUN_TEST(test_peer_table_stores_mac_address);
+    RUN_TEST(test_audio_frame_duplication_resilience);
+    RUN_TEST(test_range_test_statistics_and_margin);
     return UNITY_END();
 }

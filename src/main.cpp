@@ -24,6 +24,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "radio.hpp"
+#include "range_test.hpp"
 #include "usb_headset.hpp"
 #include "voice_gate.hpp"
 
@@ -37,6 +38,14 @@ nvs_handle_t s_nvs;
 SemaphoreHandle_t s_app_mtx;
 volatile uint8_t s_hid_down = 0;
 uint32_t s_ping_token = 0, s_ping_ms = 0;
+
+static uint32_t s_range_token = 0;
+static wt::RangeStats s_range_stats;
+static volatile bool s_range_active = false;
+static volatile bool s_walk_mode = false;
+static volatile bool s_walk_pending = false;
+static uint32_t s_walk_probe_sent_ms = 0;
+static uint16_t s_walk_seq = 0;
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -294,6 +303,98 @@ void on_rx(const radio::Rx& rx) {
                    rx.hops ? "via relay" : "direct", rx.rssi);
             break;
         }
+        case wt::MSG_RANGE_REQ: {
+            if (rx.len >= sizeof(wt::RangeReq)) {
+                wt::RangeReq req;
+                memcpy(&req, rx.plain, sizeof(req));
+                wt::RangeResp resp;
+                resp.token = req.token;
+                resp.seq = req.seq;
+                resp.req_rssi = rx.rssi;
+                radio::send(wt::MSG_RANGE_RESP, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
+                led::flash(led::Color::Cyan, 40);
+            }
+            break;
+        }
+        case wt::MSG_RANGE_RESP: {
+            if (rx.len >= sizeof(wt::RangeResp)) {
+                wt::RangeResp resp;
+                memcpy(&resp, rx.plain, sizeof(resp));
+                if (resp.token == s_range_token) {
+                    s_walk_pending = false;
+                    s_range_stats.add_sample(resp.req_rssi, rx.rssi);
+                    // Acoustic pitch proportional to link strength
+                    if (rx.rssi >= -75) audio::tone(880, 40, 450);      // Strong
+                    else if (rx.rssi >= -90) audio::tone(580, 40, 400); // Medium
+                    else audio::tone(380, 50, 400);                     // Edge of range
+                    printf("  probe #%-2u: OK | Downlink: %4d dBm | Uplink: %4d dBm\n",
+                           resp.seq, rx.rssi, resp.req_rssi);
+                }
+            }
+            break;
+        }
+    }
+}
+
+void run_range_test(int count) {
+    if (s_range_active) {
+        printf("Range test already active.\n");
+        return;
+    }
+    s_range_active = true;
+    s_range_token = esp_random();
+    s_range_stats.reset(count);
+
+    printf("\n===========================================================\n");
+    printf("  STARTING RANGE TEST (%d probes @ LR 250k Ch %u)\n", count, radio::channel());
+    printf("===========================================================\n");
+
+    for (int i = 0; i < count; i++) {
+        wt::RangeReq req;
+        req.token = s_range_token;
+        req.seq = i + 1;
+        req.total = count;
+        uint16_t rx_before = s_range_stats.received;
+        radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        vTaskDelay(pdMS_TO_TICKS(80));
+        if (s_range_stats.received == rx_before) {
+            audio::tone(250, 30, 350);
+            printf("  probe #%-2u: [DROPPED / NO REPLY]\n", i + 1);
+        }
+    }
+
+    printf("================== RANGE TEST SUMMARY ===================\n");
+    printf("  Probes Sent:     %u\n", s_range_stats.sent);
+    printf("  Probes Received: %u\n", s_range_stats.received);
+    printf("  Packet Loss:     %.1f%%\n", s_range_stats.loss_percent());
+    if (s_range_stats.received > 0) {
+        printf("  Downlink RSSI:   Avg %.1f dBm (Min %d, Max %d)\n",
+               s_range_stats.avg_downlink_rssi(), s_range_stats.min_rssi, s_range_stats.max_rssi);
+        printf("  Uplink RSSI:     Avg %.1f dBm\n", s_range_stats.avg_uplink_rssi());
+        printf("  Link Margin:     +%.1f dB above -108 dBm sensitivity floor\n",
+               s_range_stats.margin_db(-108.0f));
+        const char* quality = "EXCELLENT";
+        if (s_range_stats.loss_percent() > 20.0f || s_range_stats.avg_downlink_rssi() < -95.0f) quality = "MARGINAL (Near limit)";
+        else if (s_range_stats.loss_percent() > 5.0f || s_range_stats.avg_downlink_rssi() < -85.0f) quality = "GOOD";
+        printf("  Link Quality:    %s\n", quality);
+    } else {
+        printf("  Result:          NO LINK (Nodes out of range or not on same channel)\n");
+    }
+    printf("=========================================================\n\n");
+    s_range_active = false;
+}
+
+void toggle_walk_mode() {
+    s_walk_mode = !s_walk_mode;
+    if (s_walk_mode) {
+        s_range_token = esp_random();
+        s_walk_seq = 0;
+        printf("\nWALK RANGE MODE: ON (emitting 1 probe/sec with acoustic pitch)\n");
+        printf("Put on headset and walk away. Tone pitch indicates signal strength!\n\n");
+        audio::tone(880, 60, 450);
+    } else {
+        printf("\nWALK RANGE MODE: OFF\n\n");
+        audio::tone(400, 60, 400);
     }
 }
 
@@ -334,7 +435,7 @@ void print_status() {
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
     printf("  radio: mode %s  tx-power %d (%.2f dBm)\n",
-           cfg::kLongRange ? "ESP-NOW Long Range (LR 500k, -105 dBm)" : "802.11g 6M (-90 dBm)",
+           cfg::kLongRange ? "ESP-NOW Long Range (LR 250k, -108 dBm)" : "802.11g 6M (-90 dBm)",
            pwr, pwr * 0.25f);
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
@@ -379,15 +480,17 @@ void selftest() {
 }
 
 void help() {
-    printf("\n  t        talk on/off (same as BOOT or headset button click)\n"
-           "  r / c    radar: check peer count and distance (same as double click)\n"
-           "  + / -    volume\n"
-           "  p        ping all nodes (same as long press)\n"
-           "  s        status, peers, counters\n"
-           "  ch N     radio channel 1..13 (all nodes must match)\n"
-           "  name X   set this node's name\n"
-           "  loop     loopback test: hear your own voice through the codec\n"
-           "  selftest check headset streams and the audio path\n"
+    printf("\n  t          talk on/off (same as BOOT or headset button click)\n"
+           "  r / c      radar: check peer count and distance (same as double click)\n"
+           "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
+           "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
+           "  + / -      volume\n"
+           "  p          ping all nodes (same as long press)\n"
+           "  s          status, peers, counters\n"
+           "  ch N       radio channel 1..13 (all nodes must match)\n"
+           "  name X     set this node's name\n"
+           "  loop       loopback test: hear your own voice through the codec\n"
+           "  selftest   check headset streams and the audio path\n"
            "  reboot\n\n");
 }
 
@@ -409,6 +512,13 @@ void console_task(void*) {
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
+        else if (!strncmp(line, "range", 5) || !strcmp(line, "test")) {
+            int count = 20;
+            if (strlen(line) > 6) count = atoi(line + 6);
+            if (count <= 0 || count > 200) count = 20;
+            run_range_test(count);
+        }
+        else if (!strcmp(line, "walk")) toggle_walk_mode();
         else if (!strcmp(line, "+")) volume_step(+10);
         else if (!strcmp(line, "-")) volume_step(-10);
         else if (!strcmp(line, "p")) send_ping();
@@ -575,6 +685,23 @@ extern "C" void app_main() {
             radio::peers().prune(now);
             radio::peers_unlock();
         }
+
+        static uint32_t last_walk_probe = 0;
+        if (s_walk_mode && (now - last_walk_probe >= 1000)) {
+            last_walk_probe = now;
+            wt::RangeReq req;
+            req.token = s_range_token;
+            req.seq = ++s_walk_seq;
+            req.total = 0;
+            s_walk_pending = true;
+            s_walk_probe_sent_ms = now;
+            radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        }
+        if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 400)) {
+            s_walk_pending = false;
+            audio::tone(250, 40, 350);  // low warning tone: missed probe
+        }
+
         update_led();
         vTaskDelay(pdMS_TO_TICKS(10));
     }

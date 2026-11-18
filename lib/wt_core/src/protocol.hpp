@@ -39,9 +39,11 @@ enum MsgType : uint8_t {
     MSG_BEACON = 1,   // presence + name, every few seconds
     MSG_JOIN   = 2,   // started talking
     MSG_LEAVE  = 3,   // stopped talking
-    MSG_AUDIO  = 4,
-    MSG_PING   = 5,
-    MSG_PONG   = 6,
+    MSG_AUDIO      = 4,
+    MSG_PING       = 5,
+    MSG_PONG       = 6,
+    MSG_RANGE_REQ  = 7,
+    MSG_RANGE_RESP = 8,
 };
 
 struct Header {
