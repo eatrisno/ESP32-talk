@@ -86,24 +86,19 @@ uint32_t next_session() {
 
 // --- feedback --------------------------------------------------------------------------
 
-// Soft, gentle "pi.." feedback
-void chime_join() { audio::tone(550, 45, 450); }
-void chime_leave() { audio::tone(420, 45, 400); }
-void chime_peer_joined() { audio::tone(550, 30, 400); }
-void chime_peer_left() { audio::tone(400, 30, 350); }
+void chime_join() { audio::prompt_clear(); audio::prompt(wt::PROMPT_MIC_ON); }
+void chime_leave() { audio::prompt_clear(); audio::prompt(wt::PROMPT_MIC_OFF); }
+void chime_peer_joined() { audio::prompt_clear(); audio::prompt(wt::PROMPT_CONNECTED); }
+void chime_peer_left() { audio::prompt_clear(); audio::prompt(wt::PROMPT_DISCONNECTED); }
 
 void sound_distress_alert() {
-    // Gentle, non-deafening distress tone: warm two-tone 620Hz (130ms), gap 30ms, 480Hz (170ms) at amplitude 380
-    audio::tone(620, 130, 380);
-    audio::tone(0, 30);
-    audio::tone(480, 170, 380);
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_EMERGENCY_RX);
 }
 
 void sound_all_clear() {
-    // Gentle soothing all-clear chime: rising 450Hz (70ms) -> 600Hz (100ms)
-    audio::tone(450, 70, 400);
-    audio::tone(0, 20);
-    audio::tone(600, 100, 400);
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_EMERGENCY_OFF);
 }
 
 void update_led() {
@@ -167,12 +162,13 @@ void send_distress_packet(bool active) {
 void toggle_distress() {
     s_distress_active = !s_distress_active;
     send_distress_packet(s_distress_active);
+    audio::prompt_clear();
     if (s_distress_active) {
         printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
-        sound_distress_alert();
+        audio::prompt(wt::PROMPT_EMERGENCY_ON);
     } else {
         printf("\n*** [DISTRESS CANCELLED] All-clear broadcasted. ***\n\n");
-        sound_all_clear();
+        audio::prompt(wt::PROMPT_EMERGENCY_OFF);
     }
 }
 
@@ -314,8 +310,11 @@ void radar_check() {
         } else if (count == 3) {
             audio::prompt(wt::PROMPT_THREE);
             audio::prompt(wt::PROMPT_DEVICES);
-        } else {
+        } else if (count == 4) {
             audio::prompt(wt::PROMPT_FOUR);
+            audio::prompt(wt::PROMPT_DEVICES);
+        } else {
+            audio::prompt(wt::PROMPT_FIVE);
             audio::prompt(wt::PROMPT_DEVICES);
         }
         if (has_direct && best_rssi >= -70) {
@@ -930,6 +929,12 @@ extern "C" void app_main() {
     for (;;) {
         uint32_t now = now_ms();
         uint8_t hid = s_hid_down;
+
+        static bool s_ready_announced = false;
+        if (!s_ready_announced && usb_headset::spk_ready()) {
+            s_ready_announced = true;
+            audio::prompt(wt::PROMPT_READY);
+        }
 
         // Latching hook/mute control: every change is one click
         uint8_t tog = hid & wt::HID_BTN_TALK_TOGGLE;
