@@ -564,9 +564,11 @@ void test_button_click_long_and_bounce() {
     // Bounce: 10 ms glitch is ignored.
     TEST_ASSERT_TRUE(feed(b, true, 405, 415) == Press::None);
     TEST_ASSERT_TRUE(feed(b, false, 420, 600) == Press::None);
-    // Long press: fires while held, no click on release.
+    // Long press: fires while held.
     TEST_ASSERT_TRUE(feed(b, true, 605, 605 + ButtonDetector::kLongMs + 50) == Press::Long);
-    TEST_ASSERT_TRUE(feed(b, false, 2300, 2500) == Press::None);
+    // Hold press (distress trigger): fires when held continuously past kHoldMs, no click on release.
+    TEST_ASSERT_TRUE(feed(b, true, 605 + ButtonDetector::kLongMs + 55, 605 + ButtonDetector::kHoldMs + 50) == Press::Hold);
+    TEST_ASSERT_TRUE(feed(b, false, 3500, 3700) == Press::None);
     // millis() wrap-around
     ButtonDetector w;
     TEST_ASSERT_TRUE(feed(w, true, 0xFFFFFF00u, 0xFFFFFFF0u) == Press::None);

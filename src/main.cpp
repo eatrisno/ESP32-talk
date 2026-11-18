@@ -22,6 +22,7 @@
 #include "hid_buttons.hpp"
 #include "led.hpp"
 #include "nvs.h"
+#include "driver/temperature_sensor.h"
 #include "nvs_flash.h"
 #include "radio.hpp"
 #include "range_test.hpp"
@@ -46,6 +47,13 @@ static volatile bool s_walk_mode = false;
 static volatile bool s_walk_pending = false;
 static uint32_t s_walk_probe_sent_ms = 0;
 static uint16_t s_walk_seq = 0;
+
+static volatile bool s_distress_active = false;
+static volatile uint32_t s_distress_peer = 0;
+static char s_distress_peer_name[12] = "";
+static uint32_t s_last_distress_tx_ms = 0;
+static uint32_t s_last_distress_beep_ms = 0;
+static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -83,14 +91,62 @@ void chime_leave() { audio::tone(420, 45, 400); }
 void chime_peer_joined() { audio::tone(550, 30, 400); }
 void chime_peer_left() { audio::tone(400, 30, 350); }
 
+void sound_distress_alert() {
+    // Gentle, non-deafening distress tone: warm two-tone 620Hz (130ms), gap 30ms, 480Hz (170ms) at amplitude 380
+    audio::tone(620, 130, 380);
+    audio::tone(0, 30);
+    audio::tone(480, 170, 380);
+}
+
+void sound_all_clear() {
+    // Gentle soothing all-clear chime: rising 450Hz (70ms) -> 600Hz (100ms)
+    audio::tone(450, 70, 400);
+    audio::tone(0, 20);
+    audio::tone(600, 100, 400);
+}
+
 void update_led() {
     using led::Color;
+    if (s_distress_active || s_distress_peer != 0) {
+        static uint32_t s_last_distress_flash = 0;
+        static bool s_red_on = false;
+        uint32_t now = now_ms();
+        if (now - s_last_distress_flash >= 250) {
+            s_last_distress_flash = now;
+            s_red_on = !s_red_on;
+        }
+        led::set(s_red_on ? Color::Red : Color::Off);
+        return;
+    }
     if (audio::loopback()) led::set(Color::White);
     else if (audio::sending()) led::set(Color::Red);
     else if (audio::receiving()) led::set(Color::Green);
     else if (audio::talking()) led::set(Color::Amber);  // mic open, waiting for speech
     else if (!usb_headset::spk_ready()) led::set(Color::Blue);
     else led::set(Color::Off);
+}
+
+void send_distress_packet(bool active) {
+    wt::DistressPayload dp;
+    dp.sender = radio::self_id();
+    dp.active = active ? 1 : 0;
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    strncpy(dp.name, s_name, sizeof(dp.name) - 1);
+    dp.name[sizeof(dp.name) - 1] = 0;
+    xSemaphoreGive(s_app_mtx);
+    radio::send(wt::MSG_DISTRESS, reinterpret_cast<const uint8_t*>(&dp), sizeof(dp));
+}
+
+void toggle_distress() {
+    s_distress_active = !s_distress_active;
+    send_distress_packet(s_distress_active);
+    if (s_distress_active) {
+        printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
+        sound_distress_alert();
+    } else {
+        printf("\n*** [DISTRESS CANCELLED] All-clear broadcasted. ***\n\n");
+        sound_all_clear();
+    }
 }
 
 // --- actions ---------------------------------------------------------------------------
@@ -227,8 +283,14 @@ static bool s_pending_single_talk = false;
 void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
     if (p == wt::Press::None) return;
-    ESP_LOGI(TAG, "Button %d event: %s", which, p == wt::Press::Click ? "Click" : "Long");
+    ESP_LOGI(TAG, "Button %d event: %d", which, static_cast<int>(p));
     if (which == 0) {
+        if (s_distress_active) {
+            // Any click or press while distress is active immediately cancels it!
+            s_pending_single_talk = false;
+            toggle_distress();
+            return;
+        }
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
             if (s_pending_single_talk && (now - s_last_talk_click_ms <= 350)) {
@@ -242,8 +304,14 @@ void handle_press(wt::Press p, int which) {
                 s_last_talk_click_ms = now;
             }
         } else if (p == wt::Press::Long) {
+            // Pre-warning soft ticks at 1.2s indicating button is being held for distress
+            audio::tone(650, 20, 350);
+            audio::tone(0, 40);
+            audio::tone(750, 25, 350);
+        } else if (p == wt::Press::Hold) {
+            // 2.5s hold: trigger distress signal!
             s_pending_single_talk = false;
-            send_ping();
+            toggle_distress();
         }
     }
     if (which == 1 && p == wt::Press::Click) volume_step(+10);
@@ -329,6 +397,27 @@ void on_rx(const radio::Rx& rx) {
                     else audio::tone(380, 50, 400);                     // Edge of range
                     printf("  probe #%-2u: OK | Downlink: %4d dBm | Uplink: %4d dBm\n",
                            resp.seq, rx.rssi, resp.req_rssi);
+                }
+            }
+            break;
+        }
+        case wt::MSG_DISTRESS: {
+            if (rx.len >= sizeof(wt::DistressPayload)) {
+                wt::DistressPayload dp;
+                memcpy(&dp, rx.plain, sizeof(dp));
+                dp.name[sizeof(dp.name) - 1] = 0;
+                if (dp.active) {
+                    s_distress_peer = dp.sender;
+                    strncpy(s_distress_peer_name, dp.name, sizeof(s_distress_peer_name) - 1);
+                    s_distress_peer_name[sizeof(s_distress_peer_name) - 1] = 0;
+                    printf("\n*** [DISTRESS ALERT] Emergency SOS from %s (%08lx)! RSSI: %d dBm ***\n\n",
+                           dp.name, (unsigned long)dp.sender, rx.rssi);
+                    sound_distress_alert();
+                } else {
+                    if (s_distress_peer == dp.sender) s_distress_peer = 0;
+                    printf("\n[DISTRESS CLEARED] Emergency resolved by %s (%08lx).\n\n",
+                           dp.name, (unsigned long)dp.sender);
+                    sound_all_clear();
                 }
             }
             break;
@@ -440,6 +529,14 @@ void print_status() {
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
            (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
+    float temp_c = 0.0f;
+    if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
+    uint32_t free_ram = esp_get_free_heap_size() / 1024;
+    uint32_t min_ram = esp_get_minimum_free_heap_size() / 1024;
+    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s\n",
+           temp_c, (unsigned long)free_ram, (unsigned long)min_ram,
+           s_distress_active ? "  [DISTRESS ACTIVE]" : "",
+           s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "");
     printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
            (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
            (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
@@ -482,6 +579,7 @@ void selftest() {
 void help() {
     printf("\n  t          talk on/off (same as BOOT or headset button click)\n"
            "  r / c      radar: check peer count and distance (same as double click)\n"
+           "  sos        distress SOS on/off (same as holding button 2.5s)\n"
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
            "  + / -      volume\n"
@@ -512,6 +610,7 @@ void console_task(void*) {
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
+        else if (!strcmp(line, "sos") || !strcmp(line, "distress")) toggle_distress();
         else if (!strncmp(line, "range", 5) || !strcmp(line, "test")) {
             int count = 20;
             if (strlen(line) > 6) count = atoi(line + 6);
@@ -606,6 +705,10 @@ extern "C" void app_main() {
         vTaskDelay(portMAX_DELAY);
     }
     audio::start();
+    temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+    if (temperature_sensor_install(&temp_cfg, &s_temp_sensor) == ESP_OK) {
+        temperature_sensor_enable(s_temp_sensor);
+    }
     usb_headset::start(on_hid_buttons, on_headset_state);
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
     printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
@@ -615,6 +718,7 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
+    bool hid_talk_hold_sent = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
@@ -636,17 +740,22 @@ extern "C" void app_main() {
         }
 
         // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
-        // Click on release (< 1.5s), Long press when held (>= 1.5s)
+        // Click on release (< 1.2s), Long press when held (>= 1.2s), Hold when held (>= 2.5s)
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
+            hid_talk_hold_sent = false;
         }
         if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= wt::ButtonDetector::kLongMs)) {
             hid_talk_long_sent = true;
             handle_press(wt::Press::Long, 0);
         }
+        if ((hid & wt::HID_BTN_TALK) && !hid_talk_hold_sent && (now - hid_talk_start >= wt::ButtonDetector::kHoldMs)) {
+            hid_talk_hold_sent = true;
+            handle_press(wt::Press::Hold, 0);
+        }
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
-            if (!hid_talk_long_sent) {
+            if (!hid_talk_long_sent && !hid_talk_hold_sent) {
                 handle_press(wt::Press::Click, 0);
             }
         }
@@ -700,6 +809,23 @@ extern "C" void app_main() {
         if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 400)) {
             s_walk_pending = false;
             audio::tone(250, 40, 350);  // low warning tone: missed probe
+        }
+
+        // Distress SOS periodic broadcasting & audible reminder
+        if (s_distress_active) {
+            if (now - s_last_distress_tx_ms >= 2000) {
+                s_last_distress_tx_ms = now;
+                send_distress_packet(true);
+            }
+            if (now - s_last_distress_beep_ms >= 2500) {
+                s_last_distress_beep_ms = now;
+                sound_distress_alert();
+            }
+        } else if (s_distress_peer != 0) {
+            if (now - s_last_distress_beep_ms >= 3000) {
+                s_last_distress_beep_ms = now;
+                sound_distress_alert();
+            }
         }
 
         update_led();

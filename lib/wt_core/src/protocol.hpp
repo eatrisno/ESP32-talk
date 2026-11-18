@@ -44,7 +44,16 @@ enum MsgType : uint8_t {
     MSG_PONG       = 6,
     MSG_RANGE_REQ  = 7,
     MSG_RANGE_RESP = 8,
+    MSG_DISTRESS   = 9,
 };
+
+#pragma pack(push, 1)
+struct DistressPayload {
+    uint32_t sender;
+    uint8_t  active; // 1 = SOS active, 0 = all-clear / cancelled
+    char     name[12];
+};
+#pragma pack(pop)
 
 struct Header {
     uint8_t  type = 0;
