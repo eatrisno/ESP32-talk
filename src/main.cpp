@@ -86,8 +86,6 @@ uint32_t next_session() {
 
 // --- feedback --------------------------------------------------------------------------
 
-void chime_join() { audio::prompt_clear(); audio::prompt(wt::PROMPT_MIC_ON); }
-void chime_leave() { audio::prompt_clear(); audio::prompt(wt::PROMPT_MIC_OFF); }
 void chime_peer_joined() { audio::prompt_clear(); audio::prompt(wt::PROMPT_CONNECTED); }
 void chime_peer_left() { audio::prompt_clear(); audio::prompt(wt::PROMPT_DISCONNECTED); }
 
@@ -862,7 +860,6 @@ void on_hid_buttons(uint8_t down) {
 
 void on_headset_state(bool connected) {
     if (connected) {
-        chime_join();
         ESP_LOGI(TAG, "headset ready");
     }
 }
@@ -939,7 +936,12 @@ extern "C" void app_main() {
 
         // Latching hook/mute control: every change is one click
         uint8_t tog = hid & wt::HID_BTN_TALK_TOGGLE;
-        if (tog != last_toggle) {
+        static bool s_first_hid = true;
+        if (s_first_hid) {
+            s_first_hid = false;
+            last_toggle = tog;
+            last_hid = hid;
+        } else if (tog != last_toggle) {
             last_toggle = tog;
             handle_press(wt::Press::Click, 0);
         }
