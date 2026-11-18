@@ -211,6 +211,27 @@ void volume_step(int d) {
     audio::tone(freq, 25, 350);
 }
 
+// --- voice mail ------------------------------------------------------------------------
+
+struct VmFrame {
+    int16_t adpcm_pred;
+    int8_t  adpcm_index;
+    uint8_t data_len;
+    uint8_t data[wt::kAdpcmBytes]; // 160 bytes
+};
+
+struct VmStorage {
+    uint32_t vm_id = 0;
+    uint16_t total_frames = 0;
+    char name[12] = {};
+    VmFrame frames[250]; // up to 10 seconds (250 * 40ms = 10s)
+};
+
+static VmStorage* s_vm_storage = nullptr;
+static bool s_vm_recording = false;
+static bool s_vm_outbox_pending = false;
+static uint32_t s_last_played_vm_id = 0;
+
 void radar_check() {
     uint32_t now = now_ms();
     struct PeerInfo {
@@ -256,8 +277,12 @@ void radar_check() {
                active[i].hops ? "mesh relay" : "direct    ",
                active[i].rssi, dist);
     }
-    if (count == 0) printf("  No peers in range.\n\n");
-    else printf("\n");
+    if (count == 0) printf("  No peers in range.\n");
+    if (s_vm_outbox_pending && s_vm_storage && s_vm_storage->total_frames > 0) {
+        printf("  [OUTBOX QUEUED] 1 Voice Note (%.1fs) pending delivery once in range.\n",
+               s_vm_storage->total_frames * 0.04f);
+    }
+    printf("\n");
 
     // Audio acoustic telemetry in headset:
     // 1. Tell peer count with N distinct pips
@@ -291,26 +316,7 @@ void radar_check() {
     }
 }
 
-// --- voice mail ------------------------------------------------------------------------
 
-struct VmFrame {
-    int16_t adpcm_pred;
-    int8_t  adpcm_index;
-    uint8_t data_len;
-    uint8_t data[wt::kAdpcmBytes]; // 160 bytes
-};
-
-struct VmStorage {
-    uint32_t vm_id = 0;
-    uint16_t total_frames = 0;
-    char name[12] = {};
-    VmFrame frames[250]; // up to 10 seconds (250 * 40ms = 10s)
-};
-
-static VmStorage* s_vm_storage = nullptr;
-static bool s_vm_recording = false;
-static bool s_vm_outbox_pending = false;
-static uint32_t s_last_played_vm_id = 0;
 
 void chime_voicemail_prompt() {
     // Rising 3-tone record start prompt: 440Hz -> 660Hz -> 880Hz
@@ -725,10 +731,11 @@ void print_status() {
     if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
     uint32_t free_ram = esp_get_free_heap_size() / 1024;
     uint32_t min_ram = esp_get_minimum_free_heap_size() / 1024;
-    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s\n",
+    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s%s\n",
            temp_c, (unsigned long)free_ram, (unsigned long)min_ram,
            s_distress_active ? "  [DISTRESS ACTIVE]" : "",
-           s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "");
+           s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "",
+           s_vm_outbox_pending ? "  [VOICE NOTE IN OUTBOX]" : "");
     printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
            (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
            (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
