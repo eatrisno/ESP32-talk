@@ -42,6 +42,7 @@ void prompt_clear();
 
 // From the radio task.
 void on_audio(uint32_t sender, const wt::AudioPayload& a);
+void clear_talker(uint32_t sender);
 
 struct Stats {
     uint32_t frames_sent, frames_gated, frames_played, lost, late, mic_bytes,

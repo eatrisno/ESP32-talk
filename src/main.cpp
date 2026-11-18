@@ -238,7 +238,11 @@ struct VmStorage {
 
 static VmStorage* s_vm_storage = nullptr;
 static bool s_vm_outbox_pending = false;
-static uint32_t s_last_played_vm_id = 0;
+static VmStorage* s_vm_inbox = nullptr;
+static bool s_vm_inbox_has_message = false;
+static uint32_t s_last_received_vm_id = 0;
+static TaskHandle_t s_vm_playback_task = nullptr;
+static constexpr uint32_t kVmLocalSender = 0xFFFFFFFE;
 
 void radar_check() {
     uint32_t now = now_ms();
@@ -441,6 +445,63 @@ void send_voicemail() {
     }
 }
 
+void vm_playback_worker(void* arg) {
+    if (!s_vm_inbox || s_vm_inbox->total_frames == 0) {
+        s_vm_playback_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+    uint8_t voice_id = static_cast<uint8_t>(s_vm_inbox->vm_id & 0xFF);
+    uint16_t total = s_vm_inbox->total_frames;
+    printf("[Voice Note] Playing %u frames (%.1fs)...\n", total, total * 0.04f);
+    led::flash(led::Color::Cyan, 120);
+
+    for (uint16_t i = 0; i < total; i++) {
+        if (!s_vm_inbox_has_message) break;
+        const VmFrame& f = s_vm_inbox->frames[i];
+        wt::AudioPayload a;
+        a.voice_id = voice_id;
+        a.frame_no = i;
+        a.adpcm_pred = f.adpcm_pred;
+        a.adpcm_index = static_cast<uint8_t>(f.adpcm_index);
+        a.data_len = f.data_len;
+        a.data = f.data;
+        audio::on_audio(kVmLocalSender, a);
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    printf("[Voice Note] Playback finished. Click 1x to repeat, 2x to remove/dismiss.\n");
+    s_vm_playback_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void play_inbox_voicemail() {
+    if (!s_vm_inbox || s_vm_inbox->total_frames == 0) return;
+    if (s_vm_playback_task) {
+        vTaskDelete(s_vm_playback_task);
+        s_vm_playback_task = nullptr;
+    }
+    audio::clear_talker(kVmLocalSender);
+    xTaskCreate(vm_playback_worker, "vm_play", 3072, nullptr, 4, &s_vm_playback_task);
+}
+
+void dismiss_inbox_voicemail() {
+    if (s_vm_playback_task) {
+        vTaskDelete(s_vm_playback_task);
+        s_vm_playback_task = nullptr;
+    }
+    audio::clear_talker(kVmLocalSender);
+    s_vm_inbox_has_message = false;
+    if (s_vm_inbox) {
+        free(s_vm_inbox);
+        s_vm_inbox = nullptr;
+    }
+    // Subtle acknowledgment tone (descending two-tone) for dismiss
+    audio::tone(500, 35, 300);
+    audio::tone(0, 15);
+    audio::tone(350, 45, 300);
+    printf("[Voice Note] Dismissed / Removed.\n");
+}
+
 static uint32_t s_last_talk_click_ms = 0;
 static uint8_t  s_talk_click_count = 0;
 static constexpr uint32_t kMultiClickWindowMs = 650; // Comfortable, relaxed multi-click window (was 450ms)
@@ -601,21 +662,38 @@ void on_rx(const radio::Rx& rx) {
                 wt::VoicemailPayload vp;
                 memcpy(&vp, rx.plain, sizeof(vp));
                 vp.name[sizeof(vp.name) - 1] = 0;
-                if (vp.vm_id != s_last_played_vm_id) {
-                    s_last_played_vm_id = vp.vm_id;
+                if (vp.vm_id != s_last_received_vm_id) {
+                    s_last_received_vm_id = vp.vm_id;
+                    if (s_vm_playback_task) {
+                        vTaskDelete(s_vm_playback_task);
+                        s_vm_playback_task = nullptr;
+                    }
+                    audio::clear_talker(kVmLocalSender);
+                    if (!s_vm_inbox) {
+                        s_vm_inbox = static_cast<VmStorage*>(malloc(sizeof(VmStorage)));
+                    }
+                    if (s_vm_inbox) {
+                        s_vm_inbox->vm_id = vp.vm_id;
+                        s_vm_inbox->total_frames = 0;
+                        memcpy(s_vm_inbox->name, vp.name, sizeof(s_vm_inbox->name));
+                    }
+                    s_vm_inbox_has_message = true;
                     chime_voicemail_received();
-                    led::flash(led::Color::Cyan, 150);
-                    printf("\n*** [VOICE MAIL RECEIVED] from %-11s (%u frames, %.1fs) ***\n\n",
+                    led::flash(led::Color::Cyan, 200);
+                    printf("\n*** [VOICE NOTE RECEIVED] from %-11s (%u frames, %.1fs) ***\n",
                            vp.name[0] ? vp.name : "?", vp.total_frames, vp.total_frames * 0.04f);
+                    printf(">>> Click 1x to hear, click 1x more to repeat, 2x to remove/dismiss <<<\n\n");
                 }
-                wt::AudioPayload a;
-                a.voice_id = static_cast<uint8_t>(vp.vm_id & 0xFF);
-                a.frame_no = vp.frame_index;
-                a.adpcm_pred = vp.adpcm_pred;
-                a.adpcm_index = static_cast<uint8_t>(vp.adpcm_index);
-                a.data_len = vp.data_len > wt::kAdpcmBytes ? wt::kAdpcmBytes : vp.data_len;
-                a.data = vp.data;
-                audio::on_audio(id, a);
+                if (s_vm_inbox && vp.frame_index < 250) {
+                    VmFrame& f = s_vm_inbox->frames[vp.frame_index];
+                    f.adpcm_pred = vp.adpcm_pred;
+                    f.adpcm_index = vp.adpcm_index;
+                    f.data_len = vp.data_len > wt::kAdpcmBytes ? wt::kAdpcmBytes : vp.data_len;
+                    memcpy(f.data, vp.data, f.data_len);
+                    if (vp.frame_index + 1 > s_vm_inbox->total_frames) {
+                        s_vm_inbox->total_frames = vp.frame_index + 1;
+                    }
+                }
             }
             break;
         }
@@ -815,6 +893,8 @@ void console_task(void*) {
             else start_voicemail_recording();
         }
         else if (!strcmp(line, "send")) send_voicemail();
+        else if (!strcmp(line, "play") || !strcmp(line, "pvm")) play_inbox_voicemail();
+        else if (!strcmp(line, "dismiss") || !strcmp(line, "dvm")) dismiss_inbox_voicemail();
         else if (!strcmp(line, "sos") || !strcmp(line, "distress")) toggle_distress();
         else if (!strncmp(line, "range", 5) || !strcmp(line, "test")) {
             int count = 20;
@@ -985,11 +1065,21 @@ extern "C" void app_main() {
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
             uint8_t count = s_talk_click_count;
             s_talk_click_count = 0;
-            if (count == 1) {
-                toggle_talk();
-            } else if (count == 2) {
-                ESP_LOGI(TAG, "Double click: radar check");
-                radar_check();
+            if (s_vm_inbox_has_message) {
+                if (count == 1) {
+                    // Click once to hear, click 1 more to repeat
+                    play_inbox_voicemail();
+                } else if (count == 2) {
+                    // Click 2 times to remove or dismiss
+                    dismiss_inbox_voicemail();
+                }
+            } else {
+                if (count == 1) {
+                    toggle_talk();
+                } else if (count == 2) {
+                    ESP_LOGI(TAG, "Double click: radar check");
+                    radar_check();
+                }
             }
         }
 

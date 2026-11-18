@@ -302,6 +302,17 @@ void on_audio(uint32_t sender, const wt::AudioPayload& a) {
     xSemaphoreGive(s_mtx);
 }
 
+void clear_talker(uint32_t sender) {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    for (auto& x : s_talkers) {
+        if (x.used && x.sender == sender) {
+            x.jb.reset();
+            x.used = false;
+        }
+    }
+    xSemaphoreGive(s_mtx);
+}
+
 Stats stats() { return s_stats; }
 
 }  // namespace audio
