@@ -119,9 +119,13 @@ void update_led() {
         return;
     }
     if (audio::loopback()) led::set(Color::White);
-    else if (audio::sending()) led::set(Color::Red);
+    else if (audio::sending()) {
+        // While speaking / transmitting RF: blinking red (low duty cycle ~35%) to conserve power
+        uint32_t phase = now_ms() % 250;
+        led::set(phase < 90 ? Color::Red : Color::Off);
+    }
     else if (audio::receiving()) led::set(Color::Green);
-    else if (audio::talking()) led::set(Color::Amber);  // mic open, waiting for speech
+    else if (audio::talking()) led::set(Color::Amber);  // mic open in talk mode, waiting for speech
     else if (!usb_headset::spk_ready()) led::set(Color::Blue);
     else led::set(Color::Off);
 }
@@ -232,11 +236,11 @@ void radar_check() {
     for (int i = 0; i < count; i++) {
         const char* dist = "far";
         if (active[i].hops == 0) {
-            if (active[i].rssi >= -65) dist = "close (<25m)";
-            else if (active[i].rssi >= -80) dist = "medium (~50m)";
-            else dist = "far (>80m)";
+            if (active[i].rssi >= -70) dist = "close / strong (beep panjang)";
+            else if (active[i].rssi >= -88) dist = "medium / mid-range (beep sedang)";
+            else dist = "far / weak (beep pendek)";
         } else {
-            dist = "relayed via mesh";
+            dist = "relayed via mesh (beep pendek)";
         }
         printf("  - %-11s %s  RSSI %4d dBm  (%s)\n",
                active[i].name[0] ? active[i].name : "?",
@@ -246,33 +250,26 @@ void radar_check() {
     if (count == 0) printf("  No peers in range.\n\n");
     else printf("\n");
 
-    // Audio acoustic telemetry in headset
+    // Audio acoustic telemetry in headset using intuitive beep length:
+    // - Kuat (>= -70 dBm): Beep Panjang (~350ms)
+    // - Sedang (-71 s/d -88 dBm): Beep Sedang (~160ms)
+    // - Lemah (< -88 dBm / relay): Beep Pendek (~50ms)
+    // - 0 peer: descending double-boop
     if (count == 0) {
-        // 0 peers: soft low descending tone (350Hz 60ms, gap 20ms, 280Hz 80ms)
-        audio::tone(350, 60, 400);
+        // 0 peers: soft low descending tone (350Hz 80ms, gap 20ms, 250Hz 100ms)
+        audio::tone(350, 80, 380);
         audio::tone(0, 20);
-        audio::tone(280, 80, 400);
+        audio::tone(250, 100, 380);
     } else {
-        // 1 to N peers: play N soft pips (550Hz, 35ms with 75ms gap)
-        int pips = count > 6 ? 6 : count;
-        for (int i = 0; i < pips; i++) {
-            audio::tone(550, 35, 450);
-            audio::tone(0, 75);
-        }
-        // Short pause before distance indicator
-        audio::tone(0, 150);
-        // Distance chime based on closest direct peer
-        if (has_direct && best_rssi >= -65) {
-            // Close: bright high double-chime (750Hz 40ms, gap 30ms, 850Hz 50ms)
-            audio::tone(750, 40, 450);
-            audio::tone(0, 30);
-            audio::tone(850, 50, 450);
-        } else if (has_direct && best_rssi >= -80) {
-            // Medium: single warm mid chime (550Hz 60ms)
-            audio::tone(550, 60, 400);
+        if (has_direct && best_rssi >= -70) {
+            // Signal Kuat: BEEP PANJANG (620Hz, 350ms)
+            audio::tone(620, 350, 400);
+        } else if (has_direct && best_rssi >= -88) {
+            // Signal Sedang: BEEP SEDANG (540Hz, 160ms)
+            audio::tone(540, 160, 380);
         } else {
-            // Far or multi-hop: low soft tone (380Hz 80ms)
-            audio::tone(380, 80, 400);
+            // Signal Lemah / Multi-hop: BEEP PENDEK (440Hz, 50ms)
+            audio::tone(440, 50, 360);
         }
     }
 }
@@ -293,13 +290,13 @@ void handle_press(wt::Press p, int which) {
         }
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
-            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 350)) {
+            if (s_pending_single_talk && (now - s_last_talk_click_ms <= 450)) {
                 // Double click: cancel single click and run radar check
                 s_pending_single_talk = false;
                 ESP_LOGI(TAG, "Double click: radar check");
                 radar_check();
             } else {
-                // First click: wait up to 350ms to see if a second click arrives
+                // First click: wait up to 450ms to see if a second click arrives
                 s_pending_single_talk = true;
                 s_last_talk_click_ms = now;
             }
@@ -766,8 +763,8 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Handle pending single talk click timeout (350 ms)
-        if (s_pending_single_talk && (now - s_last_talk_click_ms > 350)) {
+        // Handle pending single talk click timeout (450 ms)
+        if (s_pending_single_talk && (now - s_last_talk_click_ms > 450)) {
             s_pending_single_talk = false;
             toggle_talk();
         }

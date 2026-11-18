@@ -11,7 +11,7 @@ constexpr gpio_num_t kPinVolUp = GPIO_NUM_1;
 constexpr gpio_num_t kPinVolDown = GPIO_NUM_2;
 
 constexpr gpio_num_t kPinLed = GPIO_NUM_48;     // WS2812 on ESP32-S3-DevKitC-1 (v1.0: 48, v1.1: 38)
-constexpr uint8_t kLedBrightness = 2;           // of 255; dim to eliminate 3V3 power rail noise and save power
+constexpr uint8_t kLedBrightness = 1;           // of 255; dim to absolute minimum (1 LSB) to eliminate 3V3 rail noise and save power
 
 // Radio
 constexpr uint8_t kDefaultChannel = 13;          // Ch 13 (2472 MHz) is quiet, far from crowded Wi-Fi channels 1, 6, 11
@@ -24,7 +24,11 @@ constexpr uint32_t kBeaconMs = 3000;
 
 // Talk
 constexpr uint32_t kMaxTalkMs = 0;              // 0 = disabled (never auto-mute, stay ON until user turns it OFF)
-constexpr bool     kContinuousStream = true;    // stream audio continuously while ON without voice-gate auto-muting
+// Voice-gate power saving:
+// When false: stops transmitting RF packets during silence, saving ~150mA current and dramatically
+// reducing heat. Resumes transmitting instantly when speech is detected.
+// When true: stream audio continuously while ON even during complete silence.
+constexpr bool     kContinuousStream = false;
 constexpr uint8_t  kDefaultVolume = 70;
 
 // Network key: 16 bytes, same on every node. Set WT_NETWORK_KEY_HEX (32 hex chars) as a
