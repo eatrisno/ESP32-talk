@@ -331,30 +331,32 @@ void radar_check() {
 
 
 
+// Simple, intuitive Low-Medium-High harmonic notes:
+// Low: 400Hz | Medium: 550Hz | High: 750Hz (comfortable, warm, and clearly articulated)
+
 void chime_voicemail_prompt() {
-    // Distinct, high-register modern voice memo prompt: C6 (1046Hz) -> F#6 (1480Hz)
-    // Instant clear separation from walkie-talkie 550Hz/420Hz PTT beeps
-    audio::tone(1046, 35, 380);
-    audio::tone(0, 20);
-    audio::tone(1480, 55, 420);
+    // Start recording: Low -> Medium -> High ("Voice - Note - Start!")
+    audio::tone(400, 85, 380);
+    audio::tone(0, 35);
+    audio::tone(550, 85, 380);
+    audio::tone(0, 35);
+    audio::tone(750, 140, 400);
 }
 
 void chime_voicemail_send() {
-    // Crisp modern messenger swoosh: 1480Hz -> 1046Hz -> 1660Hz
-    audio::tone(1480, 30, 380);
-    audio::tone(0, 15);
-    audio::tone(1046, 30, 380);
-    audio::tone(0, 15);
-    audio::tone(1660, 65, 420);
+    // Send immediate (peers online): Medium -> High ("Mes - sage Sent!")
+    audio::tone(550, 85, 380);
+    audio::tone(0, 35);
+    audio::tone(750, 130, 400);
 }
 
 void chime_voicemail_received() {
-    // Distinct answering-machine / dispatcher chime: C5 (523Hz) -> E5 (659Hz) -> G5 (784Hz)
-    audio::tone(523, 70, 400);
-    audio::tone(0, 30);
-    audio::tone(659, 70, 400);
-    audio::tone(0, 30);
-    audio::tone(784, 100, 420);
+    // Received incoming voice note: Low -> Med -> High ("Voice - Note - In!")
+    audio::tone(400, 85, 380);
+    audio::tone(0, 35);
+    audio::tone(550, 85, 380);
+    audio::tone(0, 35);
+    audio::tone(750, 140, 400);
 }
 
 void on_voicemail_captured_frame(const wt::AudioPayload& a) {
@@ -363,13 +365,9 @@ void on_voicemail_captured_frame(const wt::AudioPayload& a) {
         // 10 seconds maximum reached: stop recording automatically
         s_vm_recording = false;
         audio::set_recording_vm(false);
-        audio::tone(700, 50, 400);
+        audio::tone(700, 70, 400);
         printf("[Voice Mail] Max 10s recording reached. Press 1x to send.\n");
         return;
-    }
-    // Subtle low-volume soft tick every 50 frames (2.0s) so user knows recording is running
-    if (s_vm_storage->total_frames > 0 && (s_vm_storage->total_frames % 50 == 0)) {
-        audio::tone(1300, 10, 200);
     }
     VmFrame& f = s_vm_storage->frames[s_vm_storage->total_frames++];
     f.adpcm_pred = a.adpcm_pred;
@@ -452,10 +450,10 @@ void send_voicemail() {
         led::flash(led::Color::Cyan, 150);
     } else {
         s_vm_outbox_pending = true;
-        // Distinct offline outbox stored sound: 680Hz (45ms) -> 480Hz (75ms)
-        audio::tone(680, 45, 380);
-        audio::tone(0, 25);
-        audio::tone(480, 75, 380);
+        // Offline / Outbox saved: Medium -> Low ("Out - box!")
+        audio::tone(550, 85, 380);
+        audio::tone(0, 35);
+        audio::tone(400, 130, 380);
         printf("[Voice Mail] Out of range (0 peers). Saved to outbox (%u frames, %.1fs). Will auto-send when a node is detected!\n",
                s_vm_storage->total_frames, s_vm_storage->total_frames * 0.04f);
     }
@@ -1014,10 +1012,10 @@ extern "C" void app_main() {
             if (has_peer) {
                 printf("\n[Voice Mail] Peer detected! Automatically sending outbox voice mail...\n");
                 flush_voicemail_to_mesh();
-                // Bright delivery confirmation: 1046Hz -> 1480Hz
-                audio::tone(1046, 35, 380);
-                audio::tone(0, 20);
-                audio::tone(1480, 50, 420);
+                // Delivery confirmation: Low -> High ("Sent out!")
+                audio::tone(400, 75, 380);
+                audio::tone(0, 30);
+                audio::tone(750, 120, 400);
             }
         }
 
