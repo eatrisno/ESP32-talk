@@ -445,6 +445,7 @@ void send_voicemail() {
 
 static uint32_t s_last_talk_click_ms = 0;
 static uint8_t  s_talk_click_count = 0;
+static constexpr uint32_t kMultiClickWindowMs = 650; // Comfortable, relaxed multi-click window (was 450ms)
 
 void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
@@ -465,7 +466,7 @@ void handle_press(wt::Press p, int which) {
                 send_voicemail();
                 return;
             }
-            if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= 450)) {
+            if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
                 s_talk_click_count++;
                 s_last_talk_click_ms = now;
                 if (s_talk_click_count >= 3) {
@@ -978,8 +979,8 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Handle pending click evaluation (450 ms after last click)
-        if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > 450)) {
+        // Handle pending click evaluation (kMultiClickWindowMs after last click)
+        if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
             uint8_t count = s_talk_click_count;
             s_talk_click_count = 0;
             if (count == 1) {
