@@ -1,5 +1,6 @@
 dependencies:
   idf: ">=5.4"
-  espressif/usb_host_uac: "1.5.0"
+  # usb_host_uac: patched copy in components/usb_host_uac (see PATCHES.md there)
+  espressif/cmake_utilities: "0.5.*"
   espressif/usb_host_hid: "1.2.1"
   espressif/led_strip: "3.1.1"

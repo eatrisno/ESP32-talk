@@ -69,6 +69,7 @@ StreamFormat choose_format(const AltFormat* alts, size_t n) {
         long score = rs * 100L + (a.channels - 1) * 10L + (a.subframe_bytes - 2);
         if (score < best_score) {
             best_score = score;
+            best.alt = a.alt;
             best.channels = a.channels;
             best.subframe_bytes = a.subframe_bytes;
             best.bits = a.bits;

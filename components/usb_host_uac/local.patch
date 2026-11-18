@@ -1,0 +1,326 @@
+--- a/uac_host.c	1980-01-01 00:00:00
++++ b/uac_host.c	2026-11-18 18:03:34
+@@ -25,6 +25,7 @@
+ #include "freertos/ringbuf.h"
+ #include "usb/usb_host.h"
+ #include "usb/uac_host.h"
++#include "uac_feedback.h"
+ #include "usb/usb_types_ch9.h"
+ 
+ // UAC spinlock
+@@ -146,6 +147,8 @@
+     uint8_t vol_ch_map;                        /*!< volume channel map */
+     uint8_t mute_ch_map;                       /*!< mute channel map */
+     bool freq_ctrl_supported;                  /*!< sampling frequency control supported */
++    uint8_t fb_ep_addr;                        /*!< asynchronous OUT: feedback IN endpoint (0 = none) */
++    uint16_t fb_ep_mps;                        /*!< feedback endpoint max packet size */
+     uac_host_dev_alt_param_t dev_alt_param;    /*!< audio stream alternate setting parameters */
+ } uac_iface_alt_t;
+ 
+@@ -173,6 +176,10 @@
+     uint32_t packet_frame_size;                /*!< bytes per audio frame (channels × subframe_size) */
+     uint32_t packet_size_frac;                 /*!< remainder in frames/second when dividing sample_rate by 1000, i.e. sample_rate % 1000 */
+     uint32_t packet_frac_accum;                /*!< running fractional frame accumulator (0..999) */
++    bool fb_active;                            /*!< asynchronous OUT with feedback endpoint in use */
++    bool fb_high_speed;                        /*!< feedback format: high speed (16.16) */
++    uac_fb_t fb;                               /*!< feedback rate state */
++    usb_transfer_t *fb_xfer;                   /*!< feedback IN transfer */
+     uac_host_device_event_cb_t user_cb;        /*!< Interface application callback */
+     void *user_cb_arg;                         /*!< Interface application callback arg */
+     RingbufHandle_t ringbuf;                   /*!< Ring buffer for audio data */
+@@ -829,6 +836,15 @@
+             }
+             case USB_B_DESCRIPTOR_TYPE_ENDPOINT: {
+                 ep_desc = (const usb_ep_desc_t *)cs_desc;
++                if (uac_fb_is_feedback_ep(iface_alt->ep_addr, ep_desc->bEndpointAddress, ep_desc->bmAttributes)) {
++                    // Feedback endpoint of an asynchronous OUT stream (UAC 1.0 puts it after the
++                    // data endpoint and its class descriptor).
++                    iface_alt->fb_ep_addr = ep_desc->bEndpointAddress;
++                    iface_alt->fb_ep_mps = ep_desc->wMaxPacketSize;
++                    ESP_LOGI(TAG, "UAC feedback endpoint 0x%02X, MPS %d", ep_desc->bEndpointAddress, ep_desc->wMaxPacketSize);
++                    parse_continue = false;
++                    break;
++                }
+                 iface_alt->ep_addr = ep_desc->bEndpointAddress;
+                 iface_alt->ep_mps = ep_desc->wMaxPacketSize;
+                 iface_alt->ep_attr = ep_desc->bmAttributes;
+@@ -873,12 +889,16 @@
+                 const uac_as_cs_ep_desc_t *cs_ep_desc = (const uac_as_cs_ep_desc_t *)cs_desc;
+                 if (cs_ep_desc->bDescriptorSubtype == UAC_EP_GENERAL) {
+                     iface_alt->freq_ctrl_supported = cs_ep_desc->bmAttributes & UAC_SAMPLING_FREQ_CONTROL;
+-                    parse_continue = false;
++                    // Asynchronous OUT: a feedback endpoint may follow, keep going.
++                    parse_continue = uac_fb_may_follow(iface_alt->ep_addr, iface_alt->ep_attr);
+                     ESP_LOGD(TAG, "UAC EP General, Attributes 0x%02X", cs_ep_desc->bmAttributes);
+                     ESP_LOGD(TAG, "UAC EP Frequency Control %d", iface_alt->freq_ctrl_supported);
+                 }
+                 break;
+             }
++            case USB_B_DESCRIPTOR_TYPE_INTERFACE:
++                parse_continue = false;  // next alternate setting: no feedback endpoint here
++                continue;
+             default:
+                 break;
+             }
+@@ -1135,6 +1155,12 @@
+         }
+         free(iface->xfer_list);
+     }
++    // ponytail: an in-flight feedback transfer is cancelled by the suspend/halt before we get here.
++    if (iface->fb_xfer) {
++        usb_host_transfer_free(iface->fb_xfer);
++        iface->fb_xfer = NULL;
++    }
++    iface->fb_active = false;
+ 
+     // Change state
+     iface->state = UAC_INTERFACE_STATE_IDLE;
+@@ -1164,6 +1190,10 @@
+         UAC_GOTO_ON_ERROR(usb_host_transfer_alloc(packet_size * iface->packet_num, iface->packet_num, &iface->free_xfer_list[i]),
+                           "Unable to allocate transfer buffer for EP IN");
+     }
++    if (iface->fb_active) {
++        uint16_t mps = iface->iface_alt[iface->cur_alt].fb_ep_mps ? iface->iface_alt[iface->cur_alt].fb_ep_mps : 4;
++        UAC_GOTO_ON_ERROR(usb_host_transfer_alloc(mps, 1, &iface->fb_xfer), "Unable to allocate feedback transfer");
++    }
+     // Change state
+     iface->state = UAC_INTERFACE_STATE_READY;
+     return ESP_OK;
+@@ -1248,6 +1278,16 @@
+ static uint32_t _uac_fill_tx_xfer_packets(uac_iface_t *iface, usb_transfer_t *xfer)
+ {
+     uint32_t total = 0;
++    if (iface->fb_active) {
++        // Asynchronous sink: the device told us its real consumption rate.
++        for (int j = 0; j < iface->packet_num; j++) {
++            uint32_t psize = uac_fb_next_packet(&iface->fb);
++            xfer->isoc_packet_desc[j].num_bytes = psize;
++            total += psize;
++        }
++        xfer->num_bytes = total;
++        return total;
++    }
+     for (int j = 0; j < iface->packet_num; j++) {
+         iface->packet_frac_accum += iface->packet_size_frac;
+         uint32_t psize = iface->packet_size;
+@@ -1273,6 +1313,8 @@
+ 
+     // Save accumulator state in case we cannot submit (not enough data in ring buffer).
+     uint32_t saved_accum = iface->packet_frac_accum;
++    uint64_t saved_fb_accum = iface->fb.accum_q32;
++    uint32_t saved_fb_rem = iface->fb.nominal_rem;
+     uint32_t urb_size = _uac_fill_tx_xfer_packets(iface, out_xfer);
+ 
+     size_t data_len = _ring_buffer_get_len(iface->ringbuf);
+@@ -1296,6 +1338,8 @@
+     } else {
+         // Not enough data — restore accumulator so next attempt is consistent.
+         iface->packet_frac_accum = saved_accum;
++        iface->fb.accum_q32 = saved_fb_accum;
++        iface->fb.nominal_rem = saved_fb_rem;
+         xSemaphoreGive(iface->ringbuf_mutex);
+         // add the transfer to free list
+         UAC_ENTER_CRITICAL();
+@@ -1359,6 +1403,26 @@
+     uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR);
+ }
+ 
++static void stream_fb_xfer_done(usb_transfer_t *fb_xfer)
++{
++    uac_iface_t *iface = fb_xfer->context;
++    assert(iface);
++    if (iface->state != UAC_INTERFACE_STATE_ACTIVE) {
++        return;  // stopping: do not resubmit
++    }
++    if (fb_xfer->status == USB_TRANSFER_STATUS_COMPLETED && fb_xfer->isoc_packet_desc[0].status == USB_TRANSFER_STATUS_COMPLETED) {
++        xSemaphoreTake(iface->ringbuf_mutex, portMAX_DELAY);  // packet sizing reads fb under this lock
++        uac_fb_update(&iface->fb, fb_xfer->data_buffer, fb_xfer->isoc_packet_desc[0].actual_num_bytes, iface->fb_high_speed);
++        xSemaphoreGive(iface->ringbuf_mutex);
++    }
++    if (fb_xfer->status == USB_TRANSFER_STATUS_NO_DEVICE || fb_xfer->status == USB_TRANSFER_STATUS_CANCELED) {
++        return;
++    }
++    // Any other status (an isochronous IN packet can be missed): poll again; the last good
++    // rate stays in use meanwhile.
++    usb_host_transfer_submit(fb_xfer);
++}
++
+ /**
+  * @brief Suspend active interface, the interface will be in READY state
+  *
+@@ -1392,6 +1456,12 @@
+     UAC_RETURN_ON_ERROR(usb_host_endpoint_halt(iface->parent->dev_hdl, ep_addr), "Unable to HALT EP");
+     UAC_RETURN_ON_ERROR(usb_host_endpoint_flush(iface->parent->dev_hdl, ep_addr), "Unable to FLUSH EP");
+     usb_host_endpoint_clear(iface->parent->dev_hdl, ep_addr);
++    if (iface->fb_active) {
++        uint8_t fb_ep = iface->iface_alt[iface->cur_alt].fb_ep_addr;
++        usb_host_endpoint_halt(iface->parent->dev_hdl, fb_ep);
++        usb_host_endpoint_flush(iface->parent->dev_hdl, fb_ep);
++        usb_host_endpoint_clear(iface->parent->dev_hdl, fb_ep);
++    }
+     _ring_buffer_flush(iface->ringbuf);
+ 
+     // add all the transfer to free list
+@@ -1462,6 +1532,18 @@
+         assert(!(iface->iface_alt[iface->cur_alt].ep_addr & USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK));
+         // Reset accumulator so suspend/resume does not shift the fractional packet pattern.
+         iface->packet_frac_accum = 0;
++        if (iface->fb_active) {
++            uac_fb_init(&iface->fb, iface->iface_alt[iface->cur_alt].cur_sampling_freq, iface->packet_frame_size,
++                        iface->iface_alt[iface->cur_alt].ep_mps);
++            usb_transfer_t *f = iface->fb_xfer;
++            f->device_handle = iface->parent->dev_hdl;
++            f->callback = stream_fb_xfer_done;
++            f->context = iface;
++            f->timeout_ms = DEFAULT_ISOC_XFER_TIMEOUT_MS;
++            f->bEndpointAddress = iface->iface_alt[iface->cur_alt].fb_ep_addr;
++            f->num_bytes = f->data_buffer_size;
++            f->isoc_packet_desc[0].num_bytes = f->data_buffer_size;
++        }
+         // for TX, we submit the first transfer with data 0 to make the speaker quiet
+         for (int i = 0; i < iface->xfer_num; i++) {
+             assert(iface->free_xfer_list[i]);
+@@ -1479,6 +1561,14 @@
+ 
+     // for TX, we check if data is available in the ringbuffer, if yes, we submit the transfer
+     iface->state = UAC_INTERFACE_STATE_ACTIVE;
++    if (iface->dev_info.type == UAC_STREAM_TX && iface->fb_active) {
++        if (usb_host_transfer_submit(iface->fb_xfer) != ESP_OK) {
++            ESP_LOGW(TAG, "Feedback endpoint submit failed, using nominal rate");
++        } else {
++            ESP_LOGI(TAG, "Asynchronous speaker: following device rate feedback on EP 0x%02X",
++                     iface->iface_alt[iface->cur_alt].fb_ep_addr);
++        }
++    }
+ 
+     return ESP_OK;
+ }
+@@ -2363,26 +2453,37 @@
+ 
+     // check if any alt setting meets the channels, sample frequency and bit resolution requirements
+     // if not exist, return error. If exist, claim the interface and prepare transfer
++    // Local patch: match the subframe size too, honour an explicit alt index, and take the
++    // FIRST match (upstream took the last one for discrete rates and ignored the subframe size,
++    // so 24-bit-in-3-bytes and 24-bit-in-4-bytes could not be told apart).
+     iface->cur_alt = UINT8_MAX;
+-    for (int i = 0; i < iface->dev_info.iface_alt_num; i++) {
+-        if (iface->iface_alt[i].dev_alt_param.channels == stream_config->channels &&
+-                iface->iface_alt[i].dev_alt_param.bit_resolution == stream_config->bit_resolution) {
+-            // check if the sample frequency is in the list or in the range
+-            if (iface->iface_alt[i].dev_alt_param.sample_freq_type > 0) {
+-                for (int j = 0; j < iface->iface_alt[i].dev_alt_param.sample_freq_type; j++) {
+-                    if (iface->iface_alt[i].dev_alt_param.sample_freq[j] == stream_config->sample_freq) {
+-                        iface->cur_alt = i;
+-                        iface->iface_alt[i].cur_sampling_freq = stream_config->sample_freq;
+-                        break;
+-                    }
+-                }
+-            } else if (iface->iface_alt[i].dev_alt_param.sample_freq_lower <= stream_config->sample_freq &&
+-                       iface->iface_alt[i].dev_alt_param.sample_freq_upper >= stream_config->sample_freq) {
+-                iface->cur_alt = i;
+-                iface->iface_alt[i].cur_sampling_freq = stream_config->sample_freq;
+-                break;
++    {
++        uac_alt_desc_t alts[16];
++        int n = iface->dev_info.iface_alt_num < 16 ? iface->dev_info.iface_alt_num : 16;
++        for (int i = 0; i < n; i++) {
++            const uac_host_dev_alt_param_t *p = &iface->iface_alt[i].dev_alt_param;
++            uac_alt_desc_t *a = &alts[i];
++            memset(a, 0, sizeof(*a));
++            a->alt_idx = iface->iface_alt[i].alt_idx;
++            a->channels = p->channels;
++            a->bit_resolution = p->bit_resolution;
++            a->subframe_size = p->subframe_size;
++            a->freq_type = p->sample_freq_type;
++            if (p->sample_freq_type == 0) {
++                a->freq_lower = p->sample_freq_lower;
++                a->freq_upper = p->sample_freq_upper;
++            } else {
++                for (int j = 0; j < p->sample_freq_type && j < UAC_FREQ_NUM_MAX && j < 8; j++) {
++                    a->freqs[j] = p->sample_freq[j];
++                }
+             }
+         }
++        int pick = uac_alt_pick(alts, n, stream_config->channels, stream_config->bit_resolution,
++                                stream_config->subframe_size, stream_config->sample_freq, stream_config->alt_idx);
++        if (pick >= 0) {
++            iface->cur_alt = (uint8_t)pick;
++            iface->iface_alt[pick].cur_sampling_freq = stream_config->sample_freq;
++        }
+     }
+ 
+     UAC_GOTO_ON_FALSE(iface->cur_alt != UINT8_MAX, ESP_ERR_NOT_FOUND, "No suitable alt setting found");
+@@ -2406,6 +2507,11 @@
+     }
+     UAC_GOTO_ON_FALSE((iface->packet_size + (iface->packet_size_frac ? frame_size : 0)) <= iface->iface_alt[iface->cur_alt].ep_mps,
+                       ESP_ERR_INVALID_SIZE, "Calculated packet size exceeds endpoint max packet size");
++    iface->fb_active = iface->dev_info.type == UAC_STREAM_TX && iface->iface_alt[iface->cur_alt].fb_ep_addr != 0;
++    {
++        usb_device_info_t di;
++        iface->fb_high_speed = usb_host_device_info(iface->parent->dev_hdl, &di) == ESP_OK && di.speed == USB_SPEED_HIGH;
++    }
+ 
+     // Claim Interface and prepare transfer
+     UAC_GOTO_ON_ERROR(uac_host_interface_claim_and_prepare_transfer(iface), "Unable to claim Interface");
+@@ -2469,6 +2575,21 @@
+ fail:
+     uac_host_interface_unlock(iface);
+     return ret;
++}
++
++bool uac_host_device_feedback(uac_host_device_handle_t uac_dev_handle, uint32_t *rate_mhz, uint32_t *accepted)
++{
++    uac_iface_t *iface = get_iface_by_handle(uac_dev_handle);
++    if (!iface || !iface->fb_active) {
++        return false;
++    }
++    if (rate_mhz) {
++        *rate_mhz = (uint32_t)(((uint64_t)iface->fb.rate_q16 * 1000000u) >> 16);  // samples per second x 1000
++    }
++    if (accepted) {
++        *accepted = iface->fb.accepted;
++    }
++    return true;
+ }
+ 
+ esp_err_t uac_host_device_stop(uac_host_device_handle_t uac_dev_handle)
+--- a/include/usb/uac_host.h	1980-01-01 00:00:00
++++ b/include/usb/uac_host.h	2026-11-18 18:01:06
+@@ -173,6 +173,8 @@
+     uint8_t bit_resolution;                              /*!< Audio bit resolution */
+     uint32_t sample_freq;                                /*!< Audio sample frequency in Hz. */
+     uint16_t flags;                                      /*!< Control flags */
++    uint8_t subframe_size;                               /*!< Bytes per sample container (2/3/4); 0 = any. Local patch */
++    uint8_t alt_idx;                                     /*!< bAlternateSetting to use (1-based); 0 = search. Local patch */
+ } uac_host_stream_config_t;
+ 
+ // ----------------------------- Public ---------------------------------------
+@@ -378,6 +380,15 @@
+ esp_err_t uac_host_device_stop(uac_host_device_handle_t uac_dev_handle);
+ 
+ /**
++ * @brief Asynchronous speaker rate feedback (local patch, see b/PATCHES.md).
++ *
++ * @param[out] rate_mhz  Device consumption rate in milli-Hz (e.g. 48000123 = 48000.123 Hz), may be NULL
++ * @param[out] accepted  Number of feedback values used so far, may be NULL
++ * @return true if this stream is asynchronous and the feedback endpoint is in use
++ */
++bool uac_host_device_feedback(uac_host_device_handle_t uac_dev_handle, uint32_t *rate_mhz, uint32_t *accepted);
++
++/**
+  * @brief Read data from the UAC stream buffer.
+  *
+  * This function is available only after the stream has started.
+--- a/CMakeLists.txt	1980-01-01 00:00:00
++++ b/CMakeLists.txt	2026-11-18 18:00:50
+@@ -7,8 +7,9 @@
+     list(APPEND requires usb)
+ endif()
+ 
+-idf_component_register(SRCS "uac_descriptors.c" "uac_host.c"
++idf_component_register(SRCS "uac_descriptors.c" "uac_host.c" "uac_feedback.c"
+                        INCLUDE_DIRS "include"
++                       PRIV_INCLUDE_DIRS "."
+                        PRIV_REQUIRES esp_ringbuf
+                        REQUIRES "${requires}"
+                        )

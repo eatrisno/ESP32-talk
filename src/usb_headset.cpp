@@ -107,6 +107,7 @@ void open_uac(const Msg& m) {
         if (uac_host_get_device_alt_param(h, alt, &p) != ESP_OK) continue;
         if (p.format != UAC_TYPE_I_PCM) continue;  // only plain PCM (wFormatTag 1)
         wt::AltFormat& a = alts[n++];
+        a.alt = alt;
         a.channels = p.channels;
         a.subframe_bytes = p.subframe_size;
         a.bits = p.bit_resolution;
@@ -131,16 +132,6 @@ void open_uac(const Msg& m) {
         ESP_LOGE(TAG, "%s: no usable format (need PCM, 1-2 ch, 16/24/32-bit)", m.tx ? "speaker" : "mic");
         return;
     }
-    // The driver starts the LAST alt with matching channels and bit resolution and ignores the
-    // subframe size. If another PCM alt has the same channels+bits but a different subframe
-    // size (e.g. 24-bit in 3 and in 4 bytes), we cannot tell which one it would stream: refuse
-    // rather than play noise.
-    for (size_t i = 0; i < n; i++)
-        if (alts[i].channels == f.channels && alts[i].bits == f.bits && alts[i].subframe_bytes != f.subframe_bytes) {
-            ESP_LOGE(TAG, "%s: ambiguous %u-bit formats (%u and %u byte), not supported", m.tx ? "speaker" : "mic",
-                     f.bits, f.subframe_bytes, alts[i].subframe_bytes);
-            return;
-        }
     // Speaker: 100 ms. It is also the playback clock (the speaker task blocks on it), so it
     // bounds the output latency. Mic: 100 ms, read every 10 ms.
     uint32_t bytes_per_ms = f.rate / 1000 * static_cast<uint32_t>(f.frame_bytes()) + f.frame_bytes();
@@ -154,6 +145,8 @@ void open_uac(const Msg& m) {
     sc.channels = f.channels;
     sc.bit_resolution = f.bits;
     sc.sample_freq = f.rate;
+    sc.subframe_size = f.subframe_bytes;  // exact alt: the patched driver matches all of these
+    sc.alt_idx = f.alt;
     if (uac_host_device_start(h, &sc) != ESP_OK) {
         ESP_LOGE(TAG, "%s start failed at %lu Hz", m.tx ? "speaker" : "mic", (unsigned long)f.rate);
         uac_host_device_close(h);
@@ -170,6 +163,8 @@ void open_uac(const Msg& m) {
     s.ready = true;
     ESP_LOGI(TAG, "%s %04x:%04x started: %lu Hz, %u ch, %u-bit", m.tx ? "speaker" : "mic", info.VID,
              info.PID, (unsigned long)f.rate, f.channels, f.bits);
+    if (m.tx && uac_host_device_feedback(h, nullptr, nullptr))
+        ESP_LOGI(TAG, "speaker is asynchronous: packet sizes follow its rate feedback");
     if (m.tx && s_on_state) s_on_state(true);  // once per headset, when it can play the chime
 }
 
@@ -184,6 +179,8 @@ void restart_uac(uac_host_device_handle_t h) {
         sc.channels = s->fmt.channels;
         sc.bit_resolution = s->fmt.bits;
         sc.sample_freq = s->fmt.rate;
+        sc.subframe_size = s->fmt.subframe_bytes;
+        sc.alt_idx = s->fmt.alt;
         if (uac_host_device_start(h, &sc) == ESP_OK) {
             s->ready = true;
             ESP_LOGW(TAG, "%s transfer error, stream restarted", s == &s_spk ? "speaker" : "mic");
@@ -358,6 +355,10 @@ void print_info() {
     };
     line("mic", s_mic);
     line("speaker", s_spk);
+    uint32_t mhz = 0, n = 0;
+    if (s_spk.ready && uac_host_device_feedback(s_spk.h, &mhz, &n))
+        printf("  speaker clock %lu.%03lu Hz (async, %lu feedback updates)\n", (unsigned long)(mhz / 1000),
+               (unsigned long)(mhz % 1000), (unsigned long)n);
     printf("  buttons %s\n", has_buttons() ? "yes (USB HID)" : "none found");
 }
 

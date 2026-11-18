@@ -17,7 +17,7 @@ reached through the others (mesh relay, up to 2 hops).
 |---|---|
 | Conference | Every node on the same channel and key hears every talker. Up to 4 voices are mixed at once. |
 | Mesh | Each node rebroadcasts new packets once (ttl 3). A node skips its relay if a neighbour already sent it. |
-| Headset | Any USB Audio Class 1.0 headset. It picks the best format the headset offers (48/44.1/32/16 kHz…, mono or stereo, 16/24/32-bit). |
+| Headset | Any USB Audio Class 1.0 headset. It picks the best format the headset offers (48/44.1/32/16 kHz…, mono or stereo, 16/24/32-bit, any container size) and starts exactly that alternate setting. Asynchronous headsets (own DAC clock) are fed at the rate they report, so they do not drift or click. |
 | Headset buttons | Play/Pause and Mute on the headset act the same as the BOOT button. A latching Hook / Phone-mute control toggles the mic on every change. Vol+ and Vol- change volume. |
 | Voice | 8 kHz, IMA-ADPCM (32 kbit/s), 40 ms frames. Mic has a DC filter, automatic gain (adapts only on speech, so hiss between words is not pumped up) and a voice gate that learns the room noise, so silence is not sent. Talkers are summed in float and soft-limited once, so several loud voices compress instead of clipping. |
 | Losses | Each frame carries its own decoder state, so a lost packet costs 40 ms and does not corrupt the frames after it. |
@@ -93,7 +93,7 @@ reboot    restart                    anything else prints this list
 ## Testing
 
 ```bash
-pio test -e native     # 46 host tests, no hardware
+pio test -e native     # 55 host tests (46 core + 9 driver), no hardware
 ```
 
 The host tests run the same code as the firmware. A 1 kHz tone goes from the mic rate through 8 kHz, ADPCM,
@@ -104,7 +104,9 @@ gap, a slow sender losing no frames, latency draining back after a stall, click-
 replay window (including after a peer was pruned or evicted, and with more than 8 nodes), the 3-node relay
 path, HID descriptors from four headset layouts with buttons across report ids, button debounce and long
 press, the voice gate (sustained sound, boot hiss, fan noise), AGC not pumping hiss, and mixing two loud
-talkers. Each of these was checked to fail on the code before its fix. The tests also pass under
+talkers. The driver tests cover rate feedback from a fast and a slow DAC over 10 minutes, bad feedback
+values, both feedback formats, packet size limits, feedback endpoint detection, and picking the right
+alternate setting for 24-bit in 3 vs 4 bytes. Each of these was checked to fail on the code before its fix. The tests also pass under
 AddressSanitizer and UBSan.
 
 Not covered by any test: the ESP-IDF layer in `src/` (USB host, ESP-NOW, tasks, LED) is only checked by the
@@ -114,7 +116,8 @@ compiler. On a device:
    silence, and a 1 kHz tone through the software voice path at the headset's rates comes out above 18 dB
    SNR. It does not prove the sound is clean in your ear: step 2 does.
 2. `loop`, then speak: you hear yourself about 0.2 s later. This checks mic and speaker by ear.
-3. Two nodes in one room: talk both ways, `s` on each shows the other as `direct`.
+3. Two nodes in one room: talk both ways, `s` on each shows the other as `direct`. With an asynchronous
+   headset, `s` also shows `speaker clock 48000.xxx Hz (async, N feedback updates)` and N keeps rising.
 4. Three nodes, A and C out of range of each other: `s` on A shows C as `relay`, and A and C hear each other.
 
 If a headset fails, the boot log lists every format it offers (`usb: mic alt 1: ...`). Include that log in a
@@ -133,12 +136,14 @@ lib/wt_core/src/   hardware-free core, built for both the ESP32 and the host tes
   hid_buttons   HID report descriptor parser
   button        debounce, click, long press
   voice_gate    voice detection, pipeline self-test
+components/usb_host_uac/  Espressif UAC host driver 1.5.0 + local patches (PATCHES.md)
 src/               ESP-IDF firmware
   usb_headset   USB host: UAC mic + speaker, HID buttons
   audio         mic task, speaker task, mixer
   radio         ESP-NOW, AES-CCM, relay
   led, config, main (buttons, beacons, console)
-test/test_core/    host tests
+test/test_core/    host tests for the core
+test/test_uac/     host tests for the driver patches (rate feedback, alt selection)
 ```
 
 ## Protocol (v3)
@@ -158,10 +163,8 @@ value cannot be stored, so a nonce is not reused. Not compatible with firmware 2
   work but the status list only shows 8.
 * A sender silent for over 10 minutes is forgotten: one old frame of it could then be replayed once.
 * Two nodes whose MACs share the last 4 bytes collide (one ignores the other). Rare; not detected.
-* Headsets that list one bit depth in two container sizes (24-bit in 3 and in 4 bytes) are refused: the
-  driver cannot be told which one to stream.
-* No USB feedback endpoint support: an asynchronous headset whose DAC clock differs from the USB clock may
-  click faintly every few minutes.
+* The USB audio driver is a patched copy of Espressif's `usb_host_uac` 1.5.0 in `components/usb_host_uac`
+  (rate feedback, exact alternate setting). See `PATCHES.md` there before updating it.
 * No OTA update yet (the partition table keeps a second slot for it). Flash over USB.
 * UAC 2.0-only headsets are not supported (the ESP-IDF UAC host driver is UAC 1.0). Most USB-C headsets
   are UAC 1.0.

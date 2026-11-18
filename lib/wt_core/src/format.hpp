@@ -14,9 +14,11 @@ struct AltFormat {
     uint8_t  freq_count = 0;       // 0 = continuous range [freq_min, freq_max]
     uint32_t freqs[8] = {};
     uint32_t freq_min = 0, freq_max = 0;
+    uint8_t  alt = 0;              // bAlternateSetting this came from (passed back to the driver)
 };
 
 struct StreamFormat {
+    uint8_t  alt = 0;              // bAlternateSetting to start (0 = unknown)
     uint8_t  channels = 0;
     uint8_t  subframe_bytes = 0;
     uint8_t  bits = 0;
