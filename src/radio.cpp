@@ -135,10 +135,13 @@ void handle_raw(Raw& r) {
     rx.rssi = r.rssi;
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
     bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms());
+    int num_peers = s_peers.count();
     xSemaphoreGive(s_peers_mtx);
     if (!accepted) return;
     s_stats.rx++;
-    if (h.ttl > 1) {
+    // Only relay if there are other nodes that need it (peer_count > 1).
+    // In a direct 2-node pair, echoing packets back to the sender causes self-collision.
+    if (h.ttl > 1 && num_peers > 1) {
         r.data[3] = h.ttl - 1;
         // 2..12 ms random hold-off; weaker receivers relay sooner because they are more
         // likely at the edge of the group, where relays matter.
@@ -241,7 +244,12 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_500K : WIFI_PHY_RATE_6M;
     esp_now_set_peer_rate_config(kBroadcast, &rc);
     set_channel(ch);
-    ESP_LOGI(TAG, "node %08lx session %lu ch %u", (unsigned long)s_self, (unsigned long)session, ch);
+    int8_t pwr = 0;
+    esp_wifi_get_max_tx_power(&pwr);
+    ESP_LOGI(TAG, "node %08lx session %lu ch %u (phy %s, tx %d = %.2f dBm)",
+             (unsigned long)s_self, (unsigned long)session, ch,
+             cfg::kLongRange ? "ESP-NOW LR 500k (-105 dBm)" : "11g 6M (-90 dBm)",
+             pwr, pwr * 0.25f);
     if (cfg::kDefaultKey)
         ESP_LOGW(TAG, "using the PUBLIC default network key: anyone can listen. See README.");
     return true;

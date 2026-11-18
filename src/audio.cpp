@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "adpcm.hpp"
+#include "config.hpp"
 #include "dsp.hpp"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -109,7 +110,7 @@ void mic_task(void*) {
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
             agc.process(frame, wt::kFrameSamples, gate.speech_now());
             if (!active) continue;
-            if (!voice && !s_loopback) {
+            if (!cfg::kContinuousStream && !voice && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
                     was_sending = false;
@@ -196,7 +197,8 @@ void spk_task(void*) {
         float g = wt::volume_gain(s_volume);
         for (size_t i = 0; i < wt::kFrameSamples; i++) mix[i] = wt::clip16(wt::soft_limit(bus[i] * g));
         if (any) s_stats.frames_played++;
-        s_tones.render(mix, wt::kFrameSamples);  // beeps are not scaled: audible at volume 0
+        float tone_vol = 0.3f + 0.7f * g;  // scales with volume, but stays softly audible
+        s_tones.render(mix, wt::kFrameSamples, tone_vol);
         xSemaphoreGive(s_mtx);
         s_receiving = talkers > 0;
         s_stats.talkers = talkers;
@@ -240,9 +242,9 @@ bool loopback() { return s_loopback; }
 void set_volume(uint8_t p) { s_volume = p > 100 ? 100 : p; }
 uint8_t volume() { return s_volume; }
 
-void tone(uint16_t freq, uint16_t ms) {
+void tone(uint16_t freq, uint16_t ms, uint16_t amp) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    s_tones.push(freq, ms);
+    s_tones.push(freq, ms, amp);
     xSemaphoreGive(s_mtx);
 }
 

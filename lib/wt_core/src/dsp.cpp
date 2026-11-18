@@ -114,25 +114,33 @@ void mix_into(float* dst, const int16_t* src, size_t n) {
     for (size_t i = 0; i < n; i++) dst[i] += static_cast<float>(src[i]);
 }
 
-void ToneQueue::push(uint16_t freq, uint16_t ms) {
+void ToneQueue::push(uint16_t freq, uint16_t ms, uint16_t amp) {
     int next = (tail_ + 1) % kCap;
     if (next == head_ || ms == 0) return;
-    q_[tail_] = {freq, ms};
+    q_[tail_] = {freq, ms, amp};
     tail_ = next;
 }
 
-bool ToneQueue::render(int16_t* out, size_t n) {
+bool ToneQueue::render(int16_t* out, size_t n, float vol_scale) {
     bool any = false;
     size_t i = 0;
     while (i < n && head_ != tail_) {
         const Seg& s = q_[head_];
         uint32_t total = static_cast<uint32_t>(s.ms) * kVoiceRate / 1000;
         uint32_t ramp = kVoiceRate / 200;  // 5 ms fade in/out, no clicks
+        if (ramp * 2 > total) ramp = total / 2;
+        float base_amp = (s.amp > 0 ? static_cast<float>(s.amp) : 9000.f) * vol_scale;
         for (; i < n && pos_ < total; i++, pos_++) {
             if (s.freq == 0) continue;
-            float amp = 9000.f;
-            if (pos_ < ramp) amp *= static_cast<float>(pos_) / ramp;
-            if (total - pos_ < ramp) amp *= static_cast<float>(total - pos_) / ramp;
+            float amp = base_amp;
+            if (ramp > 0 && pos_ < ramp) {
+                float x = static_cast<float>(pos_) / ramp;
+                amp *= 0.5f * (1.f - cosf(static_cast<float>(M_PI) * x));
+            }
+            if (ramp > 0 && total - pos_ < ramp) {
+                float x = static_cast<float>(total - pos_) / ramp;
+                amp *= 0.5f * (1.f - cosf(static_cast<float>(M_PI) * x));
+            }
             phase_ += 2.f * static_cast<float>(M_PI) * s.freq / kVoiceRate;
             if (phase_ > 2.f * static_cast<float>(M_PI)) phase_ -= 2.f * static_cast<float>(M_PI);
             int32_t v = out[i] + static_cast<int32_t>(sinf(phase_) * amp);
