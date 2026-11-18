@@ -118,16 +118,25 @@ void update_led() {
         led::set(s_red_on ? Color::Red : Color::Off);
         return;
     }
-    if (audio::loopback()) led::set(Color::White);
-    else if (audio::sending()) {
-        // While speaking / transmitting RF: blinking red (low duty cycle ~35%) to conserve power
-        uint32_t phase = now_ms() % 250;
-        led::set(phase < 90 ? Color::Red : Color::Off);
+
+    static bool s_was_sending = false;
+    static bool s_was_receiving = false;
+    bool sending = audio::sending();
+    bool receiving = audio::receiving();
+
+    // Subtle edge confirmation flashes: 1 short flash at start, then OFF
+    if (sending && !s_was_sending) {
+        led::flash(Color::Red, 70);    // 1 quick red blip when you start transmitting
     }
-    else if (audio::receiving()) led::set(Color::Green);
-    else if (audio::talking()) led::set(Color::Amber);  // mic open in talk mode, waiting for speech
+    if (receiving && !s_was_receiving) {
+        led::flash(Color::Green, 70);  // 1 quick green blip when incoming voice begins
+    }
+    s_was_sending = sending;
+    s_was_receiving = receiving;
+
+    if (audio::loopback()) led::set(Color::White);
     else if (!usb_headset::spk_ready()) led::set(Color::Blue);
-    else led::set(Color::Off);
+    else led::set(Color::Off);  // silent & dark while speaking and listening
 }
 
 void send_distress_packet(bool active) {
