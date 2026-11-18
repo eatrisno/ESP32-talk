@@ -43,6 +43,7 @@ RxHandler s_on_rx;
 uint32_t s_self, s_session, s_seq;
 uint8_t s_channel;
 Stats s_stats;
+portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;  // Wi-Fi task + radio task both count
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -54,12 +55,20 @@ void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     r.len = static_cast<uint8_t>(len);
     r.rssi = info->rx_ctrl ? static_cast<int8_t>(info->rx_ctrl->rssi) : 0;
     memcpy(r.data, data, len);
-    if (xQueueSend(s_rxq, &r, 0) != pdTRUE) s_stats.rx_drop++;  // queue full: shed load
+    if (xQueueSend(s_rxq, &r, 0) != pdTRUE) {  // queue full: shed load
+        portENTER_CRITICAL(&s_stats_mux);
+        s_stats.rx_drop++;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
     xTaskNotifyGive(s_task);
 }
 
 void on_sent(const esp_now_send_info_t*, esp_now_send_status_t st) {
-    if (st != ESP_NOW_SEND_SUCCESS) s_stats.tx_fail++;
+    if (st != ESP_NOW_SEND_SUCCESS) {
+        portENTER_CRITICAL(&s_stats_mux);
+        s_stats.tx_fail++;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
 }
 
 bool seal(const wt::Header& h, const uint8_t* plain, size_t len, uint8_t* out, size_t* out_len) {
@@ -91,18 +100,26 @@ void transmit(const uint8_t* frame, size_t len) {
         vTaskDelay(1);
         e = esp_now_send(kBroadcast, frame, len);
     }
+    portENTER_CRITICAL(&s_stats_mux);
     if (e == ESP_OK) s_stats.tx++;
     else s_stats.tx_fail++;
+    portEXIT_CRITICAL(&s_stats_mux);
 }
 
 void handle_raw(Raw& r) {
     wt::Header h;
     if (!wt::read_header(r.data, r.len, h)) return;
     if (h.sender == s_self) return;                      // our own frame, relayed back
+    // ttl is outside the authenticated data (relays decrement it). Clamp it so an attacker
+    // rebroadcasting a real frame with ttl 255 cannot carry it past the designed 2 relays.
+    if (h.ttl > wt::kDefaultTtl) {
+        h.ttl = wt::kDefaultTtl;
+        r.data[3] = wt::kDefaultTtl;
+    }
     // A neighbour already relayed this one: our pending copy is redundant.
     s_relay.cancel(r.data, r.len);
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-    bool fresh = s_peers.fresh(h);
+    bool fresh = s_peers.fresh(h, now_ms());
     xSemaphoreGive(s_peers_mtx);
     if (!fresh) {
         s_stats.dup++;
@@ -114,7 +131,7 @@ void handle_raw(Raw& r) {
         return;
     }
     rx.hdr = h;
-    rx.hops = h.ttl <= wt::kDefaultTtl ? static_cast<uint8_t>(wt::kDefaultTtl - h.ttl) : 0;
+    rx.hops = static_cast<uint8_t>(wt::kDefaultTtl - h.ttl);
     rx.rssi = r.rssi;
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
     bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms());
@@ -198,6 +215,8 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     s_rxq = xQueueCreate(24, sizeof(Raw));
     s_txq = xQueueCreate(8, sizeof(Tx));
     s_peers_mtx = xSemaphoreCreateMutex();
+    // The task must exist before on_recv can be called: it notifies s_task.
+    xTaskCreatePinnedToCore(task, "radio", 6144, nullptr, 7, &s_task, 0);
 
     wifi_init_config_t wc = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wc));
@@ -222,7 +241,6 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_500K : WIFI_PHY_RATE_6M;
     esp_now_set_peer_rate_config(kBroadcast, &rc);
     set_channel(ch);
-    xTaskCreatePinnedToCore(task, "radio", 6144, nullptr, 7, &s_task, 0);
     ESP_LOGI(TAG, "node %08lx session %lu ch %u", (unsigned long)s_self, (unsigned long)session, ch);
     if (cfg::kDefaultKey)
         ESP_LOGW(TAG, "using the PUBLIC default network key: anyone can listen. See README.");
@@ -253,6 +271,11 @@ bool send(wt::MsgType type, const uint8_t* plain, size_t len) {
 wt::PeerTable& peers() { return s_peers; }
 void peers_lock() { xSemaphoreTake(s_peers_mtx, portMAX_DELAY); }
 void peers_unlock() { xSemaphoreGive(s_peers_mtx); }
-Stats stats() { return s_stats; }
+Stats stats() {
+    portENTER_CRITICAL(&s_stats_mux);
+    Stats s = s_stats;
+    portEXIT_CRITICAL(&s_stats_mux);
+    return s;
+}
 
 }  // namespace radio

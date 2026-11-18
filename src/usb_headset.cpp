@@ -22,6 +22,7 @@ struct Stream {
     uac_host_device_handle_t h = nullptr;
     wt::StreamFormat fmt;
     volatile bool ready = false;
+    volatile bool error = false;   // transfer error: worker restarts the stream
     uint16_t vid = 0, pid = 0;
 };
 Stream s_mic, s_spk;
@@ -29,7 +30,7 @@ Stream s_mic, s_spk;
 struct HidIf {
     hid_host_device_handle_t h = nullptr;
     wt::HidButtons parser;
-    uint8_t down = 0;
+    uint8_t down = 0;          // merged over all report ids of this interface
 };
 constexpr int kMaxHid = 3;
 HidIf s_hid[kMaxHid];
@@ -37,7 +38,7 @@ HidIf s_hid[kMaxHid];
 ButtonCb s_on_buttons;
 StateCb s_on_state;
 
-enum class Ev : uint8_t { UacConnected, UacDisconnected, HidConnected };
+enum class Ev : uint8_t { UacConnected, UacDisconnected, UacError, HidConnected };
 struct Msg {
     Ev ev;
     uint8_t addr, iface;
@@ -56,16 +57,23 @@ void usb_lib_task(void*) {
 
 // --- UAC -------------------------------------------------------------------------------
 
+void post(const Msg& m) {
+    // Driver-task context. The worker can be busy for a few seconds (control transfers), so
+    // wait for room rather than drop: a lost disconnect would leave a dead handle forever.
+    if (xQueueSend(s_q, &m, pdMS_TO_TICKS(2000)) != pdTRUE) ESP_LOGE(TAG, "event queue stuck, event lost");
+}
+
 void uac_dev_cb(uac_host_device_handle_t h, const uac_host_device_event_t ev, void*) {
-    if (ev == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
-        Msg m{Ev::UacDisconnected, 0, 0, false, h};
-        xQueueSend(s_q, &m, 0);
+    if (ev == UAC_HOST_DRIVER_EVENT_DISCONNECTED || ev == UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR) {
+        // Stop the audio tasks using it right now, before the worker gets to the message.
+        for (Stream* s : {&s_mic, &s_spk})
+            if (s->h == h) s->ready = false;
+        post(Msg{ev == UAC_HOST_DRIVER_EVENT_DISCONNECTED ? Ev::UacDisconnected : Ev::UacError, 0, 0, false, h});
     }
 }
 
 void uac_drv_cb(uint8_t addr, uint8_t iface, const uac_host_driver_event_t ev, void*) {
-    Msg m{Ev::UacConnected, addr, iface, ev == UAC_HOST_DRIVER_EVENT_TX_CONNECTED, nullptr};
-    xQueueSend(s_q, &m, 0);
+    post(Msg{Ev::UacConnected, addr, iface, ev == UAC_HOST_DRIVER_EVENT_TX_CONNECTED, nullptr});
 }
 
 uac_host_device_handle_t open_dev(const Msg& m, uint32_t buffer_size) {
@@ -97,6 +105,7 @@ void open_uac(const Msg& m) {
     for (uint8_t alt = 1; alt <= info.iface_alt_num && n < 8; alt++) {
         uac_host_dev_alt_param_t p;
         if (uac_host_get_device_alt_param(h, alt, &p) != ESP_OK) continue;
+        if (p.format != UAC_TYPE_I_PCM) continue;  // only plain PCM (wFormatTag 1)
         wt::AltFormat& a = alts[n++];
         a.channels = p.channels;
         a.subframe_bytes = p.subframe_size;
@@ -122,6 +131,16 @@ void open_uac(const Msg& m) {
         ESP_LOGE(TAG, "%s: no usable format (need PCM, 1-2 ch, 16/24/32-bit)", m.tx ? "speaker" : "mic");
         return;
     }
+    // The driver starts the LAST alt with matching channels and bit resolution and ignores the
+    // subframe size. If another PCM alt has the same channels+bits but a different subframe
+    // size (e.g. 24-bit in 3 and in 4 bytes), we cannot tell which one it would stream: refuse
+    // rather than play noise.
+    for (size_t i = 0; i < n; i++)
+        if (alts[i].channels == f.channels && alts[i].bits == f.bits && alts[i].subframe_bytes != f.subframe_bytes) {
+            ESP_LOGE(TAG, "%s: ambiguous %u-bit formats (%u and %u byte), not supported", m.tx ? "speaker" : "mic",
+                     f.bits, f.subframe_bytes, alts[i].subframe_bytes);
+            return;
+        }
     // Speaker: 100 ms. It is also the playback clock (the speaker task blocks on it), so it
     // bounds the output latency. Mic: 100 ms, read every 10 ms.
     uint32_t bytes_per_ms = f.rate / 1000 * static_cast<uint32_t>(f.frame_bytes()) + f.frame_bytes();
@@ -154,6 +173,26 @@ void open_uac(const Msg& m) {
     if (m.tx && s_on_state) s_on_state(true);  // once per headset, when it can play the chime
 }
 
+void restart_uac(uac_host_device_handle_t h) {
+    // A failed isochronous transfer is not resubmitted by the driver: the stream would stay
+    // silent until replug. Stop and start it again with the same format.
+    for (Stream* s : {&s_mic, &s_spk}) {
+        if (s->h != h) continue;
+        vTaskDelay(pdMS_TO_TICKS(100));  // let the audio task leave the driver
+        uac_host_device_stop(h);
+        uac_host_stream_config_t sc = {};
+        sc.channels = s->fmt.channels;
+        sc.bit_resolution = s->fmt.bits;
+        sc.sample_freq = s->fmt.rate;
+        if (uac_host_device_start(h, &sc) == ESP_OK) {
+            s->ready = true;
+            ESP_LOGW(TAG, "%s transfer error, stream restarted", s == &s_spk ? "speaker" : "mic");
+        } else {
+            ESP_LOGE(TAG, "%s transfer error, restart failed: replug the headset", s == &s_spk ? "speaker" : "mic");
+        }
+    }
+}
+
 void close_uac(uac_host_device_handle_t h) {
     for (Stream* s : {&s_mic, &s_spk}) {
         if (s->h != h) continue;
@@ -169,24 +208,47 @@ void close_uac(uac_host_device_handle_t h) {
 
 // --- HID -------------------------------------------------------------------------------
 
+void report_buttons() {
+    uint8_t all = 0;
+    for (auto& x : s_hid)
+        if (x.h) all |= x.down;
+    static uint8_t last = 0;
+    if (all != last) {
+        last = all;
+        if (s_on_buttons) s_on_buttons(all);
+    }
+}
+
 void hid_if_cb(hid_host_device_handle_t h, const hid_host_interface_event_t ev, void*) {
     HidIf* d = nullptr;
     for (auto& x : s_hid)
         if (x.h == h) d = &x;
-    if (!d) return;
+    if (!d) {
+        // An interface we opened only to read its descriptor and then closed: the driver
+        // asks for the second close here.
+        if (ev == HID_HOST_INTERFACE_EVENT_DISCONNECTED) hid_host_device_close(h);
+        return;
+    }
     if (ev == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
         uint8_t r[64];
         size_t len = 0;
         if (hid_host_device_get_raw_input_report_data(h, r, sizeof r, &len) != ESP_OK) return;
-        uint8_t down = d->parser.decode(r, len);
-        if (down != d->down) {
-            d->down = down;
-            if (s_on_buttons) s_on_buttons(down);
-        }
+        uint8_t mask = 0;
+        uint8_t now = d->parser.decode(r, len, &mask);
+        // A report only says something about the buttons it carries: keep the others.
+        d->down = static_cast<uint8_t>((d->down & ~mask) | now);
+        report_buttons();
+    } else if (ev == HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR) {
+        // Not resubmitted by the driver: restart polling, release anything held.
+        d->down = 0;
+        report_buttons();
+        hid_host_device_stop(h);
+        hid_host_device_start(h);
     } else if (ev == HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
         hid_host_device_close(h);
-        if (d->down && s_on_buttons) s_on_buttons(0);
-        *d = HidIf();
+        d->h = nullptr;
+        d->down = 0;
+        report_buttons();
     }
 }
 
@@ -227,6 +289,7 @@ void worker(void*) {
         switch (m.ev) {
             case Ev::UacConnected: open_uac(m); break;
             case Ev::UacDisconnected: close_uac(static_cast<uac_host_device_handle_t>(m.handle)); break;
+            case Ev::UacError: restart_uac(static_cast<uac_host_device_handle_t>(m.handle)); break;
             case Ev::HidConnected: open_hid(static_cast<hid_host_device_handle_t>(m.handle)); break;
         }
     }
@@ -237,7 +300,7 @@ void worker(void*) {
 void start(ButtonCb on_buttons, StateCb on_state) {
     s_on_buttons = on_buttons;
     s_on_state = on_state;
-    s_q = xQueueCreate(8, sizeof(Msg));
+    s_q = xQueueCreate(16, sizeof(Msg));
     usb_host_config_t hc = {};
     hc.skip_phy_setup = false;
     hc.intr_flags = ESP_INTR_FLAG_LOWMED;

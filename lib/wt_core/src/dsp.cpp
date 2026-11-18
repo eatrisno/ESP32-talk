@@ -85,15 +85,15 @@ float soft_limit(float y) {
     return y < 0 ? -l : l;
 }
 
-void Agc::process(int16_t* x, size_t n) {
+void Agc::process(int16_t* x, size_t n, bool speech) {
     const float kTarget = 0.25f * 32768.f;   // -12 dBFS speech peaks
-    const float kGate = 0.004f * 32768.f;    // about -48 dBFS: below this, hold the gain
+    const float kAbsGate = 0.004f * 32768.f; // about -48 dBFS: never adapt below this
     const float kMax = 8.0f, kMin = 1.0f;
     for (size_t i = 0; i < n; i++) {
         float v = static_cast<float>(x[i]);
         float a = fabsf(v);
         env_ = a > env_ ? a : env_ * 0.9995f;  // instant attack, ~250 ms release at 8 kHz
-        if (env_ > kGate) {
+        if (speech && env_ > kAbsGate) {
             float want = kTarget / env_;
             if (want > kMax) want = kMax;
             if (want < kMin) want = kMin;
@@ -110,11 +110,8 @@ float volume_gain(uint8_t percent) {
     return p * p;
 }
 
-void mix_into(int16_t* dst, const int16_t* src, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        int32_t s = static_cast<int32_t>(dst[i]) + src[i];
-        dst[i] = static_cast<int16_t>(s > 32767 ? 32767 : (s < -32768 ? -32768 : s));
-    }
+void mix_into(float* dst, const int16_t* src, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] += static_cast<float>(src[i]);
 }
 
 void ToneQueue::push(uint16_t freq, uint16_t ms) {

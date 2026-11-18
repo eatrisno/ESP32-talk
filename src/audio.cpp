@@ -50,6 +50,9 @@ void mic_task(void*) {
     wt::DcBlocker dc;
     wt::Agc agc;
     wt::VoiceGate gate;
+    wt::StereoPick pick;
+    int16_t peak_acc = 0;
+    int peak_blocks = 0;
     wt::AdpcmState enc;
     uint32_t cur_rate = 0;
     uint8_t voice_id = static_cast<uint8_t>(esp_random());
@@ -58,32 +61,54 @@ void mic_task(void*) {
     for (;;) {
         if (!usb_headset::mic_ready()) {
             cur_rate = 0;
+            if (was_sending) {  // headset gone mid-sentence
+                was_sending = false;
+                s_sending = false;
+                voice_id++;
+                enc = wt::AdpcmState();
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         wt::StreamFormat f = usb_headset::mic_format();
-        if (f.rate != cur_rate) {
+        if (f.rate != cur_rate) {  // new headset (or first one): fresh state for its stream
             rs.init(f.rate, wt::kVoiceRate);
             cur_rate = f.rate;
             fill = 0;
+            pick = wt::StereoPick();
+            gate = wt::VoiceGate();
+            dc = wt::DcBlocker();
         }
         // About 10 ms per read, whole frames only.
         size_t want = f.frame_bytes() * (f.rate / 100);
         if (want > sizeof raw) want = sizeof raw - sizeof raw % f.frame_bytes();
         size_t got = usb_headset::mic_read(raw, want, 50);
-        if (!got) continue;
+        if (!got) {
+            vTaskDelay(pdMS_TO_TICKS(5));  // read can fail at once (stream stopping): never spin
+            continue;
+        }
         s_stats.mic_bytes += got;
-        size_t n = wt::pcm_to_mono(raw, got, f, mono, 1024);
+        size_t n = wt::pcm_to_mono(raw, got, f, mono, 1024, &pick);
+        for (size_t i = 0; i < n; i++) {
+            int16_t a = mono[i] < 0 ? static_cast<int16_t>(mono[i] == -32768 ? 32767 : -mono[i]) : mono[i];
+            if (a > peak_acc) peak_acc = a;
+        }
+        if (++peak_blocks >= 100) {  // ~1 s
+            s_stats.mic_peak = peak_acc;
+            peak_acc = 0;
+            peak_blocks = 0;
+        }
         size_t m = rs.process(mono, n, v8, 512);
         bool active = s_talking || s_loopback;
         for (size_t i = 0; i < m; i++) {
             frame[fill++] = v8[i];
             if (fill < wt::kFrameSamples) continue;
             fill = 0;
-            if (!active) continue;
             for (auto& s : frame) s = wt::clip16(dc.run(s));
-            agc.process(frame, wt::kFrameSamples);
-            bool voice = gate.update(frame, wt::kFrameSamples);
+            // Gate first, on the frame before gain, so a gain change never opens or closes it.
+            bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
+            agc.process(frame, wt::kFrameSamples, gate.speech_now());
+            if (!active) continue;
             if (!voice && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
@@ -128,6 +153,7 @@ void mic_task(void*) {
 // --- radio -> speaker ------------------------------------------------------------------
 
 void spk_task(void*) {
+    static float bus[wt::kFrameSamples];
     static int16_t mix[wt::kFrameSamples], one[wt::kFrameSamples];
     static int16_t up[wt::kFrameSamples * 13];
     static uint8_t raw[wt::kFrameSamples * 13 * 8];
@@ -144,7 +170,7 @@ void spk_task(void*) {
             rs.init(wt::kVoiceRate, f.rate);
             cur_rate = f.rate;
         }
-        memset(mix, 0, sizeof mix);
+        for (auto& b : bus) b = 0.f;
         bool any = false;
         int talkers = 0;
         uint32_t now = now_ms();
@@ -152,7 +178,7 @@ void spk_task(void*) {
         for (auto& t : s_talkers) {
             if (!t.used) continue;
             if (t.jb.pop(one)) {
-                wt::mix_into(mix, one, wt::kFrameSamples);
+                wt::mix_into(bus, one, wt::kFrameSamples);
                 any = true;
                 talkers++;
             } else if (!t.jb.active() && now - t.last_ms > 2000) {
@@ -162,14 +188,14 @@ void spk_task(void*) {
             }
         }
         if (s_loopback && s_loop.pop(one)) {
-            wt::mix_into(mix, one, wt::kFrameSamples);
+            wt::mix_into(bus, one, wt::kFrameSamples);
             any = true;
         }
+        // Sum in float, then volume, then one soft limiter: several loud talkers compress
+        // smoothly instead of clipping.
         float g = wt::volume_gain(s_volume);
-        if (any) {
-            for (auto& s : mix) s = wt::clip16(wt::soft_limit(s * g));
-            s_stats.frames_played++;
-        }
+        for (size_t i = 0; i < wt::kFrameSamples; i++) mix[i] = wt::clip16(wt::soft_limit(bus[i] * g));
+        if (any) s_stats.frames_played++;
         s_tones.render(mix, wt::kFrameSamples);  // beeps are not scaled: audible at volume 0
         xSemaphoreGive(s_mtx);
         s_receiving = talkers > 0;
@@ -178,8 +204,10 @@ void spk_task(void*) {
         // and avoids the pop some headsets make when the stream restarts.
         size_t n = rs.process(mix, wt::kFrameSamples, up, sizeof up / 2);
         size_t bytes = wt::mono_to_pcm(up, n, f, raw, sizeof raw);
-        // Blocks until the 100 ms speaker buffer has room: the headset's own clock paces
-        // playback, so latency stays bounded and there is no drift against the CPU tick.
+        // Blocks until the 100 ms speaker buffer has room, so the USB frame clock (1 kHz SOF
+        // from the ESP32) paces playback and latency stays bounded. ponytail: no feedback
+        // endpoint support in the driver, so an asynchronous headset whose DAC clock differs
+        // from USB timing will slip a sample now and then (a faint click every few minutes).
         if (!usb_headset::spk_write(raw, bytes, 80)) {
             s_stats.spk_underrun++;
             vTaskDelay(pdMS_TO_TICKS(10));

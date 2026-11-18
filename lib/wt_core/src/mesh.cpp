@@ -26,15 +26,57 @@ Peer* PeerTable::slot_for(uint32_t id, uint32_t now_ms) {
     return oldest;
 }
 
-bool PeerTable::fresh(const Header& h) const {
-    for (const auto& p : peers_)
-        if (p.used && p.id == h.sender) return p.replay.fresh(h.session, h.seq);
+bool SessionMemory::newer(uint32_t sender, uint32_t session, uint32_t seq, uint32_t now_ms) const {
+    for (const auto& x : e_) {
+        if (!x.used || x.id != sender) continue;
+        if (now_ms - x.last_ms > kForgetMs) return true;
+        return session > x.session || (session == x.session && seq > x.seq);
+    }
     return true;
 }
 
+void SessionMemory::put(uint32_t sender, uint32_t session, uint32_t seq, uint32_t now_ms) {
+    E* slot = nullptr;
+    for (auto& x : e_)
+        if (x.used && x.id == sender) { slot = &x; break; }
+    if (!slot)
+        for (auto& x : e_)
+            if (!x.used) { slot = &x; break; }
+    if (!slot) {  // full: forget the sender heard from longest ago
+        slot = &e_[0];
+        for (auto& x : e_)
+            if (now_ms - x.last_ms > now_ms - slot->last_ms) slot = &x;
+    }
+    bool fresh_slot = !slot->used || slot->id != sender || now_ms - slot->last_ms > kForgetMs;
+    if (fresh_slot || session > slot->session || (session == slot->session && seq > slot->seq)) {
+        slot->session = session;
+        slot->seq = seq;
+    }
+    slot->id = sender;
+    slot->used = true;
+    slot->last_ms = now_ms;
+}
+
+bool PeerTable::fresh(const Header& h, uint32_t now_ms) const {
+    for (const auto& p : peers_)
+        if (p.used && p.id == h.sender) return p.replay.fresh(h.session, h.seq);
+    // Not in the table (pruned or evicted): without its 64-frame window, accept only frames
+    // newer than the newest one remembered. Relayed copies of older frames are dropped.
+    return sessions_.newer(h.sender, h.session, h.seq, now_ms);
+}
+
 bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms) {
-    Peer* p = slot_for(h.sender, now_ms);
-    if (!p->replay.accept(h.session, h.seq)) return false;
+    if (!fresh(h, now_ms)) return false;
+    Peer* p = find(h.sender);
+    if (!p) {
+        p = slot_for(h.sender, now_ms);
+        // New slot: seed the window from memory so frames at or below the remembered seq
+        // stay rejected.
+        p->replay.accept(h.session, h.seq);
+    } else if (!p->replay.accept(h.session, h.seq)) {
+        return false;
+    }
+    sessions_.put(h.sender, h.session, h.seq, now_ms);
     p->last_ms = now_ms;
     p->hops = hops;
     if (hops == 0) p->rssi = rssi;

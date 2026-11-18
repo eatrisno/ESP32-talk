@@ -11,6 +11,7 @@ enum HidButton : uint8_t {
     HID_BTN_TALK = 1 << 0,      // Play/Pause, Play, Hook switch, Mic mute
     HID_BTN_VOL_UP = 1 << 1,
     HID_BTN_VOL_DOWN = 1 << 2,
+    HID_BTN_TALK_TOGGLE = 1 << 3,   // Telephony hook switch / phone mute: latching, any change = click
 };
 
 class HidButtons {
@@ -18,8 +19,10 @@ public:
     // Returns false if the descriptor has no button this device can use.
     bool parse(const uint8_t* desc, size_t len);
     // Buttons currently held according to this report (report id byte included when
-    // the descriptor uses report ids).
-    uint8_t decode(const uint8_t* report, size_t len) const;
+    // the descriptor uses report ids). If mask is given, it is set to the buttons this
+    // report id can carry, so the caller can keep the state of the others:
+    //   down = (down & ~mask) | decode(...)
+    uint8_t decode(const uint8_t* report, size_t len, uint8_t* mask = nullptr) const;
     bool uses_report_ids() const { return uses_ids_; }
     int field_count() const { return n_; }
 

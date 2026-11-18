@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hid_buttons.hpp"
 #include "led.hpp"
@@ -31,6 +32,8 @@ const char* TAG = "app";
 
 char s_name[12] = "";
 nvs_handle_t s_nvs;
+// Guards s_name, s_ping_* and the talk toggle: app task, console task and radio task use them.
+SemaphoreHandle_t s_app_mtx;
 volatile uint8_t s_hid_down = 0;
 uint32_t s_ping_token = 0, s_ping_ms = 0;
 
@@ -48,12 +51,17 @@ void nvs_put_u8(const char* k, uint8_t v) {
     nvs_commit(s_nvs);
 }
 
+// The session is half of the CCM nonce (sender|session|seq), so it must never repeat under
+// the same key. A boot counter alone repeats after a flash erase or NVS reset, so the first
+// value after such a reset is random in [2^30, 2^31): another erase picks a new random start,
+// and a collision with any earlier session is about 1 in 10^9 per erase. Returns 0 if the new
+// value could not be stored; the radio must then stay off, or the next boot would reuse it.
 uint32_t next_session() {
     uint32_t s = 0;
-    nvs_get_u32(s_nvs, "session", &s);
+    if (nvs_get_u32(s_nvs, "session", &s) != ESP_OK || s == 0)
+        s = (1u << 30) + (esp_random() & ((1u << 30) - 1));
     s++;
-    nvs_set_u32(s_nvs, "session", s);
-    nvs_commit(s_nvs);  // must hit flash before the first packet: it is the nonce prefix
+    if (nvs_set_u32(s_nvs, "session", s) != ESP_OK || nvs_commit(s_nvs) != ESP_OK) return 0;
     return s;
 }
 
@@ -77,25 +85,37 @@ void update_led() {
 
 // --- actions ---------------------------------------------------------------------------
 
-void broadcast_state() {
-    uint8_t p[1 + sizeof s_name];
+// Name + talking flag, as sent in BEACON / JOIN / LEAVE. Caller holds s_app_mtx.
+void state_payload(uint8_t* p) {
     p[0] = audio::talking();
     memcpy(p + 1, s_name, sizeof s_name);
-    radio::send(audio::talking() ? wt::MSG_JOIN : wt::MSG_LEAVE, p, sizeof p);
+}
+
+void broadcast_state() {
+    uint8_t p[1 + sizeof s_name];
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    state_payload(p);
+    xSemaphoreGive(s_app_mtx);
+    radio::send(p[0] ? wt::MSG_JOIN : wt::MSG_LEAVE, p, sizeof p);
 }
 
 void toggle_talk() {
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);  // button and console can press at once
     bool on = !audio::talking();
     audio::set_talking(on);
+    xSemaphoreGive(s_app_mtx);
     on ? chime_join() : chime_leave();
     broadcast_state();
     ESP_LOGI(TAG, "mic %s", on ? "OPEN" : "muted");
 }
 
 void send_ping() {
-    s_ping_token = static_cast<uint32_t>(esp_timer_get_time());
+    uint32_t tok = static_cast<uint32_t>(esp_timer_get_time());
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    s_ping_token = tok;
     s_ping_ms = now_ms();
-    radio::send(wt::MSG_PING, reinterpret_cast<uint8_t*>(&s_ping_token), 4);
+    xSemaphoreGive(s_app_mtx);
+    radio::send(wt::MSG_PING, reinterpret_cast<uint8_t*>(&tok), 4);
     audio::tone(1800, 30);
     printf("ping sent\n");
 }
@@ -154,12 +174,20 @@ void on_rx(const radio::Rx& rx) {
             uint32_t tok;
             if (rx.len < 4) break;
             memcpy(&tok, rx.plain, 4);
-            if (tok != s_ping_token) break;
+            xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+            bool mine = tok == s_ping_token;
+            uint32_t sent_ms = s_ping_ms;
+            xSemaphoreGive(s_app_mtx);
+            if (!mine) break;
+            char name[sizeof s_name] = "?";
             radio::peers_lock();
-            wt::Peer* p = radio::peers().find(id);
-            printf("pong %-11s %3lu ms  %s  rssi %d\n", p && p->name[0] ? p->name : "?",
-                   (unsigned long)(now_ms() - s_ping_ms), rx.hops ? "via relay" : "direct", rx.rssi);
+            if (const wt::Peer* p = radio::peers().find(id))
+                if (p->name[0]) memcpy(name, p->name, sizeof name);
             radio::peers_unlock();
+            // ponytail: printf from the radio task blocks it ~5 ms per line at 115200 baud;
+            // fine for a ping reply. Move to a log queue if pings get frequent.
+            printf("pong %-11s %3lu ms  %s  rssi %d\n", name, (unsigned long)(now_ms() - sent_ms),
+                   rx.hops ? "via relay" : "direct", rx.rssi);
             break;
         }
     }
@@ -170,20 +198,35 @@ void on_rx(const radio::Rx& rx) {
 void print_status() {
     radio::Stats r = radio::stats();
     audio::Stats a = audio::stats();
-    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s%s\n", s_name, (unsigned long)radio::self_id(),
+    char name[sizeof s_name];
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    memcpy(name, s_name, sizeof name);
+    xSemaphoreGive(s_app_mtx);
+    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s%s\n", name, (unsigned long)radio::self_id(),
            radio::channel(), audio::volume(), audio::talking() ? "OPEN" : "muted",
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
     printf("  peers:\n");
-    radio::peers_lock();
+    struct Row { uint32_t id, age; char name[12]; int8_t rssi; bool relay, talking; };
+    Row rows[wt::kMaxPeers];
+    int nrows = 0;
+    radio::peers_lock();  // copy only: printing here would stall the radio task
     uint32_t now = now_ms();
     for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
         if (!p->used) continue;
-        printf("    %-11s %08lx  %s  rssi %4d  seen %lus ago%s\n", p->name[0] ? p->name : "?",
-               (unsigned long)p->id, p->hops ? "relay " : "direct", p->rssi,
-               (unsigned long)((now - p->last_ms) / 1000), p->talking ? "  talking" : "");
+        Row& r = rows[nrows++];
+        r.id = p->id;
+        r.age = (now - p->last_ms) / 1000;
+        memcpy(r.name, p->name, sizeof r.name);
+        r.rssi = p->rssi;
+        r.relay = p->hops != 0;
+        r.talking = p->talking;
     }
     radio::peers_unlock();
+    for (int i = 0; i < nrows; i++)
+        printf("    %-11s %08lx  %s  rssi %4d  seen %lus ago%s\n", rows[i].name[0] ? rows[i].name : "?",
+               (unsigned long)rows[i].id, rows[i].relay ? "relay " : "direct", rows[i].rssi,
+               (unsigned long)rows[i].age, rows[i].talking ? "  talking" : "");
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
            (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
@@ -208,16 +251,21 @@ void selftest() {
     uint32_t expect = m.valid() ? m.rate * m.frame_bytes() / 2 : 1;
     check(m.valid() && got > expect * 8 / 10 && got < expect * 12 / 10,
           "mic delivers samples at its nominal rate (+/-20%)");
+    vTaskDelay(pdMS_TO_TICKS(1100));  // one full peak window
+    int16_t pk = audio::stats().mic_peak;
+    char pl[80];
+    snprintf(pl, sizeof pl, "mic is live, not digital silence (peak %d of 32767)", pk);
+    check(pk > 8, pl);
     if (m.valid() && s.valid()) {
         float snr = wt::pipeline_selftest(m.rate, s.rate);
         char line[80];
         snprintf(line, sizeof line, "1 kHz tone through the voice path at %lu->%lu Hz: %.1f dB SNR",
                  (unsigned long)m.rate, (unsigned long)s.rate, snr);
-        check(snr > 18.f, line);
+        check(snr > 18.f, line);  // software path only: codec, jitter buffer, resamplers
     }
     check(radio::stats().tx_fail == 0 || radio::stats().tx > radio::stats().tx_fail * 20,
           "radio send failures under 5%");
-    printf("%s. Then: 'loop' and speak, you should hear yourself ~150 ms later.\n",
+    printf("%s. Then: 'loop' and speak, you should hear yourself about 0.2 s later.\n",
            ok ? "ALL PASS" : "FAILED");
 }
 
@@ -242,7 +290,7 @@ void console_task(void*) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        if (c == '\r') continue;
+        if (c == '\r') continue;  // stdin maps CR to LF already; kept for other consoles
         if (c != '\n') {
             if (n < sizeof line - 1) line[n++] = static_cast<char>(c);
             continue;
@@ -266,12 +314,14 @@ void console_task(void*) {
                 printf("channel %d\n", ch);
             } else printf("channel must be 1..13\n");
         } else if (!strncmp(line, "name ", 5) && line[5]) {
+            xSemaphoreTake(s_app_mtx, portMAX_DELAY);
             strncpy(s_name, line + 5, sizeof s_name - 1);
             s_name[sizeof s_name - 1] = 0;
             nvs_set_str(s_nvs, "name", s_name);
             nvs_commit(s_nvs);
+            xSemaphoreGive(s_app_mtx);
             broadcast_state();
-            printf("name %s\n", s_name);
+            printf("name %.11s\n", line + 5);
         } else if (line[0]) help();
     }
 }
@@ -306,6 +356,7 @@ extern "C" void app_main() {
         nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
+    s_app_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -319,7 +370,13 @@ extern "C" void app_main() {
     led::set(led::Color::Blue);
     for (gpio_num_t p : {cfg::kPinBoot, cfg::kPinTalk, cfg::kPinVolUp, cfg::kPinVolDown}) init_gpio(p);
 
-    if (!radio::start(ch, next_session(), on_rx)) {
+    uint32_t session = next_session();
+    if (!session) {
+        led::set(led::Color::Red);
+        ESP_LOGE(TAG, "cannot store the session counter in NVS, radio stays off (erase flash and reflash)");
+        vTaskDelay(portMAX_DELAY);
+    }
+    if (!radio::start(ch, session, on_rx)) {
         led::set(led::Color::Red);
         ESP_LOGE(TAG, "radio failed, halting");
         vTaskDelay(portMAX_DELAY);
@@ -330,10 +387,16 @@ extern "C" void app_main() {
     printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
 
     wt::ButtonDetector talk, up, down;
+    uint8_t last_toggle = 0;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
         uint8_t hid = s_hid_down;
+        uint8_t tog = hid & wt::HID_BTN_TALK_TOGGLE;
+        if (tog != last_toggle) {  // latching hook/mute control: every change is one click
+            last_toggle = tog;
+            handle_press(wt::Press::Click, 0);
+        }
         handle_press(talk.update(low(cfg::kPinBoot) || low(cfg::kPinTalk) ||
                                      (hid & wt::HID_BTN_TALK), now), 0);
         handle_press(up.update(low(cfg::kPinVolUp) || (hid & wt::HID_BTN_VOL_UP), now), 1);
@@ -353,8 +416,9 @@ extern "C" void app_main() {
         if (now - last_beacon >= cfg::kBeaconMs) {
             last_beacon = now;
             uint8_t p[1 + sizeof s_name];
-            p[0] = audio::talking();
-            memcpy(p + 1, s_name, sizeof s_name);
+            xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+            state_payload(p);
+            xSemaphoreGive(s_app_mtx);
             radio::send(wt::MSG_BEACON, p, sizeof p);
             radio::peers_lock();
             radio::peers().prune(now);

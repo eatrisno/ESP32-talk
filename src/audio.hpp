@@ -36,6 +36,7 @@ struct Stats {
     uint32_t frames_sent, frames_gated, frames_played, lost, late, mic_bytes,
              spk_underrun;  // speaker writes that timed out (stream stalled)
     float agc_gain, noise_floor;
+    int16_t mic_peak;   // largest raw mic sample in the last second (0 = digital silence)
     int talkers;
 };
 Stats stats();

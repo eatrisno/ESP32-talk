@@ -30,10 +30,19 @@ struct StreamFormat {
 // alias the least). Fewer channels and 16-bit win ties. Returns invalid if nothing usable.
 StreamFormat choose_format(const AltFormat* alts, size_t n);
 
-// Raw interleaved little-endian PCM to mono int16. Stereo is averaged; if one channel is
-// silent over the whole block (single-sided mic), the live channel is used at full level.
+// Stereo mic channel choice. Many headsets put the mic on one channel and leave the other
+// near-silent; averaging would cost 6 dB. The choice changes only after a channel has
+// been clearly dead or clearly alive for ~0.5 s, so the level never flutters.
+struct StereoPick {
+    int mode = 2;          // 0 = left only, 1 = right only, 2 = average
+    int votes = 0;         // consecutive blocks agreeing with `pending`
+    int pending = 2;
+};
+
+// Raw interleaved little-endian PCM to mono int16. Pass the same StereoPick for every
+// block of one stream (nullptr = always average).
 size_t pcm_to_mono(const uint8_t* raw, size_t bytes, const StreamFormat& f, int16_t* out,
-                   size_t out_max);
+                   size_t out_max, StereoPick* pick = nullptr);
 
 // Mono int16 to raw interleaved PCM (same sample on every channel).
 size_t mono_to_pcm(const int16_t* in, size_t n, const StreamFormat& f, uint8_t* raw,

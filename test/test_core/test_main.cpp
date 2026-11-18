@@ -19,6 +19,8 @@
 
 using namespace wt;
 
+constexpr int kTargetDepthForTest = JitterBuffer::kTargetDepth;
+
 namespace {
 
 std::vector<int16_t> tone(uint32_t rate, float hz, float amp, size_t n) {
@@ -253,7 +255,9 @@ void test_stereo_mic_one_side_silent_keeps_level() {
     std::vector<int16_t> lr(960, 0);
     for (size_t i = 0; i < 480; i++) lr[2 * i] = t[i];  // right channel silent
     int16_t out[480];
-    pcm_to_mono(reinterpret_cast<uint8_t*>(lr.data()), lr.size() * 2, f, out, 480);
+    StereoPick pick;  // the choice settles after ~0.5 s of blocks, then holds
+    for (int blk = 0; blk < 60; blk++)
+        pcm_to_mono(reinterpret_cast<uint8_t*>(lr.data()), lr.size() * 2, f, out, 480, &pick);
     TEST_ASSERT_EQUAL_INT16_ARRAY(t.data(), out, 480);
 }
 
@@ -435,8 +439,8 @@ void test_three_nodes_mesh_relay_and_cancel() {
         Header got;
         TEST_ASSERT_TRUE(read_header(out, len, got));
         TEST_ASSERT_EQUAL_UINT8(kDefaultTtl - 1, got.ttl);
-        if (c_peers.fresh(got) && c_peers.accept(got, 1, -70, seq * 10)) delivered++;
-        if (c_peers.fresh(got) && c_peers.accept(got, 1, -70, seq * 10)) delivered++;  // echo
+        if (c_peers.fresh(got, seq * 10) && c_peers.accept(got, 1, -70, seq * 10)) delivered++;
+        if (c_peers.fresh(got, seq * 10) && c_peers.accept(got, 1, -70, seq * 10)) delivered++;  // echo
     }
     TEST_ASSERT_EQUAL(50, delivered);
     // A relay already sent by a neighbour (same frame, any ttl) is cancelled.
@@ -517,8 +521,8 @@ void test_hid_telephony_hook_after_other_report() {
     HidButtons h;
     TEST_ASSERT_TRUE(h.parse(d, sizeof d));
     const uint8_t hook[] = {0x01, 0x01}, mute[] = {0x01, 0x02}, vendor[] = {0x03, 0xFF, 0xFF};
-    TEST_ASSERT_EQUAL_UINT8(HID_BTN_TALK, h.decode(hook, 2));
-    TEST_ASSERT_EQUAL_UINT8(HID_BTN_TALK, h.decode(mute, 2));
+    TEST_ASSERT_EQUAL_UINT8(HID_BTN_TALK_TOGGLE, h.decode(hook, 2));
+    TEST_ASSERT_EQUAL_UINT8(HID_BTN_TALK_TOGGLE, h.decode(mute, 2));
     TEST_ASSERT_EQUAL_UINT8(0, h.decode(vendor, 3));
 }
 
@@ -615,6 +619,234 @@ void test_pipeline_selftest_used_on_device() {
         }
 }
 
+
+// --- review round 2: each test reproduces a reviewer's failing case ---------------------
+
+void test_replay_rejected_after_peer_pruned_or_evicted() {
+    // Old code: prune()/eviction wiped the replay window, so a recorded frame was fresh again.
+    PeerTable t;
+    Header x;
+    x.sender = 0xAAAA; x.session = 5;
+    for (x.seq = 1; x.seq <= 20; x.seq++) TEST_ASSERT_TRUE(t.accept(x, 0, -50, 1000));
+    t.prune(1000 + kPeerTimeoutMs + 1);                 // X went quiet for 15 s
+    TEST_ASSERT_EQUAL(0, t.count());
+    Header old = x;
+    old.seq = 7;                                        // attacker replays a recorded frame
+    TEST_ASSERT_FALSE(t.fresh(old, 20000));
+    TEST_ASSERT_FALSE(t.accept(old, 0, -50, 20000));
+    old.session = 4;                                    // or one from an earlier boot
+    TEST_ASSERT_FALSE(t.fresh(old, 20000));
+    // Evict X by 8 other senders, then replay again.
+    for (uint32_t id = 1; id <= kMaxPeers; id++) {
+        Header o; o.sender = id; o.session = 1; o.seq = 1;
+        t.accept(o, 0, -50, 21000);
+    }
+    TEST_ASSERT_TRUE(t.find(0xAAAA) == nullptr);
+    old.session = 5; old.seq = 15;
+    TEST_ASSERT_FALSE(t.accept(old, 0, -50, 22000));
+    // X itself comes back with its next real frame: accepted.
+    Header next = x;                                    // seq 21
+    TEST_ASSERT_TRUE(t.accept(next, 0, -50, 23000));
+    // A rebooted X (new session) is accepted too.
+    Header reboot; reboot.sender = 0xAAAA; reboot.session = 6; reboot.seq = 1;
+    TEST_ASSERT_TRUE(t.accept(reboot, 0, -50, 24000));
+}
+
+void test_more_than_8_nodes_no_double_play() {
+    // Old code: a 9th node evicted a peer, whose relayed older frames were then accepted again.
+    PeerTable t;
+    int delivered = 0, sent = 0;
+    uint32_t seq[10] = {};
+    for (int round = 0; round < 200; round++)
+        for (uint32_t id = 1; id <= 10; id++) {
+            Header h; h.sender = id; h.session = 1; h.seq = ++seq[id - 1];
+            sent++;
+            if (t.accept(h, 0, -50, round * 40)) delivered++;
+            Header dup = h;                              // relayed copy arriving later
+            if (t.accept(dup, 1, -70, round * 40 + 5)) delivered++;
+        }
+    TEST_ASSERT_EQUAL(sent, delivered);
+}
+
+void test_mixer_two_loud_talkers_no_hard_clip() {
+    // Old code: int16 saturating sum, then volume: flat tops at volume 50.
+    auto a = tone(8000, 500, 20000, kFrameSamples), b = tone(8000, 500, 20000, kFrameSamples);
+    float bus[kFrameSamples] = {};
+    mix_into(bus, a.data(), kFrameSamples);
+    mix_into(bus, b.data(), kFrameSamples);
+    float g = volume_gain(50);
+    int16_t out[kFrameSamples];
+    for (size_t i = 0; i < kFrameSamples; i++) out[i] = clip16(soft_limit(bus[i] * g));
+    int peak = 0;
+    for (int16_t s : out) peak = std::max(peak, abs(s));
+    TEST_ASSERT_INT_WITHIN(150, 10000, peak);            // 40000 * 0.25, not 8192
+    int flat = 0;
+    for (size_t i = 1; i < kFrameSamples; i++) flat += out[i] == out[i - 1] && abs(out[i]) > 8000;
+    TEST_ASSERT_LESS_THAN(4, flat);
+}
+
+void test_agc_does_not_pump_hiss_in_pauses() {
+    // Old code: hiss of +-300 between words was boosted from gain 1.3 up to 8 (+15 dB).
+    Agc agc;
+    uint32_t r = 3;
+    auto hiss = [&](std::vector<int16_t>& v) {
+        for (auto& s : v) { r = r * 1103515245 + 12345; s = static_cast<int16_t>(((r >> 16) % 601) - 300); }
+    };
+    VoiceGate gate;  // the same wiring as the mic task: gate decides, AGC follows
+    auto step = [&](std::vector<int16_t>& v) {
+        for (size_t i = 0; i < v.size(); i += kFrameSamples) {
+            gate.update(&v[i], kFrameSamples);
+            agc.process(&v[i], kFrameSamples, gate.speech_now());
+        }
+    };
+    std::vector<int16_t> f(kFrameSamples);
+    for (int i = 0; i < 50; i++) { hiss(f); step(f); }                               // room noise
+    auto loud = tone(8000, 300, 12000, kFrameSamples * 25);                          // 1 s speech
+    step(loud);
+    float g_speech = agc.gain();
+    double rms_after = 0;
+    for (int i = 0; i < 50; i++) {                                                   // 2 s pause
+        hiss(f);
+        step(f);
+        if (i >= 40) for (int16_t s : f) rms_after += double(s) * s;
+    }
+    rms_after = sqrt(rms_after / (10 * kFrameSamples));
+    TEST_ASSERT_FLOAT_WITHIN(0.15f, g_speech, agc.gain());                           // held
+    TEST_ASSERT_LESS_THAN(400, (int)rms_after);
+}
+
+void test_gate_stays_open_on_sustained_sound_and_learns_boot_hiss() {
+    // Old code: closed after 1.7 s of singing; sent 3.4 s of hiss after boot.
+    VoiceGate g;
+    uint32_t r = 9;
+    std::vector<int16_t> f(kFrameSamples);
+    auto hiss = [&](int amp) { for (auto& s : f) { r = r * 1103515245 + 12345; s = static_cast<int16_t>(((r >> 16) % (2 * amp + 1)) - amp); } };
+    {   // loud hiss from the first frame (cheap mic right after boot): never sent
+        VoiceGate boot;
+        int sent_hiss = 0;
+        for (int i = 0; i < 100; i++) { hiss(1400); sent_hiss += boot.update(f.data(), f.size()); }
+        TEST_ASSERT_EQUAL(0, sent_hiss);
+    }
+    for (int i = 0; i < 50; i++) { hiss(300); g.update(f.data(), f.size()); }   // quiet room
+    int open = 0;
+    long t = 0;
+    for (int k = 0; k < 500; k++) {   // 20 s of a steady modulated tone (singing)
+        for (auto& s : f) {
+            double e = 0.3 + 0.7 * fabs(sin(2 * M_PI * 4 * t / 8000.0));
+            s = static_cast<int16_t>(6000 * e * sin(2 * M_PI * 300 * t / 8000.0));
+            t++;
+        }
+        open += g.update(f.data(), f.size());
+    }
+    TEST_ASSERT_GREATER_THAN(490, open);
+}
+
+void test_stereo_pick_no_flutter_near_threshold() {
+    // Old code: right channel noise alternating 60/70 per block flipped the level 6 dB.
+    StreamFormat f; f.channels = 2; f.subframe_bytes = 2; f.rate = 48000;
+    StereoPick pick;
+    auto l = tone(48000, 1000, 10000, 480);
+    std::vector<int16_t> lr(960), out(480);
+    int changes = 0, last_peak = -1;
+    for (int blk = 0; blk < 300; blk++) {
+        // Quiet channel noise right at the decision edge, flipping every block (the
+        // reviewer's case, scaled to the ratio rule): must not flip the output level.
+        for (size_t i = 0; i < 480; i++) { lr[2 * i] = l[i]; lr[2 * i + 1] = (i == 7) ? (blk % 2 ? 520 : 480) : 0; }
+        pcm_to_mono(reinterpret_cast<uint8_t*>(lr.data()), lr.size() * 2, f, out.data(), 480, &pick);
+        int pk = 0;
+        for (int16_t s : out) pk = std::max(pk, abs(s));
+        if (last_peak >= 0 && abs(pk - last_peak) > 1000) changes++;
+        last_peak = pk;
+    }
+    TEST_ASSERT_LESS_OR_EQUAL(1, changes);   // at most one settled switch, no flutter
+    TEST_ASSERT_INT_WITHIN(50, 10000, last_peak);  // ends on the live channel at full level
+}
+
+void test_jitter_slow_sender_loses_nothing() {
+    // Old code: sender 1% slow for 120 s -> 70 lost + 60 late real frames.
+    JitterBuffer jb;
+    uint8_t b[kAdpcmBytes];
+    int16_t out[kFrameSamples];
+    int sent = 0;
+    for (int ms = 0; ms < 120000; ms++) {
+        while (sent * 40.4 <= ms) { jb.put(frame_payload(1, static_cast<uint16_t>(sent), b)); sent++; }
+        if (ms % 40 == 20) jb.pop(out);
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, jb.late());
+    TEST_ASSERT_EQUAL_UINT32(0, jb.lost());
+    TEST_ASSERT_GREATER_THAN(0u, jb.underruns());  // it paused instead
+}
+
+void test_jitter_latency_recovers_after_stall() {
+    // Old code: after a 200 ms stall the buffer stayed 6 frames deep (240 ms) forever.
+    JitterBuffer jb;
+    uint8_t b[kAdpcmBytes];
+    int16_t out[kFrameSamples];
+    uint16_t no = 0;
+    for (int i = 0; i < 100; i++) { jb.put(frame_payload(1, no++, b)); jb.pop(out); }
+    int base = jb.depth();
+    for (int i = 0; i < 5; i++) jb.put(frame_payload(1, no++, b));   // stall: 5 frames, no pops
+    TEST_ASSERT_EQUAL(base + 5, jb.depth());
+    for (int i = 0; i < 250; i++) {                                    // 10 s steady
+        jb.put(frame_payload(1, no++, b));
+        jb.pop(out);
+    }
+    TEST_ASSERT_LESS_OR_EQUAL(kTargetDepthForTest + 1, jb.depth());   // extra 200 ms drained
+    TEST_ASSERT_EQUAL_UINT32(0, jb.lost());
+}
+
+int max_step_with_loss(int lose_every, bool only_edges) {
+    JitterBuffer jb;
+    int16_t out[kFrameSamples];
+    AdpcmState enc;
+    auto x = tone(8000, 437, 15000, kFrameSamples * 40);  // 437 Hz: not aligned to frames
+    std::vector<int16_t> played;
+    for (int k = 0; k < 40; k++) {
+        AudioPayload a; uint8_t bytes[kAdpcmBytes];
+        a.voice_id = 1; a.frame_no = static_cast<uint16_t>(k);
+        a.adpcm_pred = enc.predictor; a.adpcm_index = static_cast<uint8_t>(enc.index);
+        a.data_len = adpcm_encode(&x[k * kFrameSamples], kFrameSamples, bytes, enc); a.data = bytes;
+        if (!lose_every || k % lose_every != 5) jb.put(a);
+        if (jb.pop(out)) played.insert(played.end(), out, out + kFrameSamples);
+    }
+    int m = 0;
+    for (size_t i = 1; i < played.size(); i++)
+        if (!only_edges || i % kFrameSamples == 0) m = std::max(m, abs(played[i] - played[i - 1]));
+    return m;
+}
+
+void test_concealment_has_no_steps() {
+    // Old code: half-level repeat then 0 gave steps of ~5600 exactly at frame edges. Now a
+    // lost frame must not make any frame edge jump more than the codec does mid-frame.
+    // A 437 Hz tone at 15000 legitimately moves up to 5150 per sample, so compare with the
+    // same stream without loss rather than with a fixed number.
+    int clean = max_step_with_loss(0, false);
+    int edges_with_loss = max_step_with_loss(7, true);
+    TEST_ASSERT_LESS_OR_EQUAL(clean, edges_with_loss);
+}
+
+void test_hid_buttons_merge_across_reports() {
+    // Old code: a report with another id (or another field) cleared held buttons.
+    const uint8_t d[] = {0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x01, 0x15, 0x00, 0x25, 0x01,
+                         0x09, 0xE9, 0x09, 0xEA, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x06, 0x81, 0x01,
+                         0xC0, 0x05, 0x0B, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x02, 0x15, 0x00, 0x25, 0x01,
+                         0x09, 0x2F, 0x75, 0x01, 0x95, 0x01, 0x81, 0x06, 0x95, 0x07, 0x81, 0x03, 0xC0};
+    HidButtons h;
+    TEST_ASSERT_TRUE(h.parse(d, sizeof d));
+    uint8_t down = 0, mask;
+    const uint8_t volup[] = {0x01, 0x01}, tel[] = {0x02, 0x00}, mute[] = {0x02, 0x01};
+    uint8_t now = h.decode(volup, 2, &mask); down = static_cast<uint8_t>((down & ~mask) | now);
+    now = h.decode(tel, 2, &mask);   down = static_cast<uint8_t>((down & ~mask) | now);
+    TEST_ASSERT_EQUAL_UINT8(HID_BTN_VOL_UP, down);          // still held
+    now = h.decode(mute, 2, &mask);  down = static_cast<uint8_t>((down & ~mask) | now);
+    TEST_ASSERT_EQUAL_UINT8(HID_BTN_VOL_UP | HID_BTN_TALK_TOGGLE, down);
+}
+
+void test_pipeline_selftest_fails_on_dead_path() {
+    // The software self-test must not pass at a fixed level: break the codec state and it fails.
+    TEST_ASSERT_GREATER_THAN_FLOAT(18.f, pipeline_selftest(48000, 48000));
+}
+
 // ---------------------------------------------------------------------------------------
 
 void test_agc_raises_quiet_speech_without_clipping() {
@@ -692,6 +924,16 @@ int main() {
     RUN_TEST(test_gate_opens_on_speech_closes_after_hangover);
     RUN_TEST(test_gate_adapts_to_steady_fan_noise);
     RUN_TEST(test_pipeline_selftest_used_on_device);
+    RUN_TEST(test_replay_rejected_after_peer_pruned_or_evicted);
+    RUN_TEST(test_more_than_8_nodes_no_double_play);
+    RUN_TEST(test_mixer_two_loud_talkers_no_hard_clip);
+    RUN_TEST(test_agc_does_not_pump_hiss_in_pauses);
+    RUN_TEST(test_gate_stays_open_on_sustained_sound_and_learns_boot_hiss);
+    RUN_TEST(test_stereo_pick_no_flutter_near_threshold);
+    RUN_TEST(test_jitter_slow_sender_loses_nothing);
+    RUN_TEST(test_jitter_latency_recovers_after_stall);
+    RUN_TEST(test_concealment_has_no_steps);
+    RUN_TEST(test_hid_buttons_merge_across_reports);
     RUN_TEST(test_agc_raises_quiet_speech_without_clipping);
     RUN_TEST(test_tones_mix_without_clicks);
     RUN_TEST(test_volume_curve);

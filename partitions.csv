@@ -1,8 +1,8 @@
-# ESP32-S3 WalkieTalkie Partition Table
-# Dual OTA partitions for safe over-the-air updates
-# Total: fits within 4MB flash (works on all ESP32-S3 variants)
+# ESP32-S3 walkie-talkie, 4 MB flash (fits every ESP32-S3 module).
+# Two app slots are kept for a future OTA update path; this firmware has no OTA code yet
+# and always boots app0. Flash over USB.
 #
-# Name,    Type, SubType,  Offset,    Size,     Flags
+# Name,    Type, SubType,  Offset,    Size,
 nvs,       data, nvs,      0x9000,    0x5000,
 otadata,   data, ota,      0xe000,    0x2000,
 app0,      app,  ota_0,    0x10000,   0x1E0000,

@@ -79,7 +79,7 @@ StreamFormat choose_format(const AltFormat* alts, size_t n) {
 }
 
 size_t pcm_to_mono(const uint8_t* raw, size_t bytes, const StreamFormat& f, int16_t* out,
-                   size_t out_max) {
+                   size_t out_max, StereoPick* pick) {
     if (!f.valid()) return 0;
     size_t fb = f.frame_bytes();
     size_t frames = bytes / fb;
@@ -89,18 +89,42 @@ size_t pcm_to_mono(const uint8_t* raw, size_t bytes, const StreamFormat& f, int1
             out[i] = static_cast<int16_t>(read_sample(raw + i * fb, f.subframe_bytes));
         return frames;
     }
-    // Stereo: decide per block, never per sample (per-sample switching distorts).
-    int32_t peak0 = 0, peak1 = 0;
-    for (size_t i = 0; i < frames; i++) {
-        int32_t a = abs(read_sample(raw + i * fb, f.subframe_bytes));
-        int32_t b = abs(read_sample(raw + i * fb + f.subframe_bytes, f.subframe_bytes));
-        if (a > peak0) peak0 = a;
-        if (b > peak1) peak1 = b;
+    int mode = 2;
+    if (pick) {
+        int32_t peak0 = 0, peak1 = 0;
+        for (size_t i = 0; i < frames; i++) {
+            int32_t a = abs(read_sample(raw + i * fb, f.subframe_bytes));
+            int32_t b = abs(read_sample(raw + i * fb + f.subframe_bytes, f.subframe_bytes));
+            if (a > peak0) peak0 = a;
+            if (b > peak1) peak1 = b;
+        }
+        // Decide by level ratio with a wide dead band, so noise near any fixed threshold
+        // cannot flip it: one channel 26 dB below the other = single-sided mic; both within
+        // 12 dB = real stereo; in between, or both near silence (no one speaking) = keep.
+        const int32_t kQuiet = 200;  // about -44 dBFS: below this nobody is speaking
+        int want = -1;  // -1 = this block says nothing (quiet, or in the dead band)
+        int32_t hi = peak0 > peak1 ? peak0 : peak1;
+        if (hi > kQuiet) {
+            if (peak0 > peak1 * 20) want = 0;
+            else if (peak1 > peak0 * 20) want = 1;
+            else if (peak0 * 4 > peak1 && peak1 * 4 > peak0) want = 2;
+        }
+        if (want < 0) {
+            // no vote either way
+        } else if (want == pick->mode) {
+            pick->votes = 0;
+        } else {
+            if (want != pick->pending) {
+                pick->pending = want;
+                pick->votes = 0;
+            }
+            if (++pick->votes >= 50) {  // ~0.5 s of 10 ms blocks
+                pick->mode = want;
+                pick->votes = 0;
+            }
+        }
+        mode = pick->mode;
     }
-    const int32_t kSilent = 64;
-    int mode = 2;  // 0 = left only, 1 = right only, 2 = average
-    if (peak1 <= kSilent && peak0 > kSilent) mode = 0;
-    if (peak0 <= kSilent && peak1 > kSilent) mode = 1;
     for (size_t i = 0; i < frames; i++) {
         int32_t a = read_sample(raw + i * fb, f.subframe_bytes);
         int32_t b = read_sample(raw + i * fb + f.subframe_bytes, f.subframe_bytes);

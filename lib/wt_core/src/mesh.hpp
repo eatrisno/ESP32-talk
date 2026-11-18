@@ -25,10 +25,29 @@ struct Peer {
     ReplayWindow replay;
 };
 
+// Highest session seen per sender, kept much longer than the peer table so a frame from an
+// old session can never be replayed after its sender was pruned or evicted. Entries are
+// only written after a frame authenticated, so an attacker without the key cannot fill it.
+// Forgotten after kForgetMs of silence. Trade-off: after that, one old frame from that sender
+// could be replayed once; but a node whose flash was erased (its session restarts at a new
+// random value, possibly lower) is heard again after at most this long.
+class SessionMemory {
+public:
+    static constexpr int kCap = 64;
+    static constexpr uint32_t kForgetMs = 10u * 60u * 1000u;
+    // False if (session, seq) is not newer than the newest frame remembered for sender.
+    bool newer(uint32_t sender, uint32_t session, uint32_t seq, uint32_t now_ms) const;
+    void put(uint32_t sender, uint32_t session, uint32_t seq, uint32_t now_ms);
+
+private:
+    struct E { uint32_t id = 0, session = 0, seq = 0, last_ms = 0; bool used = false; };
+    E e_[kCap];
+};
+
 class PeerTable {
 public:
     // Before decrypting: is this (sender, session, seq) new? Cheap filter for floods.
-    bool fresh(const Header& h) const;
+    bool fresh(const Header& h, uint32_t now_ms) const;
     // After the packet authenticated: records it. Returns false if it was a duplicate.
     bool accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms);
     void set_name(uint32_t id, const char* name);
@@ -42,6 +61,7 @@ public:
 private:
     Peer* slot_for(uint32_t id, uint32_t now_ms);
     Peer peers_[kMaxPeers];
+    SessionMemory sessions_;
 };
 
 // Pending relays with cancellation. Owned by the radio task.

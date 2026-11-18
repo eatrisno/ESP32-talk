@@ -18,14 +18,15 @@ reached through the others (mesh relay, up to 2 hops).
 | Conference | Every node on the same channel and key hears every talker. Up to 4 voices are mixed at once. |
 | Mesh | Each node rebroadcasts new packets once (ttl 3). A node skips its relay if a neighbour already sent it. |
 | Headset | Any USB Audio Class 1.0 headset. It picks the best format the headset offers (48/44.1/32/16 kHz…, mono or stereo, 16/24/32-bit). |
-| Headset buttons | Play/Pause, Hook and Mute on the headset act the same as the BOOT button. Its Vol+ and Vol- change volume. |
-| Voice | 8 kHz, IMA-ADPCM (32 kbit/s), 40 ms frames. Mic has a DC filter, automatic gain and a voice gate, so silence is not sent. |
+| Headset buttons | Play/Pause and Mute on the headset act the same as the BOOT button. A latching Hook / Phone-mute control toggles the mic on every change. Vol+ and Vol- change volume. |
+| Voice | 8 kHz, IMA-ADPCM (32 kbit/s), 40 ms frames. Mic has a DC filter, automatic gain (adapts only on speech, so hiss between words is not pumped up) and a voice gate that learns the room noise, so silence is not sent. Talkers are summed in float and soft-limited once, so several loud voices compress instead of clipping. |
 | Losses | Each frame carries its own decoder state, so a lost packet costs 40 ms and does not corrupt the frames after it. |
-| Security | AES-128-CCM on every frame (encryption and authentication). Replay protection per sender. |
+| Security | AES-128-CCM on every frame (encryption and authentication). Replay protection per sender, kept for 10 minutes after the sender goes quiet. |
 
 ## Hardware
 
-* ESP32-S3 board with native USB (tested target: ESP32-S3-DevKitC-1).
+* ESP32-S3 board with native USB and at least 4 MB flash (built for ESP32-S3-DevKitC-1; the image is
+  4 MB so it also runs on 8 and 16 MB modules). Not yet run on hardware, see Testing.
 * USB-C headset (digital, UAC 1.0), connected to the native USB port (GPIO 19/20). The headset must get
   5 V on VBUS: use an OTG adapter with power, or wire 5 V to the port.
 * Console/flashing goes through the other USB port (UART bridge).
@@ -46,19 +47,22 @@ reached through the others (mesh relay, up to 2 hops).
 | Long press (1.5 s) | Ping all nodes, results on the console |
 | Vol +/- (pins or headset) | ±10 %, saved. A higher beep means louder. A beep at the limit means it can't go further. |
 | Another node turns its mic on/off | Short high/low beep |
+| Headset plugged in | Rising chime once the speaker is ready |
+| You send a ping | Short high beep (1800 Hz) |
 
 With the mic on, audio is only sent while you speak (voice gate, 400 ms hangover). The mic turns itself off
 after 2 minutes open.
 
 | LED | Meaning |
 |---|---|
-| Blue | No headset (also the colour at boot) |
+| Blue | No headset speaker (also the colour at boot) |
 | Off | Ready, mic muted |
 | Amber | Mic on, waiting for speech |
 | Red | Sending your voice |
 | Green | Playing someone else |
 | White | Loopback test |
 | Cyan flash | Answered a ping |
+| Red, not changing | Radio or settings storage failed at boot: the node is halted (see the console log) |
 
 ## Build and flash
 
@@ -89,22 +93,27 @@ reboot    restart                    anything else prints this list
 ## Testing
 
 ```bash
-pio test -e native     # 36 host tests, no hardware
+pio test -e native     # 46 host tests, no hardware
 ```
 
 The host tests run the same code as the firmware. A 1 kHz tone goes from the mic rate through 8 kHz, ADPCM,
 the packet format and the jitter buffer to the speaker rate. The test checks its level and SNR for every pair
 of common headset rates, and with packet loss. They also cover format selection for headsets without 48 kHz,
-stereo-mic handling, out-of-order and duplicate frames, resync after a long gap, clock drift, the replay
-window, the 3-node relay path (including that a forged frame cannot cancel a relay), HID descriptors from
-three headset layouts, button debounce and long press, and the voice gate.
+stereo-mic handling (including no level flutter), out-of-order and duplicate frames, resync after a long
+gap, a slow sender losing no frames, latency draining back after a stall, click-free loss concealment, the
+replay window (including after a peer was pruned or evicted, and with more than 8 nodes), the 3-node relay
+path, HID descriptors from four headset layouts with buttons across report ids, button debounce and long
+press, the voice gate (sustained sound, boot hiss, fan noise), AGC not pumping hiss, and mixing two loud
+talkers. Each of these was checked to fail on the code before its fix. The tests also pass under
+AddressSanitizer and UBSan.
 
 Not covered by any test: the ESP-IDF layer in `src/` (USB host, ESP-NOW, tasks, LED) is only checked by the
 compiler. On a device:
 
-1. `selftest`: the headset's mic and speaker streams are up, the mic delivers at its rate, and a 1 kHz tone
-   through the voice path at the headset's rates comes out above 18 dB SNR.
-2. `loop`, then speak: you hear yourself about 150-250 ms later. This checks mic and speaker by ear.
+1. `selftest`: the headset's mic and speaker streams are up, the mic delivers at its rate and is not digital
+   silence, and a 1 kHz tone through the software voice path at the headset's rates comes out above 18 dB
+   SNR. It does not prove the sound is clean in your ear: step 2 does.
+2. `loop`, then speak: you hear yourself about 0.2 s later. This checks mic and speaker by ear.
 3. Two nodes in one room: talk both ways, `s` on each shows the other as `direct`.
 4. Three nodes, A and C out of range of each other: `s` on A shows C as `relay`, and A and C hear each other.
 
@@ -135,14 +144,25 @@ test/test_core/    host tests
 ## Protocol (v3)
 
 16-byte header `'W' ver type ttl sender[4] session[4] seq[4]`, then the AES-128-CCM ciphertext and an
-8-byte tag. The header with ttl zeroed is authenticated. The nonce is `sender|session|seq`, and `session`
-is a boot counter in NVS, so a nonce is never reused. Not compatible with firmware 2.x.
+8-byte tag. The header with ttl zeroed is authenticated; receivers clamp ttl to 3, so a rebroadcast with a
+higher ttl cannot travel further than 2 relays. The nonce is `sender|session|seq`. `session` is a boot counter
+in NVS that starts at a random value in [2^30, 2^31) after a flash erase, and the radio stays off if the new
+value cannot be stored, so a nonce is not reused. Not compatible with firmware 2.x.
 
 ## Limits
 
+* Untested on hardware. Everything in `src/` (USB host, ESP-NOW, tasks) has only been compiled and reviewed.
 * One shared key per group. A node that leaks the key lets anyone join. Use your own key and keep it out
   of the repo.
-* 4 simultaneous talkers. A fifth is dropped until one stops.
+* 4 simultaneous talkers. A fifth is dropped until one stops. Peer list holds 8 nodes; larger groups still
+  work but the status list only shows 8.
+* A sender silent for over 10 minutes is forgotten: one old frame of it could then be replayed once.
+* Two nodes whose MACs share the last 4 bytes collide (one ignores the other). Rare; not detected.
+* Headsets that list one bit depth in two container sizes (24-bit in 3 and in 4 bytes) are refused: the
+  driver cannot be told which one to stream.
+* No USB feedback endpoint support: an asynchronous headset whose DAC clock differs from the USB clock may
+  click faintly every few minutes.
+* No OTA update yet (the partition table keeps a second slot for it). Flash over USB.
 * UAC 2.0-only headsets are not supported (the ESP-IDF UAC host driver is UAC 1.0). Most USB-C headsets
   are UAC 1.0.
 * Range: 6 Mbit/s ESP-NOW at 20 dBm reaches roughly 100-300 m line of sight per hop (not measured with this

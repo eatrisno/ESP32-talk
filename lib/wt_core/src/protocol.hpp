@@ -1,7 +1,8 @@
 #pragma once
 // Over-the-air packet format. Every frame is authenticated with AES-128-CCM. The header
 // (with ttl zeroed, so relays may decrement it) is the associated data, the nonce is
-// sender|session|seq, so a nonce is never reused: session is a boot counter kept in NVS.
+// sender|session|seq. session is a boot counter in NVS that starts at a random value
+// after a flash erase, so a nonce is not reused (see next_session() in main.cpp).
 //
 //   off  size  field
 //   0    1     magic 'W'
@@ -9,7 +10,7 @@
 //   2    1     type (MsgType)
 //   3    1     ttl (hops left)
 //   4    4     sender id (low 4 bytes of the sender MAC)
-//   8    4     session (sender boot counter)
+//   8    4     session (sender boot counter, random start)
 //   12   4     seq (per session, strictly increasing)
 //   16   n     ciphertext
 //   16+n 8     CCM tag

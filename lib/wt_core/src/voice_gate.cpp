@@ -12,17 +12,28 @@ namespace wt {
 bool VoiceGate::update(const int16_t* x, size_t n) {
     double acc = 0;
     for (size_t i = 0; i < n; i++) acc += static_cast<double>(x[i]) * x[i];
-    rms_ = n ? static_cast<float>(sqrt(acc / n)) : 0.f;
-    // Noise floor: falls fast, rises slowly (about 3 dB per second), so speech pauses
-    // pull it down but speech itself barely lifts it.
+    rms_ = n ? sqrtf(static_cast<float>(acc / n)) : 0.f;
+    if (frames_ < 25) {  // first second: take the quietest frame as the floor, send nothing
+        floor_ = frames_ == 0 || rms_ < floor_ ? rms_ : floor_;
+        if (floor_ < 30.f) floor_ = 30.f;
+        frames_++;
+        speech_now_ = false;
+        return false;
+    }
+    // Noise floor: falls fast. It rises (about 3 dB/s) only while the gate is closed, so
+    // sustained speech or singing cannot lift the floor up to itself and close the gate;
+    // a steady fan or hiss still gets learned within a few seconds of the gate closing.
     if (rms_ < floor_) floor_ += (rms_ - floor_) * 0.3f;
-    else floor_ *= 1.0139f;
+    else if (hang_ == 0) floor_ *= 1.0139f;
+    else if (open_frames_ > kMaxOpenFrames) floor_ *= 1.0139f;  // stuck open on noise
     if (floor_ < 30.f) floor_ = 30.f;
     const float kAbsMin = 150.f;              // about -47 dBFS
     float thr = floor_ * 2.5f;                // 8 dB above the floor
     if (thr < kAbsMin) thr = kAbsMin;
-    if (rms_ > thr) hang_ = kHangFrames;
+    speech_now_ = rms_ > thr;
+    if (speech_now_) hang_ = kHangFrames;
     else if (hang_ > 0) hang_--;
+    open_frames_ = hang_ > 0 ? open_frames_ + 1 : 0;
     return hang_ > 0;
 }
 

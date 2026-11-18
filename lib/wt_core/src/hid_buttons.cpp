@@ -42,7 +42,7 @@ uint8_t hid_usage_to_button(uint16_t page, uint16_t usage) {
             case 0xEA: return HID_BTN_VOL_DOWN;
         }
     } else if (page == kPageTelephony) {
-        if (usage == 0x20 || usage == 0x2F) return HID_BTN_TALK;  // Hook switch, Phone mute
+        if (usage == 0x20 || usage == 0x2F) return HID_BTN_TALK_TOGGLE;  // Hook switch, Phone mute
     }
     return 0;
 }
@@ -139,8 +139,9 @@ bool HidButtons::parse(const uint8_t* d, size_t len) {
     return n_ > 0;
 }
 
-uint8_t HidButtons::decode(const uint8_t* r, size_t len) const {
+uint8_t HidButtons::decode(const uint8_t* r, size_t len, uint8_t* mask) const {
     uint8_t id = 0;
+    if (mask) *mask = 0;
     if (uses_ids_) {
         if (len < 1) return 0;
         id = r[0];
@@ -151,6 +152,9 @@ uint8_t HidButtons::decode(const uint8_t* r, size_t len) const {
     for (int i = 0; i < n_; i++) {
         const Field& f = f_[i];
         if (f.report_id != id) continue;
+        if (mask) *mask |= f.array ? static_cast<uint8_t>(HID_BTN_TALK | HID_BTN_VOL_UP | HID_BTN_VOL_DOWN |
+                                                          HID_BTN_TALK_TOGGLE)
+                                   : f.button;
         if (!f.array) {
             if (bits_at(r, len, f.bit, f.size)) out |= f.button;
             continue;

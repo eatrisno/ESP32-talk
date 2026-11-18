@@ -67,11 +67,12 @@ struct DcBlocker {
     }
 };
 
-// Slow automatic gain for the microphone. Raises quiet speech up to +18 dB, never
-// boosts background noise below the gate, never clips.
+// Slow automatic gain for the microphone. Raises quiet speech up to +18 dB and never clips.
+// `speech` comes from the voice gate (measured on the frame before gain): the gain only adapts
+// on speech, and holds in pauses, so background hiss is never pumped up between words.
 class Agc {
 public:
-    void process(int16_t* x, size_t n);
+    void process(int16_t* x, size_t n, bool speech = true);
     float gain() const { return gain_; }
 
 private:
@@ -82,8 +83,8 @@ private:
 // Speaker volume 0..100 to linear gain (square law: 50% = -12 dB).
 float volume_gain(uint8_t percent);
 
-// Sums src into dst with saturation.
-void mix_into(int16_t* dst, const int16_t* src, size_t n);
+// Sums src into a float mix bus (no clipping: limit once at the end with soft_limit).
+void mix_into(float* dst, const int16_t* src, size_t n);
 
 // Feedback beeps rendered at kVoiceRate and mixed into the speaker path, so there is only
 // one writer to the USB speaker.
