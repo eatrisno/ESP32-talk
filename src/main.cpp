@@ -1434,6 +1434,7 @@ extern "C" void app_main() {
         }
 
         // Latching hook/mute control: every change is one click
+        // Only active in Hands-Free mode (not PTT mode, to prevent interference)
         uint8_t tog = hid & wt::HID_BTN_TALK_TOGGLE;
         static bool s_first_hid = true;
         if (s_first_hid) {
@@ -1442,7 +1443,9 @@ extern "C" void app_main() {
             last_hid = hid;
         } else if (tog != last_toggle) {
             last_toggle = tog;
-            handle_press(wt::Press::Click, 0);
+            if (!s_ptt_mode) {  // HID hook/toggle only acts in Hands-Free mode
+                handle_press(wt::Press::Click, 0);
+            }
         }
 
         // USB HID buttons: packets are digital and bounce-free; act directly on edge
@@ -1454,7 +1457,8 @@ extern "C" void app_main() {
         }
 
         // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
-        // which == 0 (zero menu functions)
+        // In Hands-Free mode: click toggles mic on/off.
+        // In PTT mode: handled exclusively by ptt_raw_down block below (hold = TX, release = stop).
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
@@ -1463,7 +1467,9 @@ extern "C" void app_main() {
             hid_talk_long_sent = true;
         }
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
-            if (!hid_talk_long_sent && !s_ptt_active) {
+            // On HID TALK release: only fire a click event in Hands-Free mode.
+            // In PTT mode, the hold/release is handled exclusively by ptt_raw_down block below.
+            if (!s_ptt_mode && !hid_talk_long_sent) {
                 handle_press(wt::Press::Click, 0);
             }
         }
