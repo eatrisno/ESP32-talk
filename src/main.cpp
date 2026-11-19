@@ -2088,20 +2088,25 @@ extern "C" void app_main() {
             talk_since = 0;
         }
 
+        bool active_voice = audio::talking() || audio::sending() || audio::receiving();
         if (now - last_beacon >= cfg::kBeaconMs) {
             last_beacon = now;
-            wt::PiggybackBeacon pb;
-            xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-            build_piggyback_beacon(pb);
-            xSemaphoreGive(s_app_mtx);
-            radio::send(wt::MSG_BEACON, reinterpret_cast<const uint8_t*>(&pb), sizeof(pb));
+            // Suppress beacon during active speech: voice frames already broadcast node state 25x/sec
+            if (!active_voice) {
+                wt::PiggybackBeacon pb;
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                build_piggyback_beacon(pb);
+                xSemaphoreGive(s_app_mtx);
+                radio::send(wt::MSG_BEACON, reinterpret_cast<const uint8_t*>(&pb), sizeof(pb));
+            }
             radio::peers_lock();
             radio::peers().prune(now);
             radio::peers_unlock();
         }
 
         static uint32_t last_walk_probe = 0;
-        if (s_walk_mode && (now - last_walk_probe >= 1000)) {
+        // Suppress walk probes during active speech so conversation has 100% clean airtime
+        if (s_walk_mode && !active_voice && (now - last_walk_probe >= 1000)) {
             last_walk_probe = now;
             wt::RangeReq req;
             req.token = s_range_token;
