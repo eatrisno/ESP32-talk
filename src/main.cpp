@@ -60,11 +60,11 @@ static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 // --- Audio Voice Menu & PTT state ---
 enum MenuItem : uint8_t {
-    MENU_VOICE_NOTE = 0,
-    MENU_RADAR,
-    MENU_WALK,
+    MENU_WALK = 0,
     MENU_TALK_MODE,
     MENU_CHANNEL,
+    MENU_VOICE_NOTE,
+    MENU_RADAR,
     MENU_POWER_OFF,
     MENU_EXIT,
     MENU_COUNT
@@ -73,8 +73,8 @@ enum MenuItem : uint8_t {
 static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
 static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
 static bool s_menu_active = false;
-static uint8_t s_menu_item = MENU_VOICE_NOTE;
-static bool s_menu_channel_active = false;
+static bool s_menu_sub = false;          // true = inside a feature sub-menu (Level 2)
+static MenuItem s_menu_item = MENU_WALK;
 static uint8_t s_menu_channel_candidate = 1;
 static uint32_t s_last_menu_activity_ms = 0;
 
@@ -83,7 +83,10 @@ void enter_menu();
 void exit_menu(bool play_tone = true);
 void menu_next();
 void menu_prev();
-void menu_select();
+void menu_enter_sub();
+void menu_sub_action();
+void menu_back_to_main();
+void announce_main_menu_item();
 void system_power_off();
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
@@ -545,8 +548,6 @@ void dismiss_inbox_voicemail() {
 
 static uint32_t s_last_talk_click_ms = 0;
 static uint8_t  s_talk_click_count = 0;
-static uint32_t s_last_boot_click_ms = 0;
-static uint8_t  s_boot_click_count = 0;
 static constexpr uint32_t kMultiClickWindowMs = 500;
 
 void handle_press(wt::Press p, int which) {
@@ -558,39 +559,44 @@ void handle_press(wt::Press p, int which) {
     if (which == 3) {
         if (s_distress_active) {
             // Any press on BOOT cancels distress immediately!
-            s_boot_click_count = 0;
             toggle_distress();
             return;
         }
 
         if (!s_menu_active) {
             if (p == wt::Press::Click) {
-                s_boot_click_count = 0;
                 enter_menu();
             }
             return;
         }
 
-        // Inside Menu:
-        uint32_t now = now_ms();
-        if (p == wt::Press::Click) {
-            if (s_boot_click_count > 0 && (now - s_last_boot_click_ms <= kMultiClickWindowMs)) {
-                // Double click inside menu: exit menu immediately!
-                s_boot_click_count = 0;
-                exit_menu(true);
-                return;
-            }
-            s_boot_click_count = 1;
-            s_last_boot_click_ms = now;
-            menu_next();
-        } else if (p == wt::Press::Long) {
-            // Long click (~1s): select / toggle active item!
-            s_boot_click_count = 0;
-            menu_select();
-        } else if (p == wt::Press::Hold) {
-            // Long press held (>= 2.5s): BACK / EXIT menu!
-            s_boot_click_count = 0;
+        // Inside Menu (s_menu_active is true):
+        s_last_menu_activity_ms = now_ms();
+
+        if (p == wt::Press::Hold) {
+            // Hold >= 2.5s: Exit menu immediately from anywhere!
             exit_menu(true);
+            return;
+        }
+
+        if (!s_menu_sub) {
+            // --- LEVEL 1: Main Menu Carousel ---
+            if (p == wt::Press::Click) {
+                // Click: Next menu item!
+                menu_next();
+            } else if (p == wt::Press::Long) {
+                // Long press: Enter feature!
+                menu_enter_sub();
+            }
+        } else {
+            // --- LEVEL 2: Sub-Menu (Inside Feature) ---
+            if (p == wt::Press::Click) {
+                // Click: Toggle setting or next option!
+                menu_sub_action();
+            } else if (p == wt::Press::Long) {
+                // Long press: Go back to Level 1!
+                menu_back_to_main();
+            }
         }
         return;
     }
@@ -903,7 +909,7 @@ void system_power_off() {
 void exit_menu(bool play_tone) {
     if (!s_menu_active) return;
     s_menu_active = false;
-    s_menu_channel_active = false;
+    s_menu_sub = false;
     if (play_tone) {
         audio::prompt_clear();
         audio::tone(600, 25, 300);
@@ -913,29 +919,23 @@ void exit_menu(bool play_tone) {
     printf("[Menu] Exited.\n");
 }
 
-void announce_current_menu_item() {
+void announce_main_menu_item() {
     audio::prompt_clear();
-    if (s_menu_channel_active) {
-        if (s_menu_channel_candidate >= 1 && s_menu_channel_candidate <= 13) {
-            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (s_menu_channel_candidate - 1)));
-        }
-        return;
-    }
     switch (s_menu_item) {
+        case MENU_WALK:
+            audio::prompt(wt::PROMPT_MENU_WALK);
+            break;
+        case MENU_TALK_MODE:
+            audio::prompt(wt::PROMPT_MENU_PTT);
+            break;
+        case MENU_CHANNEL:
+            audio::prompt(wt::PROMPT_MENU_CHANNEL);
+            break;
         case MENU_VOICE_NOTE:
             audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
             break;
         case MENU_RADAR:
             audio::prompt(wt::PROMPT_MENU_RADAR);
-            break;
-        case MENU_WALK:
-            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
-            break;
-        case MENU_TALK_MODE:
-            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
-            break;
-        case MENU_CHANNEL:
-            audio::prompt(wt::PROMPT_MENU_CHANNEL);
             break;
         case MENU_POWER_OFF:
             audio::prompt(wt::PROMPT_POWER_OFF);
@@ -950,52 +950,68 @@ void announce_current_menu_item() {
 
 void enter_menu() {
     s_menu_active = true;
-    s_menu_channel_active = false;
-    s_menu_item = MENU_VOICE_NOTE;
+    s_menu_sub = false;
+    s_menu_item = MENU_WALK;
     s_last_menu_activity_ms = now_ms();
     audio::prompt_clear();
     audio::prompt(wt::PROMPT_MENU);
-    audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
-    printf("[Menu] Entered Audio Menu. Click to next, Long-click to select, Hold 2.5s to back.\n");
+    audio::prompt(wt::PROMPT_MENU_WALK);
+    printf("[Menu] Entered Audio Menu. Click: next, Long: enter feature, Hold: exit.\n");
 }
 
 void menu_next() {
     s_last_menu_activity_ms = now_ms();
-    if (s_menu_channel_active) {
-        s_menu_channel_candidate++;
-        if (s_menu_channel_candidate > 13) s_menu_channel_candidate = 1;
-        printf("[Menu] Channel preview: %u\n", s_menu_channel_candidate);
-    } else {
-        s_menu_item = (s_menu_item + 1) % MENU_COUNT;
-        printf("[Menu] Item %u\n", s_menu_item);
-    }
-    announce_current_menu_item();
+    s_menu_item = static_cast<MenuItem>((s_menu_item + 1) % MENU_COUNT);
+    printf("[Menu] Next item: %u\n", s_menu_item);
+    announce_main_menu_item();
 }
 
 void menu_prev() {
     s_last_menu_activity_ms = now_ms();
-    if (s_menu_channel_active) {
-        s_menu_channel_candidate = (s_menu_channel_candidate <= 1) ? 13 : s_menu_channel_candidate - 1;
-        printf("[Menu] Channel preview: %u\n", s_menu_channel_candidate);
+    if (s_menu_sub) {
+        if (s_menu_item == MENU_CHANNEL) {
+            s_menu_channel_candidate = (s_menu_channel_candidate <= 1) ? 13 : s_menu_channel_candidate - 1;
+            audio::prompt_clear();
+            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (s_menu_channel_candidate - 1)));
+            printf("[Menu] Channel candidate: %u\n", s_menu_channel_candidate);
+        } else {
+            menu_sub_action();
+        }
     } else {
-        s_menu_item = (s_menu_item + MENU_COUNT - 1) % MENU_COUNT;
-        printf("[Menu] Item %u\n", s_menu_item);
+        s_menu_item = static_cast<MenuItem>((s_menu_item + MENU_COUNT - 1) % MENU_COUNT);
+        printf("[Menu] Prev item: %u\n", s_menu_item);
+        announce_main_menu_item();
     }
-    announce_current_menu_item();
 }
 
-void menu_select() {
+void menu_enter_sub() {
     s_last_menu_activity_ms = now_ms();
-    if (s_menu_channel_active) {
-        radio::set_channel(s_menu_channel_candidate);
-        nvs_put_u8("ch", s_menu_channel_candidate);
-        printf("[Menu] Radio Channel confirmed: %u\n", s_menu_channel_candidate);
-        s_menu_channel_active = false;
-        audio::prompt_clear();
-        audio::prompt(wt::PROMPT_CONNECTED);
-        return;
-    }
     switch (s_menu_item) {
+        case MENU_WALK:
+            s_menu_sub = true;
+            audio::prompt_clear();
+            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
+            printf("[Menu] Entered Walk Mode. Current: %s. Click: toggle, Long: back.\n",
+                   s_walk_mode ? "ON" : "OFF");
+            break;
+        case MENU_TALK_MODE:
+            s_menu_sub = true;
+            audio::prompt_clear();
+            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+            printf("[Menu] Entered Talk Mode. Current: %s. Click: toggle, Long: back.\n",
+                   s_ptt_mode ? "PTT" : "VOX");
+            break;
+        case MENU_CHANNEL:
+            s_menu_sub = true;
+            s_menu_channel_candidate = radio::channel();
+            audio::prompt_clear();
+            audio::prompt(wt::PROMPT_MENU_CHANNEL);
+            if (s_menu_channel_candidate >= 1 && s_menu_channel_candidate <= 13) {
+                audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (s_menu_channel_candidate - 1)));
+            }
+            printf("[Menu] Entered Channel. Current: %u. Click: next, Long: back.\n",
+                   s_menu_channel_candidate);
+            break;
         case MENU_VOICE_NOTE:
             exit_menu(false);
             start_voicemail_recording();
@@ -1004,11 +1020,26 @@ void menu_select() {
             exit_menu(false);
             radar_check();
             break;
+        case MENU_POWER_OFF:
+            system_power_off();
+            break;
+        case MENU_EXIT:
+            exit_menu(true);
+            break;
+        default:
+            exit_menu(true);
+            break;
+    }
+}
+
+void menu_sub_action() {
+    s_last_menu_activity_ms = now_ms();
+    switch (s_menu_item) {
         case MENU_WALK:
             toggle_walk_mode();
             audio::prompt_clear();
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
-            // Stays in menu!
+            printf("[Menu] Walk mode toggled: %s\n", s_walk_mode ? "ON" : "OFF");
             break;
         case MENU_TALK_MODE:
             s_ptt_mode = !s_ptt_mode;
@@ -1021,23 +1052,41 @@ void menu_select() {
             }
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
-            printf("[Menu] Talk mode set to: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
-            // Stays in menu!
+            printf("[Menu] Talk mode toggled: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
             break;
         case MENU_CHANNEL:
-            s_menu_channel_active = true;
-            s_menu_channel_candidate = radio::channel();
-            printf("[Menu] Channel selector active. Current: %u. Click to cycle, hold to confirm.\n", s_menu_channel_candidate);
-            announce_current_menu_item();
-            break;
-        case MENU_POWER_OFF:
-            system_power_off();
-            break;
-        case MENU_EXIT:
-            exit_menu(true);
+            s_menu_channel_candidate = (s_menu_channel_candidate % 13) + 1;
+            audio::prompt_clear();
+            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (s_menu_channel_candidate - 1)));
+            printf("[Menu] Channel candidate: %u\n", s_menu_channel_candidate);
             break;
         default:
-            exit_menu(true);
+            break;
+    }
+}
+
+void menu_back_to_main() {
+    s_last_menu_activity_ms = now_ms();
+    s_menu_sub = false;
+    audio::prompt_clear();
+    switch (s_menu_item) {
+        case MENU_CHANNEL:
+            radio::set_channel(s_menu_channel_candidate);
+            nvs_put_u8("ch", s_menu_channel_candidate);
+            printf("[Menu] Channel saved: %u. Back to main menu.\n", s_menu_channel_candidate);
+            audio::prompt(wt::PROMPT_CONNECTED);
+            audio::prompt(wt::PROMPT_MENU_CHANNEL);
+            break;
+        case MENU_WALK:
+            printf("[Menu] Walk mode saved (%s). Back to main menu.\n", s_walk_mode ? "ON" : "OFF");
+            audio::prompt(wt::PROMPT_MENU_WALK);
+            break;
+        case MENU_TALK_MODE:
+            printf("[Menu] Talk mode saved (%s). Back to main menu.\n", s_ptt_mode ? "PTT" : "VOX");
+            audio::prompt(wt::PROMPT_MENU_PTT);
+            break;
+        default:
+            announce_main_menu_item();
             break;
     }
 }
@@ -1447,14 +1496,9 @@ extern "C" void app_main() {
             }
         }
 
-        // BOOT button double-click timeout inside menu
-        if (s_boot_click_count > 0 && (now - s_last_boot_click_ms > kMultiClickWindowMs)) {
-            s_boot_click_count = 0;
-        }
-
         // Audio Voice Menu inactivity timeout (relaxed 30 seconds)
         if (s_menu_active && (now - s_last_menu_activity_ms >= 30000)) {
-            if (s_menu_channel_active) {
+            if (s_menu_sub && s_menu_item == MENU_CHANNEL) {
                 radio::set_channel(s_menu_channel_candidate);
                 nvs_put_u8("ch", s_menu_channel_candidate);
                 audio::prompt_clear();
