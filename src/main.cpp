@@ -61,12 +61,11 @@ static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 // --- Audio Voice Menu & PTT state ---
 enum MenuItem : uint8_t {
-    MENU_WALK = 0,
+    MENU_VOICE_NOTE = 0,
     MENU_TALK_MODE,
     MENU_CHANNEL,
     MENU_RADAR,
-    MENU_VOICE_NOTE,
-    MENU_POWER_OFF,
+    MENU_WALK,
     MENU_EXIT,
     MENU_COUNT
 };
@@ -74,7 +73,7 @@ enum MenuItem : uint8_t {
 static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
 static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
 static bool s_menu_active = false;
-static MenuItem s_menu_item = MENU_WALK;
+static MenuItem s_menu_item = MENU_VOICE_NOTE;
 static uint32_t s_last_menu_activity_ms = 0;
 
 void broadcast_state();
@@ -84,7 +83,8 @@ void menu_next();
 void menu_prev();
 void menu_action();
 void announce_main_menu_item();
-void system_power_off();
+uint8_t scan_best_channel();
+void sync_channel_to_mesh(uint8_t target_ch);
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -821,6 +821,25 @@ void on_rx(const radio::Rx& rx) {
             }
             break;
         }
+        case wt::MSG_CHANNEL_SWITCH: {
+            if (rx.len >= sizeof(wt::ChannelSwitchPayload)) {
+                wt::ChannelSwitchPayload csp;
+                memcpy(&csp, rx.plain, sizeof(csp));
+                if (csp.target_channel >= 1 && csp.target_channel <= 13) {
+                    if (csp.target_channel != radio::channel()) {
+                        printf("\n*** [CHANNEL SYNC] Remote command from %08lx: switching to Channel %u ***\n\n",
+                               (unsigned long)csp.sender, csp.target_channel);
+                        radio::set_channel(csp.target_channel);
+                        nvs_put_u8("ch", csp.target_channel);
+                        audio::prompt_clear();
+                        audio::prompt(wt::PROMPT_MENU_CHANNEL);
+                        audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (csp.target_channel - 1)));
+                        led::flash(led::Color::Green, 250);
+                    }
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -887,22 +906,110 @@ void toggle_walk_mode() {
 
 // --- Audio Voice Menu Engine -----------------------------------------------------------
 
-void system_power_off() {
-    printf("\n*** [SYSTEM] Powering off into Deep Sleep... ***\n\n");
-    nvs_put_u8("pwr_state", 0);
+uint8_t scan_best_channel() {
     audio::prompt_clear();
-    audio::prompt(wt::PROMPT_POWER_OFF);
-    vTaskDelay(pdMS_TO_TICKS(650));
-    led::set(led::Color::Off);
+    audio::tone(800, 35, 300);
+    audio::tone(0, 15);
+    audio::tone(1000, 45, 300);
+    printf("\n*** [CHANNEL SCAN] Scanning 2.4GHz WiFi spectrum for clearest channel... ***\n");
 
-    // Wakeup on BOOT button (GPIO 0) and optional external Talk button (GPIO 4)
-    esp_sleep_enable_ext0_wakeup(cfg::kPinBoot, 0);
-    uint64_t mask = (1ULL << cfg::kPinBoot);
-    if (cfg::kPinTalk != GPIO_NUM_NC) {
-        mask |= (1ULL << cfg::kPinTalk);
+    wifi_scan_config_t scan_config = {};
+    scan_config.show_hidden = true;
+    scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan_config.scan_time.active.min = 50;
+    scan_config.scan_time.active.max = 100;
+
+    uint8_t cur_ch = radio::channel();
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi scan start failed (%d), selecting next channel", err);
+        radio::set_channel(cur_ch);
+        return (cur_ch % 13) + 1;
     }
-    esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_deep_sleep_start();
+
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+
+    uint32_t congestion[14] = {0}; // channels 1..13
+    if (ap_count > 0) {
+        wifi_ap_record_t* ap_list = static_cast<wifi_ap_record_t*>(malloc(sizeof(wifi_ap_record_t) * ap_count));
+        if (ap_list) {
+            esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+            for (uint16_t i = 0; i < ap_count; i++) {
+                uint8_t ch = ap_list[i].primary;
+                int8_t rssi = ap_list[i].rssi;
+                // Stronger AP signal -> heavier congestion penalty
+                uint32_t weight = static_cast<uint32_t>(rssi > -100 ? (rssi + 105) : 5);
+                if (ch >= 1 && ch <= 13) {
+                    congestion[ch] += weight * 3;
+                    if (ch > 1) congestion[ch - 1] += weight * 2;
+                    if (ch < 13) congestion[ch + 1] += weight * 2;
+                    if (ch > 2) congestion[ch - 2] += weight;
+                    if (ch < 12) congestion[ch + 2] += weight;
+                }
+            }
+            free(ap_list);
+        }
+    }
+
+    // Always restore current channel after scan finishes
+    radio::set_channel(cur_ch);
+
+    printf("=== [2.4GHz Spectrum Analysis (%u APs detected)] ===\n", ap_count);
+    for (uint8_t c = 1; c <= 13; c++) {
+        printf("  Channel %2u: %s | Congestion: %lu\n",
+               c, (c == cur_ch) ? "[CURRENT]" : "         ", (unsigned long)congestion[c]);
+    }
+
+    uint8_t best_ch = cur_ch;
+    uint32_t min_congestion = UINT32_MAX;
+
+    for (uint8_t c = 1; c <= 13; c++) {
+        if (congestion[c] < min_congestion) {
+            min_congestion = congestion[c];
+            best_ch = c;
+        } else if (congestion[c] == min_congestion && min_congestion == 0 && c != cur_ch) {
+            best_ch = c;
+        }
+    }
+
+    if (best_ch == cur_ch && min_congestion == 0) {
+        best_ch = (cur_ch % 13) + 1;
+    }
+
+    printf(">>> Selected Clearest Channel: %u (score %lu) <<<\n\n", best_ch, (unsigned long)min_congestion);
+    return best_ch;
+}
+
+void sync_channel_to_mesh(uint8_t target_ch) {
+    wt::ChannelSwitchPayload csp;
+    csp.sender = radio::self_id();
+    csp.target_channel = target_ch;
+    csp.seq = esp_random();
+
+    printf("\n*** [CHANNEL SYNC] Broadcasting switch to Channel %u to mesh... ***\n", target_ch);
+
+    // Send 5 packets on current channel so all peers on this channel receive the switch command
+    for (int i = 0; i < 5; i++) {
+        radio::send(wt::MSG_CHANNEL_SWITCH, reinterpret_cast<const uint8_t*>(&csp), sizeof(csp));
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+
+    // Switch local channel and persist to NVS
+    radio::set_channel(target_ch);
+    nvs_put_u8("ch", target_ch);
+
+    // Send 3 confirmation packets on new channel
+    for (int i = 0; i < 3; i++) {
+        radio::send(wt::MSG_CHANNEL_SWITCH, reinterpret_cast<const uint8_t*>(&csp), sizeof(csp));
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_MENU_CHANNEL);
+    audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (target_ch - 1)));
+    led::flash(led::Color::Green, 200);
+    printf("*** [CHANNEL SYNC] Local node active on Channel %u ***\n\n", target_ch);
 }
 
 void exit_menu(bool play_tone) {
@@ -920,8 +1027,8 @@ void exit_menu(bool play_tone) {
 void announce_main_menu_item() {
     audio::prompt_clear();
     switch (s_menu_item) {
-        case MENU_WALK:
-            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
+        case MENU_VOICE_NOTE:
+            audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
             break;
         case MENU_TALK_MODE:
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
@@ -935,11 +1042,8 @@ void announce_main_menu_item() {
         case MENU_RADAR:
             audio::prompt(wt::PROMPT_MENU_RADAR);
             break;
-        case MENU_VOICE_NOTE:
-            audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
-            break;
-        case MENU_POWER_OFF:
-            audio::prompt(wt::PROMPT_POWER_OFF);
+        case MENU_WALK:
+            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
             break;
         case MENU_EXIT:
             audio::prompt(wt::PROMPT_MENU_EXIT);
@@ -951,12 +1055,12 @@ void announce_main_menu_item() {
 
 void enter_menu() {
     s_menu_active = true;
-    s_menu_item = MENU_WALK;
+    s_menu_item = MENU_VOICE_NOTE;
     s_last_menu_activity_ms = now_ms();
     audio::prompt_clear();
     audio::prompt(wt::PROMPT_MENU);
-    audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
-    printf("[Menu] Entered Audio Menu. Click: next, Hold: action/toggle, Hold 2.5s: exit.\n");
+    audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
+    printf("[Menu] Entered Audio Menu. 1st: Voice Note. Click: next, Hold: action, Hold 2.5s: exit.\n");
 }
 
 void menu_next() {
@@ -976,11 +1080,9 @@ void menu_prev() {
 void menu_action() {
     s_last_menu_activity_ms = now_ms();
     switch (s_menu_item) {
-        case MENU_WALK:
-            toggle_walk_mode();
-            audio::prompt_clear();
-            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
-            printf("[Menu] Walk mode toggled: %s\n", s_walk_mode ? "ON" : "OFF");
+        case MENU_VOICE_NOTE:
+            exit_menu(false);
+            start_voicemail_recording();
             break;
 
         case MENU_TALK_MODE:
@@ -1004,12 +1106,8 @@ void menu_action() {
             break;
 
         case MENU_CHANNEL: {
-            uint8_t next_ch = (radio::channel() % 13) + 1;
-            radio::set_channel(next_ch);
-            nvs_put_u8("ch", next_ch);
-            audio::prompt_clear();
-            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (next_ch - 1)));
-            printf("[Menu] Channel changed to: %u\n", next_ch);
+            uint8_t best_ch = scan_best_channel();
+            sync_channel_to_mesh(best_ch);
             break;
         }
 
@@ -1018,13 +1116,11 @@ void menu_action() {
             radar_check();
             break;
 
-        case MENU_VOICE_NOTE:
-            exit_menu(false);
-            start_voicemail_recording();
-            break;
-
-        case MENU_POWER_OFF:
-            system_power_off();
+        case MENU_WALK:
+            toggle_walk_mode();
+            audio::prompt_clear();
+            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
+            printf("[Menu] Walk mode toggled: %s\n", s_walk_mode ? "ON" : "OFF");
             break;
 
         case MENU_EXIT:
@@ -1179,8 +1275,9 @@ void console_task(void*) {
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
         }
-        else if (!strcmp(line, "off") || !strcmp(line, "poweroff") || !strcmp(line, "shutdown")) {
-            system_power_off();
+        else if (!strcmp(line, "scan")) {
+            uint8_t best_ch = scan_best_channel();
+            sync_channel_to_mesh(best_ch);
         }
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
         else if (!strcmp(line, "vm") || !strcmp(line, "record")) {
@@ -1208,10 +1305,9 @@ void console_task(void*) {
         } else if (!strcmp(line, "selftest")) selftest();
         else if (!strcmp(line, "reboot")) esp_restart();
         else if (!strncmp(line, "ch ", 3)) {
-            int ch = atoi(line + 3);
-            if (radio::set_channel(static_cast<uint8_t>(ch))) {
-                nvs_put_u8("ch", static_cast<uint8_t>(ch));
-                printf("channel %d\n", ch);
+            int target_ch = atoi(line + 3);
+            if (target_ch >= 1 && target_ch <= 13) {
+                sync_channel_to_mesh(static_cast<uint8_t>(target_ch));
             } else printf("channel must be 1..13\n");
         } else if (!strncmp(line, "name ", 5) && line[5]) {
             xSemaphoreTake(s_app_mtx, portMAX_DELAY);
@@ -1259,32 +1355,7 @@ extern "C" void app_main() {
     }
     ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
 
-    esp_reset_reason_t rst_reason = esp_reset_reason();
-    uint8_t pwr_state = nvs_u8("pwr_state", 0); // default 0: shutdown until BOOT is pressed
-
-    if (rst_reason == ESP_RST_DEEPSLEEP) {
-        // Woke up from Deep Sleep because user pressed BOOT!
-        pwr_state = 1;
-        nvs_put_u8("pwr_state", 1);
-        ESP_LOGI(TAG, "Woke up from Deep Sleep via button press -> System Online");
-    } else {
-        // Cold boot, power-on, brownout, panic, watchdog, or restart
-        if (pwr_state == 0) {
-            // Deliberately shut down earlier; returning immediately to Deep Sleep until BOOT is pressed
-            ESP_LOGI(TAG, "System was turned off; returning to Deep Sleep. Press BOOT to power on.");
-            for (gpio_num_t p : {cfg::kPinBoot, cfg::kPinTalk}) init_gpio(p);
-            esp_sleep_enable_ext0_wakeup(cfg::kPinBoot, 0);
-            uint64_t mask = (1ULL << cfg::kPinBoot);
-            if (cfg::kPinTalk != GPIO_NUM_NC) mask |= (1ULL << cfg::kPinTalk);
-            esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
-            esp_deep_sleep_start();
-        } else {
-            // Was running online when power was disconnected or glitched -> auto-recover online!
-            ESP_LOGI(TAG, "Auto-recovery: restoring online state after reset (reason %d)", rst_reason);
-            pwr_state = 1;
-            nvs_put_u8("pwr_state", 1);
-        }
-    }
+    ESP_LOGI(TAG, "ESP32 Walkie-Talkie Online (reset reason: %d)", esp_reset_reason());
 
     s_app_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());

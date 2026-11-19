@@ -46,9 +46,16 @@ enum MsgType : uint8_t {
     MSG_RANGE_RESP = 8,
     MSG_DISTRESS   = 9,
     MSG_VOICEMAIL  = 10,
+    MSG_CHANNEL_SWITCH = 11,
 };
 
 #pragma pack(push, 1)
+struct ChannelSwitchPayload {
+    uint32_t sender;
+    uint8_t  target_channel;
+    uint32_t seq;
+};
+
 struct DistressPayload {
     uint32_t sender;
     uint8_t  active; // 1 = SOS active, 0 = all-clear / cancelled
