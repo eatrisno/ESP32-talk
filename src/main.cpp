@@ -125,7 +125,7 @@ void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet = fa
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
 // Debug Audio setting & anti-chatter audio alerts
-static bool     s_debug_audio = false; // false = Quiet Snowboard Mode, true = Verbose Debug Alerts
+static bool     s_debug_audio = false; // false = Quiet Mode, true = Verbose Debug Alerts
 static uint32_t s_last_connect_prompt_ms = 0;
 static uint32_t s_last_disconnect_prompt_ms = 0;
 
@@ -1286,16 +1286,18 @@ void collaborative_channel_scan(bool quiet) {
     if (s_fallback_active || (s_recovered_on_backup_ms > 0)) {
         need_primary_switch = (best_ch != s_primary_channel);
     } else if (best_ch != s_primary_channel) {
-        // Hysteresis: only switch if current channel is congested (>= 25)
-        // AND best channel is better by at least 25 points.
-        if (cur_congestion >= 25 && cur_congestion > min1 + 25) {
+        // Strict Hysteresis: only switch if current channel has congestion (>= 50)
+        // AND candidate channel is substantially cleaner (either >150 points better or >40% cleaner).
+        bool substantial_improvement = (cur_congestion > min1 + 150) ||
+                                       (cur_congestion >= 50 && (min1 * 10 <= cur_congestion * 6));
+        if (cur_congestion >= 50 && substantial_improvement) {
             need_primary_switch = true;
-            printf("*** [AUTO-CONSENSUS] Area congestion detected on Ch %u (Score: %lu vs best Ch %u: %lu). Initiating switch... ***\n",
+            printf("*** [MESH AUTO-CONSENSUS] Area congestion detected on Ch %u (Score: %lu vs best Ch %u: %lu, >40%% cleaner). Initiating switch... ***\n",
                    s_primary_channel, (unsigned long)cur_congestion, best_ch, (unsigned long)min1);
         } else {
             // Retain current channel to avoid unnecessary hops
             best_ch = s_primary_channel;
-            printf("*** [AUTO-CONSENSUS] Current Ch %u remains adequate (Score: %lu vs best Ch: %lu). Retaining channel. ***\n",
+            printf("*** [MESH AUTO-CONSENSUS] Current Ch %u remains adequate (Score: %lu vs best Ch: %lu). Retaining channel. ***\n",
                    s_primary_channel, (unsigned long)cur_congestion, (unsigned long)min1);
         }
     }
@@ -1587,7 +1589,7 @@ void help() {
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
            "  scan       collaborative spectrum scan: consensus best channel & backup for all nodes\n"
            "  ftm        measure precise distance via Wi-Fi FTM (Fine Timing Measurement)\n"
-           "  debug      toggle quiet snowboard mode vs verbose debug alerts\n"
+           "  debug      toggle quiet mode vs verbose debug alerts\n"
            "  + / -      volume\n"
            "  p          ping all nodes\n"
            "  s          status, peers, counters\n"
@@ -1642,7 +1644,7 @@ void console_task(void*) {
         else if (!strcmp(line, "debug")) {
             s_debug_audio = !s_debug_audio;
             nvs_put_u8("dbg", s_debug_audio ? 1 : 0);
-            printf("\nDebug Audio / Verbose Alerts: %s\n", s_debug_audio ? "ON (Verbose Alerts)" : "OFF (Quiet Snowboard Mode)");
+            printf("\nDebug Audio / Verbose Alerts: %s\n", s_debug_audio ? "ON (Verbose Alerts)" : "OFF (Quiet Mode)");
             printf("  When OFF: Anti-chatter enabled. No spammy 'Connected' voice prompts; gentle chimes only.\n");
             printf("  When ON: Full spoken voice alerts on every reconnect and channel scan.\n\n");
             audio::prompt_clear();
@@ -1836,7 +1838,7 @@ extern "C" void app_main() {
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
     printf("\n%s ready on channel %u (mode: %s, audio: %s). Type 'h' for commands.\n", s_name, ch,
            s_ptt_mode ? "Classic PTT" : "Hands-Free VOX",
-           s_debug_audio ? "Debug" : "Quiet Snowboard");
+           s_debug_audio ? "Debug" : "Quiet Mode");
 
     s_boot_ms = now_ms();
     wt::ButtonDetector headset_btn, boot_btn, up, down;
@@ -2142,8 +2144,48 @@ extern "C" void app_main() {
             }
         }
 
+        // Dynamic Mesh Auto-Consensus:
+        // Evaluates mesh RF spectrum periodically (every 5 minutes cooldown) or when link degrades (> 15s silence),
+        // but ONLY if the channel is idle and strictly controlled by the coordinator.
+        static uint32_t s_last_mesh_consensus_ms = 0;
+        uint32_t rx_peer_ms = s_last_peer_rx_ms;
+        uint32_t peer_elapsed = (rx_peer_ms > 0 && cur_now >= rx_peer_ms) ? (cur_now - rx_peer_ms) : 0;
+        bool link_degraded = (rx_peer_ms > 0 && cur_now >= rx_peer_ms && peer_elapsed >= 15000 && !s_fallback_active);
+        bool periodic_check = (cur_now - s_last_mesh_consensus_ms >= 300000); // 5 minutes cooldown
 
+        if ((periodic_check || link_degraded) &&
+            !audio::talking() && !audio::receiving() && !audio::prompt_busy() &&
+            (cur_now - talk_since > 10000) && !s_vm_recording && !s_menu_active &&
+            !s_distress_active && (s_distress_peer == 0) &&
+            !s_boot_hunting_active && (s_recovered_on_backup_ms == 0)) {
 
+            bool is_coordinator = true;
+            int peer_count = 0;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used) {
+                    peer_count++;
+                    if (p->id < radio::self_id()) {
+                        is_coordinator = false;
+                        break;
+                    }
+                }
+            }
+            radio::peers_unlock();
+
+            if (is_coordinator && peer_count > 0) {
+                s_last_mesh_consensus_ms = cur_now;
+                if (link_degraded) {
+                    printf("\n*** [MESH AUTO-CONSENSUS] RF link degraded (no peer for %lu s). Checking spectrum... ***\n",
+                           (unsigned long)(peer_elapsed / 1000));
+                } else {
+                    printf("\n*** [MESH AUTO-CONSENSUS] Periodic background RF evaluation (5m cooldown)... ***\n");
+                }
+                collaborative_channel_scan(true /* quiet */);
+            } else if (periodic_check) {
+                s_last_mesh_consensus_ms = cur_now;
+            }
+        }
         update_led();
         vTaskDelay(pdMS_TO_TICKS(10));
     }

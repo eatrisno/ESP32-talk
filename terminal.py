@@ -225,7 +225,7 @@ def print_help():
   {CYAN}2: <cmd>{RESET}       Send command to Node 2 only (e.g. '2: scan')
   {CYAN}test-switch [N]{RESET} Test auto channel propagation (default Ch 6 or N)
   {CYAN}test-ping{RESET}      Test radio ping round-trip
-  {CYAN}debug{RESET}          Toggle quiet snowboard mode vs verbose debug alerts
+  {CYAN}debug{RESET}          Toggle quiet mode vs verbose debug alerts
   {CYAN}s{RESET}              Print status on both nodes
   {CYAN}h / help{RESET}       Show this help
   {CYAN}quit / exit{RESET}    Exit monitor
