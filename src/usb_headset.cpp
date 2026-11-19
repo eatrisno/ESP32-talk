@@ -244,8 +244,10 @@ void hid_if_cb(hid_host_device_handle_t h, const hid_host_interface_event_t ev, 
         d->down = static_cast<uint8_t>((d->down & ~mask) | now);
         report_buttons();
     } else if (ev == HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR) {
-        ESP_LOGW(TAG, "HID transfer error");
-        // Not resubmitted by the driver: restart polling, release anything held.
+        ESP_LOGW(TAG, "HID transfer error (PTT protected by latch in app_main)");
+        // Not resubmitted by the driver: restart polling.
+        // d->down is cleared here as we cannot know the actual button state after the error.
+        // The app_main hid_talk_held latch prevents this from dropping PTT mid-transmission.
         d->down = 0;
         report_buttons();
         hid_host_device_stop(h);

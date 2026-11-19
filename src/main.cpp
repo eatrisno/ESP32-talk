@@ -1422,6 +1422,9 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
+    // HID TALK latch: set on press-down edge, cleared only on explicit release edge.
+    // Prevents USB HID transfer errors (which force d->down=0) from dropping PTT mid-transmission.
+    bool hid_talk_held = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
@@ -1462,6 +1465,7 @@ extern "C" void app_main() {
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
+            hid_talk_held = true;   // latch ON at press-down edge
         }
         if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= 400)) {
             hid_talk_long_sent = true;
@@ -1469,6 +1473,7 @@ extern "C" void app_main() {
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
             // On HID TALK release: only fire a click event in Hands-Free mode.
             // In PTT mode, the hold/release is handled exclusively by ptt_raw_down block below.
+            hid_talk_held = false;  // latch OFF only on explicit release edge
             if (!s_ptt_mode && !hid_talk_long_sent) {
                 handle_press(wt::Press::Click, 0);
             }
@@ -1487,8 +1492,10 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Classic PTT mode: strictly middle HEADSET button to talk, release to mute with roger beep
-        bool ptt_raw_down = (hid & wt::HID_BTN_TALK) ||
+        // Classic PTT mode: strictly middle HEADSET button to talk, release to mute with roger beep.
+        // hid_talk_held is a latch set at press-down and cleared only at release-edge, so a brief
+        // USB HID transfer error (which forces d->down=0 and clears s_hid_down) cannot drop PTT.
+        bool ptt_raw_down = hid_talk_held ||
                             (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
         static bool s_last_ptt_raw_down = false;
         static uint32_t s_talk_down_ms = 0;
@@ -1500,8 +1507,10 @@ extern "C" void app_main() {
                 if (!s_last_ptt_raw_down) {
                     s_talk_down_ms = now;
                 }
-                // Crisp 30ms start debounce:
-                if (!s_ptt_active && (now - s_talk_down_ms >= 30)) {
+                // HID is already digital/debounced; GPIO needs ~30ms. Use 10ms (1 loop) for GPIO,
+                // but activate immediately (0ms) if the source is HID (hid_talk_held).
+                uint32_t debounce_ms = hid_talk_held ? 0 : 30;
+                if (!s_ptt_active && (now - s_talk_down_ms >= debounce_ms)) {
                     s_ptt_active = true;
                     s_ptt_start_ms = now;
                     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
