@@ -907,7 +907,12 @@ void on_rx(const radio::Rx& rx) {
             break;
         }
         case wt::MSG_PING:
-            if (rx.len >= 4) radio::send(wt::MSG_PONG, rx.plain, 4);
+            if (rx.len >= 4) {
+                // Stagger pong replies based on node ID to prevent RF collision when multiple peers reply
+                uint32_t stagger_ms = (radio::self_id() & 0x03) * 12 + 4;
+                vTaskDelay(pdMS_TO_TICKS(stagger_ms));
+                radio::send(wt::MSG_PONG, rx.plain, 4);
+            }
             led::flash(led::Color::Cyan, 150);
             break;
         case wt::MSG_PONG: {
@@ -957,6 +962,9 @@ void on_rx(const radio::Rx& rx) {
                 xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                 strncpy(resp.name, s_name, sizeof(resp.name) - 1);
                 xSemaphoreGive(s_app_mtx);
+                // Stagger responder replies (5ms, 20ms, 35ms, 50ms) to eliminate simultaneous RF collision in mesh
+                uint32_t stagger_ms = (radio::self_id() & 0x03) * 15 + 5;
+                vTaskDelay(pdMS_TO_TICKS(stagger_ms));
                 radio::send(wt::MSG_RANGE_RESP, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
                 led::flash(led::Color::Cyan, 40);
             }
@@ -1240,7 +1248,7 @@ void run_range_test(int count) {
     s_range_stats.reset(count);
 
     printf("\n===========================================================\n");
-    printf("  STARTING RANGE TEST (%d probes @ LR 250k Ch %u)\n", count, radio::channel());
+    printf("  STARTING RANGE TEST (%d probes @ %s Ch %u)\n", count, radio::rate_mode_str(radio::rate_mode()), radio::channel());
     printf("===========================================================\n");
 
     for (int i = 0; i < count; i++) {
@@ -1250,7 +1258,7 @@ void run_range_test(int count) {
         req.total = count;
         uint16_t rx_before = s_range_stats.received;
         radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
-        vTaskDelay(pdMS_TO_TICKS(80));
+        vTaskDelay(pdMS_TO_TICKS(120));
         if (s_range_stats.received == rx_before) {
             audio::tone(250, 30, 350);
             printf("  probe #%-2u: [DROPPED / NO REPLY]\n", i + 1);
@@ -2202,8 +2210,8 @@ extern "C" void app_main() {
         }
 
         static uint32_t last_walk_probe = 0;
-        // Suppress walk probes during active speech so conversation has 100% clean airtime
-        if (s_walk_mode && !active_voice && (now - last_walk_probe >= 1000)) {
+        // Suppress walk probes during active speech or active range test so conversation and test have 100% clean airtime
+        if (s_walk_mode && !s_range_active && !active_voice && (now - last_walk_probe >= 1000)) {
             last_walk_probe = now;
             wt::RangeReq req;
             req.token = s_range_token;
