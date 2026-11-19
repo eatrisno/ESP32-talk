@@ -46,14 +46,28 @@ enum MsgType : uint8_t {
     MSG_RANGE_RESP = 8,
     MSG_DISTRESS   = 9,
     MSG_VOICEMAIL  = 10,
-    MSG_CHANNEL_SWITCH = 11,
+    MSG_CHANNEL_SWITCH  = 11,
+    MSG_SPECTRUM_PROBE  = 12,
+    MSG_SPECTRUM_REPORT = 13,
 };
 
 #pragma pack(push, 1)
 struct ChannelSwitchPayload {
     uint32_t sender;
     uint8_t  target_channel;
+    uint8_t  backup_channel; // 0 if none, or 1..13
     uint32_t seq;
+};
+
+struct SpectrumProbePayload {
+    uint32_t token;
+    uint32_t sender;
+};
+
+struct SpectrumReportPayload {
+    uint32_t token;
+    uint32_t sender;
+    uint16_t congestion[14]; // congestion scores for channels 1..13
 };
 
 struct DistressPayload {
