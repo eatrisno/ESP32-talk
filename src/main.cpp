@@ -980,8 +980,8 @@ void on_rx(const radio::Rx& rx) {
                     }
                     radio::peers_unlock();
 
-                    // Signal Quality percentage: -60 dBm or better = 100% (flawless link with >48dB margin), -105 dBm = 5%
-                    int pct = (rx.rssi - (-105)) * 100 / (-60 - (-105));
+                    // Signal Quality percentage: >= -68 dBm gives 100% (flawless link with >37dB margin above -105 dBm floor)
+                    int pct = (rx.rssi - (-105)) * 100 / (-68 - (-105));
                     if (pct > 100) pct = 100;
                     if (pct < 5) pct = 5;
 
@@ -1021,8 +1021,11 @@ void on_rx(const radio::Rx& rx) {
                         }
                     }
 
-                    // Bidirectional RSSI average (combines Downlink and Uplink to eliminate antenna orientation mismatch)
-                    float eff_rssi = (static_cast<float>(rx.rssi) + static_cast<float>(resp.req_rssi)) / 2.0f;
+                    // Use the unshadowed Downlink RSSI for distance estimation (prevents human body shadowing from distorting distance)
+                    float eff_rssi = static_cast<float>(rx.rssi);
+                    if (resp.req_rssi != 0 && resp.req_rssi > rx.rssi) {
+                        eff_rssi = static_cast<float>(resp.req_rssi);
+                    }
 
                     // Per-peer Exponential Moving Average filter to smooth out indoor multipath reflections
                     static struct PeerRssiFilter {
@@ -1053,10 +1056,10 @@ void on_rx(const radio::Rx& rx) {
                     }
                     float smoothed_rssi = (f_idx >= 0) ? s_peer_filters[f_idx].smoothed_rssi : eff_rssi;
 
-                    // Calibrated Log-Distance Path-Loss for ESP32-S3 PCB antenna (+21 dBm TX):
-                    // Reference RSSI at 1 meter: ~ -50 dBm
-                    // Path loss exponent n = 2.4 (indoor/outdoor mixed environment)
-                    float est_m = powf(10.0f, (-50.0f - smoothed_rssi) / 24.0f);
+                    // Calibrated Log-Distance Path-Loss for ESP32-S3 (+20 dBm TX):
+                    // Reference RSSI at 1 meter: ~ -46 dBm
+                    // Path loss exponent n = 2.3 (indoor/outdoor corridor propagation)
+                    float est_m = powf(10.0f, (-46.0f - smoothed_rssi) / 23.0f);
                     if (est_m < 0.2f) est_m = 0.2f;
 
                     char who[20] = "";
