@@ -1,5 +1,6 @@
 // ESP32-S3 mesh walkie-talkie: USB-C headset, ESP-NOW, every node in range joins one
 // conference automatically. See README.md.
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,30 @@ static bool s_menu_active = false;
 static MenuItem s_menu_item = MENU_VOICE_NOTE;
 static uint32_t s_last_menu_activity_ms = 0;
 
+// Collaborative Channel & Backup Watchdog state
+static uint8_t  s_primary_channel = cfg::kDefaultChannel;
+static uint8_t  s_backup_channel = cfg::kDefaultBackupChannel;
+static uint32_t s_last_peer_rx_ms = 0;
+static bool     s_fallback_active = false;
+static uint32_t s_fallback_switch_ms = 0;
+
+static volatile bool s_spectrum_collecting = false;
+static uint32_t s_spectrum_token = 0;
+static constexpr int kMaxSpectrumReports = 8;
+static wt::SpectrumReportPayload s_spectrum_reports[kMaxSpectrumReports];
+static int      s_num_spectrum_reports = 0;
+static uint32_t s_last_spectrum_scan_ms = 0;
+static uint16_t s_cached_local_congestion[14] = {0};
+static bool     s_has_cached_spectrum = false;
+
+// Auto-Join Channel Hunting on Boot & Auto Re-Consensus
+static bool     s_boot_hunting_active = false;
+static bool     s_boot_hunting_done = false;
+static uint32_t s_boot_ms = 0;
+static uint32_t s_last_hunt_step_ms = 0;
+static uint8_t  s_hunt_ch_index = 0;
+static uint32_t s_recovered_on_backup_ms = 0;
+
 void broadcast_state();
 void enter_menu();
 void exit_menu(bool play_tone = true);
@@ -93,10 +118,41 @@ void menu_next();
 void menu_prev();
 void menu_action();
 void announce_main_menu_item();
-uint8_t scan_best_channel();
-void sync_channel_to_mesh(uint8_t target_ch);
+void measure_local_spectrum(uint16_t out_congestion[14]);
+void collaborative_channel_scan(bool quiet = false);
+void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet = false);
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+
+// Debug Audio setting & anti-chatter audio alerts
+static bool     s_debug_audio = false; // false = Quiet Snowboard Mode, true = Verbose Debug Alerts
+static uint32_t s_last_connect_prompt_ms = 0;
+static uint32_t s_last_disconnect_prompt_ms = 0;
+
+void notify_connected(bool force_voice = false) {
+    uint32_t now = now_ms();
+    if ((force_voice || s_debug_audio) && (now - s_last_connect_prompt_ms >= 30000)) {
+        s_last_connect_prompt_ms = now;
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_CONNECTED);
+    } else {
+        // Subtle soft 2-tone chirp (pleasant and non-intrusive on slopes)
+        audio::tone(700, 18, 90);
+        audio::tone(0, 10);
+        audio::tone(950, 22, 110);
+    }
+}
+
+void notify_disconnected(bool force_voice = false) {
+    uint32_t now = now_ms();
+    if ((force_voice || s_debug_audio) && (now - s_last_disconnect_prompt_ms >= 30000)) {
+        s_last_disconnect_prompt_ms = now;
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_DISCONNECTED);
+    } else {
+        audio::tone(250, 25, 180);
+    }
+}
 
 // --- persistent settings ---------------------------------------------------------------
 
@@ -721,6 +777,7 @@ void handle_press(wt::Press p, int which) {
 // --- radio rx --------------------------------------------------------------------------
 
 void on_rx(const radio::Rx& rx) {
+    s_last_peer_rx_ms = now_ms();
     const uint32_t id = rx.hdr.sender;
     switch (rx.hdr.type) {
         case wt::MSG_AUDIO: {
@@ -806,8 +863,7 @@ void on_rx(const radio::Rx& rx) {
                     uint32_t now = now_ms();
                     if (s_walk_zone == WALK_ZONE_OUT) {
                         // Reconnected after losing signal!
-                        audio::prompt_clear();
-                        audio::prompt(wt::PROMPT_CONNECTED);
+                        notify_connected();
                         s_walk_last_spoken_ms = now;
                     } else if (new_zone != s_walk_zone && (now - s_walk_last_spoken_ms >= 5000)) {
                         // Zone transition: voice announcement of distance
@@ -835,9 +891,34 @@ void on_rx(const radio::Rx& rx) {
                         }
                     }
 
-                    printf("  probe #%-2u: OK | %3d%% Link | Downlink: %4d dBm | Uplink: %4d dBm | Zone: %s\n",
-                           resp.seq, pct, rx.rssi, resp.req_rssi,
-                           new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    // Bidirectional RSSI average (combines Downlink and Uplink to eliminate antenna orientation mismatch)
+                    float eff_rssi = (static_cast<float>(rx.rssi) + static_cast<float>(resp.req_rssi)) / 2.0f;
+
+                    // Exponential Moving Average filter to smooth out indoor multipath reflections
+                    static float s_smoothed_rssi = -50.0f;
+                    static bool s_smoothed_init = false;
+                    if (!s_smoothed_init) {
+                        s_smoothed_rssi = eff_rssi;
+                        s_smoothed_init = true;
+                    } else {
+                        s_smoothed_rssi = 0.65f * s_smoothed_rssi + 0.35f * eff_rssi;
+                    }
+
+                    // Calibrated Log-Distance Path-Loss for ESP32-S3 PCB antenna (+21 dBm TX):
+                    // Reference RSSI at 1 meter: ~ -50 dBm
+                    // Path loss exponent n = 2.4 (indoor/outdoor mixed environment)
+                    float est_m = powf(10.0f, (-50.0f - s_smoothed_rssi) / 24.0f);
+                    if (est_m < 0.2f) est_m = 0.2f;
+
+                    if (est_m < 1.0f) {
+                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
+                               new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    } else {
+                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, pct, rx.rssi, est_m, resp.req_rssi,
+                               new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    }
                 }
             }
             break;
@@ -915,16 +996,58 @@ void on_rx(const radio::Rx& rx) {
                 wt::ChannelSwitchPayload csp;
                 memcpy(&csp, rx.plain, sizeof(csp));
                 if (csp.target_channel >= 1 && csp.target_channel <= 13) {
+                    s_primary_channel = csp.target_channel;
+                    s_backup_channel = (csp.backup_channel >= 1 && csp.backup_channel <= 13) ? csp.backup_channel : 0;
+                    s_fallback_active = false;
+                    nvs_put_u8("ch", s_primary_channel);
+                    nvs_put_u8("backup_ch", s_backup_channel);
+
                     if (csp.target_channel != radio::channel()) {
-                        printf("\n*** [CHANNEL SYNC] Remote command from %08lx: switching to Channel %u ***\n\n",
-                               (unsigned long)csp.sender, csp.target_channel);
+                        printf("\n*** [CHANNEL SYNC] Remote command from %08lx: switching to Primary Ch %u (Backup: %u) ***\n\n",
+                               (unsigned long)csp.sender, csp.target_channel, csp.backup_channel);
                         radio::set_channel(csp.target_channel);
-                        nvs_put_u8("ch", csp.target_channel);
-                        audio::prompt_clear();
-                        audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
-                        audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (csp.target_channel - 1)));
+                        if (s_debug_audio) {
+                            audio::prompt_clear();
+                            audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
+                            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (csp.target_channel - 1)));
+                        } else {
+                            // Soft 2-tone melodic pip (no loud voice prompt while riding)
+                            audio::tone(500, 20, 80);
+                            audio::tone(0, 10);
+                            audio::tone(750, 20, 100);
+                        }
                         led::flash(led::Color::Green, 250);
                     }
+                }
+            }
+            break;
+        }
+        case wt::MSG_SPECTRUM_PROBE: {
+            if (rx.len >= sizeof(wt::SpectrumProbePayload)) {
+                wt::SpectrumProbePayload spp;
+                memcpy(&spp, rx.plain, sizeof(spp));
+                if (spp.sender != radio::self_id()) {
+                    uint32_t now = now_ms();
+                    if (!s_has_cached_spectrum || (now - s_last_spectrum_scan_ms > 30000)) {
+                        measure_local_spectrum(s_cached_local_congestion);
+                        s_last_spectrum_scan_ms = now;
+                        s_has_cached_spectrum = true;
+                    }
+                    wt::SpectrumReportPayload rep;
+                    rep.token = spp.token;
+                    rep.sender = radio::self_id();
+                    memcpy(rep.congestion, s_cached_local_congestion, sizeof(rep.congestion));
+                    radio::send(wt::MSG_SPECTRUM_REPORT, reinterpret_cast<const uint8_t*>(&rep), sizeof(rep));
+                }
+            }
+            break;
+        }
+        case wt::MSG_SPECTRUM_REPORT: {
+            if (s_spectrum_collecting && rx.len >= sizeof(wt::SpectrumReportPayload)) {
+                wt::SpectrumReportPayload rep;
+                memcpy(&rep, rx.plain, sizeof(rep));
+                if (rep.token == s_spectrum_token && s_num_spectrum_reports < kMaxSpectrumReports) {
+                    s_spectrum_reports[s_num_spectrum_reports++] = rep;
                 }
             }
             break;
@@ -998,23 +1121,20 @@ void toggle_walk_mode() {
 
 // --- Audio Voice Menu Engine -----------------------------------------------------------
 
-uint8_t scan_best_channel() {
-    audio::prompt_clear();
-    audio::prompt(wt::PROMPT_SCANNING_CHANNEL);
-    printf("\n*** [CHANNEL SCAN] Scanning 2.4GHz WiFi spectrum for clearest channel... ***\n");
-
+void measure_local_spectrum(uint16_t out_congestion[14]) {
+    memset(out_congestion, 0, sizeof(uint16_t) * 14);
     wifi_scan_config_t scan_config = {};
     scan_config.show_hidden = true;
     scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    scan_config.scan_time.active.min = 50;
-    scan_config.scan_time.active.max = 100;
+    scan_config.scan_time.active.min = 40;
+    scan_config.scan_time.active.max = 80;
 
     uint8_t cur_ch = radio::channel();
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi scan start failed (%d), selecting next channel", err);
+        ESP_LOGW(TAG, "WiFi scan start failed (%d)", err);
         radio::set_channel(cur_ch);
-        return (cur_ch % 13) + 1;
+        return;
     }
 
     uint16_t ap_count = 0;
@@ -1028,14 +1148,17 @@ uint8_t scan_best_channel() {
             for (uint16_t i = 0; i < ap_count; i++) {
                 uint8_t ch = ap_list[i].primary;
                 int8_t rssi = ap_list[i].rssi;
-                // Stronger AP signal -> heavier congestion penalty
                 uint32_t weight = static_cast<uint32_t>(rssi > -100 ? (rssi + 105) : 5);
                 if (ch >= 1 && ch <= 13) {
-                    congestion[ch] += weight * 3;
-                    if (ch > 1) congestion[ch - 1] += weight * 2;
-                    if (ch < 13) congestion[ch + 1] += weight * 2;
-                    if (ch > 2) congestion[ch - 2] += weight;
-                    if (ch < 12) congestion[ch + 2] += weight;
+                    // Full 20MHz bandwidth (+/- 2 ch) plus spectral sideband bleed (+/- 3 ch).
+                    // An active router on Ch 2 occupies 1..4 and bleeds sideband into Ch 5.
+                    congestion[ch] += weight * 5;
+                    if (ch >= 2) congestion[ch - 1] += weight * 4;
+                    if (ch <= 12) congestion[ch + 1] += weight * 4;
+                    if (ch >= 3) congestion[ch - 2] += weight * 3;
+                    if (ch <= 11) congestion[ch + 2] += weight * 3;
+                    if (ch >= 4) congestion[ch - 3] += weight * 2;
+                    if (ch <= 10) congestion[ch + 3] += weight * 2;
                 }
             }
             free(ap_list);
@@ -1045,39 +1168,145 @@ uint8_t scan_best_channel() {
     // Always restore current channel after scan finishes
     radio::set_channel(cur_ch);
 
-    printf("=== [2.4GHz Spectrum Analysis (%u APs detected)] ===\n", ap_count);
     for (uint8_t c = 1; c <= 13; c++) {
-        printf("  Channel %2u: %s | Congestion: %lu\n",
-               c, (c == cur_ch) ? "[CURRENT]" : "         ", (unsigned long)congestion[c]);
+        out_congestion[c] = (congestion[c] > 65535) ? 65535 : static_cast<uint16_t>(congestion[c]);
+    }
+}
+
+void collaborative_channel_scan(bool quiet) {
+    if (!quiet) {
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_SCANNING_CHANNEL);
+        printf("\n*** [COLLABORATIVE SCAN] Probing mesh peers & scanning 2.4GHz spectrum... ***\n");
+    } else {
+        printf("\n*** [AUTO RE-CONSENSUS] Background spectrum scan triggered... ***\n");
     }
 
-    uint8_t best_ch = cur_ch;
-    uint32_t min_congestion = UINT32_MAX;
+    s_spectrum_collecting = true;
+    s_spectrum_token = esp_random();
+    s_num_spectrum_reports = 0;
 
+    // Send probe to mesh peers so they start scanning
+    wt::SpectrumProbePayload probe;
+    probe.token = s_spectrum_token;
+    probe.sender = radio::self_id();
+    for (int i = 0; i < 3; i++) {
+        radio::send(wt::MSG_SPECTRUM_PROBE, reinterpret_cast<const uint8_t*>(&probe), sizeof(probe));
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+
+    // Measure local spectrum
+    measure_local_spectrum(s_cached_local_congestion);
+    s_last_spectrum_scan_ms = now_ms();
+    s_has_cached_spectrum = true;
+
+    // Wait up to 1.5s for peer reports to arrive
+    uint32_t wait_start = now_ms();
+    while (now_ms() - wait_start < 1500) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    s_spectrum_collecting = false;
+
+    printf("\n=== [SPECTRUM CONSENSUS ANALYSIS (Local + %d Peer(s))] ===\n", s_num_spectrum_reports);
+    printf("  Ch   Local  ");
+    for (int p = 0; p < s_num_spectrum_reports; p++) {
+        printf("Peer%d  ", p + 1);
+    }
+    printf("Total Congestion\n");
+
+    uint32_t total_congestion[14] = {0};
     for (uint8_t c = 1; c <= 13; c++) {
-        if (congestion[c] < min_congestion) {
-            min_congestion = congestion[c];
-            best_ch = c;
-        } else if (congestion[c] == min_congestion && min_congestion == 0 && c != cur_ch) {
+        total_congestion[c] = s_cached_local_congestion[c];
+        printf("  %2u:  %5u  ", c, s_cached_local_congestion[c]);
+        for (int p = 0; p < s_num_spectrum_reports; p++) {
+            uint16_t peer_score = s_spectrum_reports[p].congestion[c];
+            total_congestion[c] += peer_score;
+            printf("%5u  ", peer_score);
+        }
+        printf("--> %lu\n", (unsigned long)total_congestion[c]);
+    }
+
+    // Channel selection prioritizing clean high-band (Ch 13 / 11) and orthogonal backup (Ch 6)
+    // Preference order for tie-breaking: 13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2
+    static const uint8_t kPreferredChannels[] = {13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2};
+    uint8_t best_ch = 13;
+    uint32_t min1 = UINT32_MAX;
+    for (uint8_t c : kPreferredChannels) {
+        if (total_congestion[c] < min1) {
+            min1 = total_congestion[c];
             best_ch = c;
         }
     }
 
-    if (best_ch == cur_ch && min_congestion == 0) {
-        best_ch = (cur_ch % 13) + 1;
+    // Find Second Best Channel with orthogonal guard band (at least 4 channels away from best_ch)
+    uint8_t backup_ch = (best_ch == 13 || best_ch == 11) ? 6 : 13;
+    uint32_t min2 = UINT32_MAX;
+    for (uint8_t c : kPreferredChannels) {
+        if (c == best_ch) continue;
+        if (abs(static_cast<int>(c) - static_cast<int>(best_ch)) < 4) continue;
+        if (total_congestion[c] < min2) {
+            min2 = total_congestion[c];
+            backup_ch = c;
+        }
     }
 
-    printf(">>> Selected Clearest Channel: %u (score %lu) <<<\n\n", best_ch, (unsigned long)min_congestion);
-    return best_ch;
+    uint32_t cur_congestion = total_congestion[s_primary_channel];
+    bool need_primary_switch = false;
+
+    // Switch criteria:
+    // 1) Fallback was active or we just recovered on backup channel
+    // 2) Or current channel congestion is substantially worse than best channel
+    if (s_fallback_active || (s_recovered_on_backup_ms > 0)) {
+        need_primary_switch = (best_ch != s_primary_channel);
+    } else if (best_ch != s_primary_channel) {
+        // Hysteresis: only switch if current channel is congested (>= 25)
+        // AND best channel is better by at least 25 points.
+        if (cur_congestion >= 25 && cur_congestion > min1 + 25) {
+            need_primary_switch = true;
+            printf("*** [AUTO-CONSENSUS] Area congestion detected on Ch %u (Score: %lu vs best Ch %u: %lu). Initiating switch... ***\n",
+                   s_primary_channel, (unsigned long)cur_congestion, best_ch, (unsigned long)min1);
+        } else {
+            // Retain current channel to avoid unnecessary hops
+            best_ch = s_primary_channel;
+            printf("*** [AUTO-CONSENSUS] Current Ch %u remains adequate (Score: %lu vs best Ch: %lu). Retaining channel. ***\n",
+                   s_primary_channel, (unsigned long)cur_congestion, (unsigned long)min1);
+        }
+    }
+
+    if (need_primary_switch) {
+        printf("\n>>> CONSENSUS DECISION FOR MESH: <<<\n");
+        printf("  [PRIMARY] Channel %u (Score: %lu) - Best for all nodes\n", best_ch, (unsigned long)min1);
+        printf("  [BACKUP ] Channel %u (Score: %lu) - Second best for recovery (orthogonal)\n\n", backup_ch, (unsigned long)min2);
+        sync_channel_to_mesh(best_ch, backup_ch, quiet);
+    } else if (backup_ch != s_backup_channel) {
+        printf("*** [AUTO-CONSENSUS] Updating Backup Channel to %u (Primary remains Ch %u) ***\n",
+               backup_ch, s_primary_channel);
+        s_backup_channel = backup_ch;
+        nvs_put_u8("backup_ch", backup_ch);
+        wt::ChannelSwitchPayload csp;
+        csp.sender = radio::self_id();
+        csp.target_channel = s_primary_channel;
+        csp.backup_channel = backup_ch;
+        csp.seq = esp_random();
+        for (int i = 0; i < 3; i++) {
+            radio::send(wt::MSG_CHANNEL_SWITCH, reinterpret_cast<const uint8_t*>(&csp), sizeof(csp));
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    } else {
+        printf("*** [AUTO-CONSENSUS] Mesh optimal on Ch %u (Backup: %u). No change needed. ***\n",
+               s_primary_channel, s_backup_channel);
+    }
 }
 
-void sync_channel_to_mesh(uint8_t target_ch) {
+void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet) {
     wt::ChannelSwitchPayload csp;
     csp.sender = radio::self_id();
-    csp.target_channel = target_ch;
+    csp.target_channel = primary_ch;
+    csp.backup_channel = backup_ch;
     csp.seq = esp_random();
 
-    printf("\n*** [CHANNEL SYNC] Broadcasting switch to Channel %u to mesh... ***\n", target_ch);
+    printf("\n*** [CHANNEL SYNC] Broadcasting switch to Primary Ch %u (Backup: %u) to mesh... ***\n",
+           primary_ch, backup_ch);
 
     // Send 5 packets on current channel so all peers on this channel receive the switch command
     for (int i = 0; i < 5; i++) {
@@ -1086,8 +1315,12 @@ void sync_channel_to_mesh(uint8_t target_ch) {
     }
 
     // Switch local channel and persist to NVS
-    radio::set_channel(target_ch);
-    nvs_put_u8("ch", target_ch);
+    radio::set_channel(primary_ch);
+    s_primary_channel = primary_ch;
+    s_backup_channel = backup_ch;
+    s_fallback_active = false;
+    nvs_put_u8("ch", primary_ch);
+    nvs_put_u8("backup_ch", backup_ch);
 
     // Send 3 confirmation packets on new channel
     for (int i = 0; i < 3; i++) {
@@ -1095,11 +1328,18 @@ void sync_channel_to_mesh(uint8_t target_ch) {
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 
-    audio::prompt_clear();
-    audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
-    audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (target_ch - 1)));
+    if (!quiet && s_debug_audio) {
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
+        audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (primary_ch - 1)));
+    } else {
+        // Soft 2-tone melodic pip (no loud voice prompt while riding)
+        audio::tone(500, 20, 80);
+        audio::tone(0, 10);
+        audio::tone(750, 20, 100);
+    }
     led::flash(led::Color::Green, 200);
-    printf("*** [CHANNEL SYNC] Local node active on Channel %u ***\n\n", target_ch);
+    printf("*** [CHANNEL SYNC] Local node active on Primary Ch %u (Backup: %u) ***\n\n", primary_ch, backup_ch);
 }
 
 void exit_menu(bool play_tone) {
@@ -1223,9 +1463,11 @@ void print_status() {
     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
     memcpy(name, s_name, sizeof name);
     xSemaphoreGive(s_app_mtx);
-    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s  mode %s%s\n", name, (unsigned long)radio::self_id(),
-           radio::channel(), audio::volume(), audio::talking() ? "OPEN" : "muted",
+    printf("\n%s  node %08lx  ch %u (pri %u, bkp %u%s)  vol %u%%  mic %s  mode %s%s%s\n", name, (unsigned long)radio::self_id(),
+           radio::channel(), s_primary_channel, s_backup_channel, s_fallback_active ? " [FALLBACK]" : "",
+           audio::volume(), audio::talking() ? "OPEN" : "muted",
            s_ptt_mode ? "PTT" : "VOX Hands-Free",
+           s_debug_audio ? "  [DEBUG AUDIO]" : "  [QUIET AUDIO]",
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
     printf("  peers:\n");
@@ -1316,10 +1558,14 @@ void help() {
            "  sos        distress SOS on/off (same as holding button 2.5s)\n"
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
+           "  scan       collaborative spectrum scan: consensus best channel & backup for all nodes\n"
+           "  ftm        measure precise distance via Wi-Fi FTM (Fine Timing Measurement)\n"
+           "  debug      toggle quiet snowboard mode vs verbose debug alerts\n"
            "  + / -      volume\n"
            "  p          ping all nodes\n"
            "  s          status, peers, counters\n"
            "  ch N       radio channel 1..13 (all nodes must match)\n"
+           "  backup N   set backup channel 0..13 (0 = disabled)\n"
            "  name X     set this node's name\n"
            "  loop       loopback test: hear your own voice through the codec\n"
            "  selftest   check headset streams and the audio path\n"
@@ -1366,9 +1612,50 @@ void console_task(void*) {
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
         }
+        else if (!strcmp(line, "debug")) {
+            s_debug_audio = !s_debug_audio;
+            nvs_put_u8("dbg", s_debug_audio ? 1 : 0);
+            printf("\nDebug Audio / Verbose Alerts: %s\n", s_debug_audio ? "ON (Verbose Alerts)" : "OFF (Quiet Snowboard Mode)");
+            printf("  When OFF: Anti-chatter enabled. No spammy 'Connected' voice prompts; gentle chimes only.\n");
+            printf("  When ON: Full spoken voice alerts on every reconnect and channel scan.\n\n");
+            audio::prompt_clear();
+            audio::tone(s_debug_audio ? 800 : 400, 30, 200);
+        }
         else if (!strcmp(line, "scan")) {
-            uint8_t best_ch = scan_best_channel();
-            sync_channel_to_mesh(best_ch);
+            collaborative_channel_scan();
+        }
+        else if (!strcmp(line, "ftm")) {
+            uint8_t direct_mac[6] = {0};
+            bool found_peer = false;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used && p->hops == 0) {
+                    for (int i = 0; i < 6; i++) {
+                        if (p->mac[i] != 0) {
+                            memcpy(direct_mac, p->mac, 6);
+                            found_peer = true;
+                            break;
+                        }
+                    }
+                    if (found_peer) break;
+                }
+            }
+            radio::peers_unlock();
+            if (found_peer) {
+                wifi_ftm_initiator_cfg_t ftmi_cfg = {};
+                memcpy(ftmi_cfg.resp_mac, direct_mac, 6);
+                ftmi_cfg.channel = radio::channel();
+                ftmi_cfg.frm_count = 16;
+                ftmi_cfg.burst_period = 2;
+                printf("[FTM] Measuring nanosecond RTT distance to peer %02x:%02x:%02x:%02x:%02x:%02x on Ch %u...\n",
+                       direct_mac[0], direct_mac[1], direct_mac[2], direct_mac[3], direct_mac[4], direct_mac[5], radio::channel());
+                esp_err_t err = esp_wifi_ftm_initiate_session(&ftmi_cfg);
+                if (err != ESP_OK) {
+                    printf("[FTM] Failed to initiate session: %s\n", esp_err_to_name(err));
+                }
+            } else {
+                printf("[FTM] No direct peer MAC available in peer table. Send a ping or walk probe first!\n");
+            }
         }
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
         else if (!strcmp(line, "vm") || !strcmp(line, "record")) {
@@ -1398,8 +1685,15 @@ void console_task(void*) {
         else if (!strncmp(line, "ch ", 3)) {
             int target_ch = atoi(line + 3);
             if (target_ch >= 1 && target_ch <= 13) {
-                sync_channel_to_mesh(static_cast<uint8_t>(target_ch));
+                sync_channel_to_mesh(static_cast<uint8_t>(target_ch), s_backup_channel);
             } else printf("channel must be 1..13\n");
+        } else if (!strncmp(line, "backup ", 7)) {
+            int bkp = atoi(line + 7);
+            if (bkp >= 0 && bkp <= 13) {
+                s_backup_channel = static_cast<uint8_t>(bkp);
+                nvs_put_u8("backup_ch", s_backup_channel);
+                printf("Backup channel set to: %u\n", s_backup_channel);
+            } else printf("backup channel must be 0 (none) or 1..13\n");
         } else if (!strncmp(line, "name ", 5) && line[5]) {
             xSemaphoreTake(s_app_mtx, portMAX_DELAY);
             strncpy(s_name, line + 5, sizeof s_name - 1);
@@ -1436,6 +1730,23 @@ void init_gpio(gpio_num_t pin) {
 
 bool low(gpio_num_t pin) { return gpio_get_level(pin) == 0; }
 
+static void ftm_event_handler(void* arg, esp_event_base_t event_base,
+                              int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_FTM_REPORT) {
+        wifi_event_ftm_report_t *event = static_cast<wifi_event_ftm_report_t *>(event_data);
+        if (event->status == FTM_STATUS_SUCCESS) {
+            uint32_t dist_cm = event->dist_est;
+            uint32_t rtt_ns = event->rtt_est;
+            printf("\n*** [FTM PRECISION DISTANCE] Peer %02x:%02x:%02x:%02x:%02x:%02x -> Distance: %lu cm (%.2f m) | RTT: %lu ns ***\n\n",
+                   event->peer_mac[0], event->peer_mac[1], event->peer_mac[2],
+                   event->peer_mac[3], event->peer_mac[4], event->peer_mac[5],
+                   (unsigned long)dist_cm, dist_cm / 100.0f, (unsigned long)rtt_ns);
+        } else {
+            printf("[FTM] Session status: %d (FTM measurement unavailable, using RF SNR)\n", event->status);
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" void app_main() {
@@ -1451,14 +1762,18 @@ extern "C" void app_main() {
     s_app_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_FTM_REPORT, ftm_event_handler, NULL, NULL);
 
     size_t len = sizeof s_name;
     if (nvs_get_str(s_nvs, "name", s_name, &len) != ESP_OK)
         snprintf(s_name, sizeof s_name, "node-%04x", static_cast<unsigned>(esp_random() & 0xFFFF));
     uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
+    s_primary_channel = ch;
+    s_backup_channel = nvs_u8("backup_ch", cfg::kDefaultBackupChannel);
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
     s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = (nvs_u8("walk", 0) != 0);
+    s_debug_audio = (nvs_u8("dbg", 0) != 0);
     uint8_t mic_saved = nvs_u8("mic", 0);
 
     led::start();
@@ -1492,9 +1807,11 @@ extern "C" void app_main() {
     }
     usb_headset::start(on_hid_buttons, on_headset_state);
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
-    printf("\n%s ready on channel %u (mode: %s). Type 'h' for commands.\n", s_name, ch,
-           s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
+    printf("\n%s ready on channel %u (mode: %s, audio: %s). Type 'h' for commands.\n", s_name, ch,
+           s_ptt_mode ? "Classic PTT" : "Hands-Free VOX",
+           s_debug_audio ? "Debug" : "Quiet Snowboard");
 
+    s_boot_ms = now_ms();
     wt::ButtonDetector headset_btn, boot_btn, up, down;
     uint8_t last_toggle = 0;
     uint8_t last_hid = 0;
@@ -1680,9 +1997,8 @@ extern "C" void app_main() {
                 printf("  probe #%-2u: [DROPPED] (miss %u/3)\n", s_walk_seq, s_walk_miss_count);
             } else if (s_walk_miss_count == 3) {
                 s_walk_zone = WALK_ZONE_OUT;
-                audio::prompt_clear();
-                audio::prompt(wt::PROMPT_DISCONNECTED);
-                printf("  probe #%-2u: [OUT OF RANGE] Link lost! Announcing 'Disconnected'.\n", s_walk_seq);
+                notify_disconnected();
+                printf("  probe #%-2u: [OUT OF RANGE] Link lost!\n", s_walk_seq);
             } else {
                 if (s_walk_miss_count % 2 == 0) {
                     audio::tone(140, 30, 200);
@@ -1708,6 +2024,135 @@ extern "C" void app_main() {
             } else if (now - s_last_distress_beep_ms >= 12000) {
                 s_last_distress_beep_ms = now;
                 sound_distress_alert();
+            }
+        }
+
+        // Auto-Join Channel Hunting on Boot:
+        // If a newly powered-on node doesn't hear any mesh peer after 6s on its boot channel,
+        // it hunts through priority channels [13, 6, 11, 1, 5, 8, 12, 10, 7, 9, 2, 3, 4]
+        // so it seamlessly joins any running mesh network.
+        if (!s_boot_hunting_done) {
+            if (s_last_peer_rx_ms > 0) {
+                if (s_boot_hunting_active) {
+                    uint8_t cur = radio::channel();
+                    printf("\n*** [AUTO-JOIN] Discovered and joined active mesh on Channel %u! ***\n\n", cur);
+                    s_primary_channel = cur;
+                    nvs_put_u8("ch", cur);
+                    notify_connected();
+                    broadcast_state();
+                }
+                s_boot_hunting_done = true;
+                s_boot_hunting_active = false;
+            } else if (now - s_boot_ms > 6000) {
+                static const uint8_t kHuntChannels[] = {13, 6, 11, 1, 5, 8, 12, 10, 7, 9, 2, 3, 4};
+                static constexpr size_t kNumHuntChannels = sizeof(kHuntChannels) / sizeof(kHuntChannels[0]);
+                if (!s_boot_hunting_active) {
+                    s_boot_hunting_active = true;
+                    s_hunt_ch_index = 0;
+                    s_last_hunt_step_ms = now;
+                    printf("\n*** [AUTO-JOIN] No mesh peers on boot channel %u. Hunting channels to auto-join mesh... ***\n", radio::channel());
+                } else if (now - s_last_hunt_step_ms >= 180) {
+                    s_last_hunt_step_ms = now;
+                    s_hunt_ch_index = (s_hunt_ch_index + 1) % kNumHuntChannels;
+                    radio::set_channel(kHuntChannels[s_hunt_ch_index]);
+                }
+            }
+        }
+
+        // Auto-Recovery Watchdog: if mesh link lost on primary channel for > 15s, switch to backup channel
+        static uint32_t last_watchdog_check = 0;
+        if (now - last_watchdog_check >= 1000) {
+            last_watchdog_check = now;
+            if (s_backup_channel >= 1 && s_backup_channel <= 13 &&
+                s_primary_channel >= 1 && s_primary_channel <= 13 &&
+                s_backup_channel != s_primary_channel) {
+                uint32_t time_since_peer = (s_last_peer_rx_ms > 0) ? (now - s_last_peer_rx_ms) : 0;
+                if (s_last_peer_rx_ms > 0 && time_since_peer > 15000) {
+                    if (!s_fallback_active) {
+                        s_fallback_active = true;
+                        s_fallback_switch_ms = now;
+                        radio::set_channel(s_backup_channel);
+                        printf("\n*** [WATCHDOG] Link lost for %lu s on Primary Ch %u! Falling back to Backup Ch %u... ***\n\n",
+                               (unsigned long)(time_since_peer / 1000), s_primary_channel, s_backup_channel);
+                        audio::tone(400, 35, 300);
+                        audio::tone(0, 15);
+                        audio::tone(300, 45, 300);
+                    } else if (now - s_fallback_switch_ms > 15000) {
+                        // Alternate between primary and backup every 15s to re-establish
+                        s_fallback_switch_ms = now;
+                        uint8_t next_ch = (radio::channel() == s_primary_channel) ? s_backup_channel : s_primary_channel;
+                        radio::set_channel(next_ch);
+                        printf("*** [WATCHDOG] Hunting for mesh peers on alternate Ch %u ***\n", next_ch);
+                    }
+                } else if (s_fallback_active && time_since_peer < 3000) {
+                    // Peer heard! Link restored!
+                    s_fallback_active = false;
+                    s_recovered_on_backup_ms = now;
+                    uint8_t cur = radio::channel();
+                    printf("\n*** [WATCHDOG] Reconnected with mesh peer on Backup Channel %u! ***\n\n", cur);
+                    notify_connected();
+                }
+            }
+        }
+
+        // Auto Re-Consensus on Recovery: 10s after recovering on backup channel, coordinator triggers quiet re-consensus
+        if (s_recovered_on_backup_ms > 0 && (now - s_recovered_on_backup_ms >= 10000)) {
+            s_recovered_on_backup_ms = 0;
+            bool is_coordinator = true;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used && p->id < radio::self_id()) {
+                    is_coordinator = false;
+                    break;
+                }
+            }
+            radio::peers_unlock();
+            if (is_coordinator) {
+                printf("\n*** [AUTO RE-CONSENSUS] Mesh link stable on backup channel. Calculating fresh optimal channels... ***\n");
+                collaborative_channel_scan(true /* quiet */);
+            }
+        }
+
+        // Snowboard Dynamic Auto-Consensus:
+        // Periodically (every 90s) while active, or proactively if link quality degrades (no peer for > 7s),
+        // the coordinator quietly evaluates mesh RF spectrum and switches channel ONLY if the current
+        // channel becomes congested (e.g. riding into a crowded lodge or ski lift area).
+        static uint32_t s_last_snowboard_consensus_ms = 0;
+        uint32_t peer_elapsed = (s_last_peer_rx_ms > 0) ? (now - s_last_peer_rx_ms) : 0;
+        bool link_degrading = (s_last_peer_rx_ms > 0 && peer_elapsed >= 7000 && !s_fallback_active);
+        bool periodic_due = (now - s_last_snowboard_consensus_ms >= 90000);
+
+        if ((periodic_due || link_degrading) &&
+            !audio::talking() && !audio::receiving() && !audio::prompt_busy() &&
+            (now - talk_since > 8000) && !s_vm_recording && !s_menu_active &&
+            !s_distress_active && (s_distress_peer == 0) &&
+            !s_boot_hunting_active && (s_recovered_on_backup_ms == 0)) {
+
+            bool is_coordinator = true;
+            int peer_count = 0;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used) {
+                    peer_count++;
+                    if (p->id < radio::self_id()) {
+                        is_coordinator = false;
+                        break;
+                    }
+                }
+            }
+            radio::peers_unlock();
+
+            if (is_coordinator && peer_count > 0) {
+                s_last_snowboard_consensus_ms = now;
+                if (link_degrading) {
+                    printf("\n*** [SNOWBOARD AUTO-CONSENSUS] RF link degrading (no peer for %lu s). Proactively checking spectrum... ***\n",
+                           (unsigned long)(peer_elapsed / 1000));
+                } else {
+                    printf("\n*** [SNOWBOARD AUTO-CONSENSUS] Periodic background RF evaluation (Snowboard mode)... ***\n");
+                }
+                collaborative_channel_scan(true /* quiet */);
+            } else if (periodic_due) {
+                s_last_snowboard_consensus_ms = now;
             }
         }
 

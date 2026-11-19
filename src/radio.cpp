@@ -299,12 +299,40 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     wifi_init_config_t wc = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wc));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
-    if (cfg::kLongRange) proto |= WIFI_PROTOCOL_LR;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    // Configure SoftAP for FTM Responder mode (Fine Timing Measurement)
+    wifi_config_t ap_config = {};
+    snprintf(reinterpret_cast<char*>(ap_config.ap.ssid), sizeof(ap_config.ap.ssid), "WT-%08lx", (unsigned long)s_self);
+    ap_config.ap.channel = ch;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.ftm_responder = true;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+
+    // Configure manual country info (JP: Ch 1-14, up to 21 dBm) to enable Channel 13 at maximum power
+    wifi_country_t country = {
+        .cc = "JP",
+        .schan = 1,
+        .nchan = 14,
+        .max_tx_power = cfg::kTxPowerQdBm,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+
+    // Protocol: LR for ESP-NOW + standard 802.11 for FTM nanosecond measurement frames
+    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_LR | WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N) : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_AP, proto));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Force default ESP-NOW PHY rate (250 kbps for extreme sensitivity)
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M);
+
+    // Maximize TX power (+20 dBm / +21 dBm)
     esp_wifi_set_max_tx_power(cfg::kTxPowerQdBm);
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(on_recv);
