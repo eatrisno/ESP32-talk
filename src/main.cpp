@@ -254,6 +254,27 @@ void toggle_talk() {
     ESP_LOGI(TAG, "mic %s (saved to NVS)", on ? "OPEN" : "muted");
 }
 
+void toggle_ptt() {
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    s_ptt_active = !s_ptt_active;
+    bool on = s_ptt_active;
+    audio::set_ptt_active(on);
+    audio::set_talking(on);
+    xSemaphoreGive(s_app_mtx);
+    broadcast_state();
+    if (on) {
+        audio::tone(880, 25, 350);  // Crisp walkie-talkie TX start chirp
+        ESP_LOGI(TAG, "PTT: TX ON (Toggle / 1x Click)");
+    } else {
+        // Roger beep on TX end (587Hz -> 880Hz)
+        audio::tone(587, 25, 300);
+        audio::tone(0, 10);
+        audio::tone(880, 35, 300);
+        s_last_ptt_ended_ms = now_ms();
+        ESP_LOGI(TAG, "PTT: TX OFF (Toggle / 1x Click - Roger beep sent)");
+    }
+}
+
 void send_ping() {
     uint32_t tok = static_cast<uint32_t>(esp_timer_get_time());
     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
@@ -635,13 +656,6 @@ void handle_press(wt::Press p, int which) {
         }
 
         if (p == wt::Press::Click) {
-            // If PTT was actively transmitting or just released, releasing PTT is not a button click
-            if (s_ptt_mode) {
-                if (s_ptt_active || (now - s_last_ptt_ended_ms < 600)) {
-                    return;
-                }
-            }
-
             if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
                 s_talk_click_count++;
             } else {
@@ -666,8 +680,8 @@ void handle_press(wt::Press p, int which) {
                 // Mode Call (Hands-Free VOX): 1x click toggles mic (mute / unmute)!
                 toggle_talk();
             } else {
-                // Mode PTT: Quick tap gives a subtle chirp acknowledgment
-                audio::tone(700, 20, 300);
+                // Mode PTT (Option A): 1x click toggles TX (start talk / stop talk + Roger Beep)!
+                toggle_ptt();
             }
         } else if (p == wt::Press::Long || p == wt::Press::Hold) {
             // Long and Hold on headset button are ignored (PTT talk can be held indefinitely;
@@ -1275,7 +1289,10 @@ void console_task(void*) {
         }
         line[n] = 0;
         n = 0;
-        if (!strcmp(line, "t")) toggle_talk();
+        if (!strcmp(line, "t")) {
+            if (s_ptt_mode) toggle_ptt();
+            else toggle_talk();
+        }
         else if (!strcmp(line, "m") || !strcmp(line, "menu")) {
             if (s_menu_active) exit_menu();
             else enter_menu();
@@ -1283,8 +1300,15 @@ void console_task(void*) {
         else if (!strcmp(line, "ptt")) {
             s_ptt_mode = !s_ptt_mode;
             nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-            if (audio::talking()) toggle_talk();
-            printf("Talk Mode: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
+            if (audio::talking() || s_ptt_active) {
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                s_ptt_active = false;
+                audio::set_ptt_active(false);
+                audio::set_talking(false);
+                xSemaphoreGive(s_app_mtx);
+                broadcast_state();
+            }
+            printf("Talk Mode: %s\n", s_ptt_mode ? "Toggle PTT" : "Hands-Free VOX");
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
         }
@@ -1422,9 +1446,6 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
-    // HID TALK latch: set on press-down edge, cleared only on explicit release edge.
-    // Prevents USB HID transfer errors (which force d->down=0) from dropping PTT mid-transmission.
-    bool hid_talk_held = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
@@ -1460,21 +1481,18 @@ extern "C" void app_main() {
         }
 
         // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
-        // In Hands-Free mode: click toggles mic on/off.
-        // In PTT mode: handled exclusively by ptt_raw_down block below (hold = TX, release = stop).
+        // In Hands-Free VOX mode: 1x click toggles mic (VOX gating active).
+        // In PTT mode (Option A): 1x click toggles TX (start talk / stop talk + Roger Beep).
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
-            hid_talk_held = true;   // latch ON at press-down edge
         }
         if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= 400)) {
             hid_talk_long_sent = true;
         }
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
-            // On HID TALK release: only fire a click event in Hands-Free mode.
-            // In PTT mode, the hold/release is handled exclusively by ptt_raw_down block below.
-            hid_talk_held = false;  // latch OFF only on explicit release edge
-            if (!s_ptt_mode && !hid_talk_long_sent) {
+            // On HID TALK release: fire click event for both Hands-Free and PTT Toggle mode
+            if (!hid_talk_long_sent) {
                 handle_press(wt::Press::Click, 0);
             }
         }
@@ -1492,60 +1510,38 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Classic PTT mode: strictly middle HEADSET button to talk, release to mute with roger beep.
-        // hid_talk_held is a latch set at press-down and cleared only at release-edge, so a brief
-        // USB HID transfer error (which forces d->down=0 and clears s_hid_down) cannot drop PTT.
-        bool ptt_raw_down = hid_talk_held ||
-                            (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
-        static bool s_last_ptt_raw_down = false;
-        static uint32_t s_talk_down_ms = 0;
-        static uint32_t s_ptt_start_ms = 0;
-        static uint32_t s_ptt_release_ms = 0;
+        // Optional physical GPIO 4 momentary PTT (if external switch is connected to Pin 4)
+        bool gpio_ptt_down = (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
+        static bool s_last_gpio_ptt_down = false;
+        static uint32_t s_gpio_down_ms = 0;
         if (s_ptt_mode && !s_menu_active && !s_vm_recording && !s_distress_active) {
-            if (ptt_raw_down) {
-                s_ptt_release_ms = 0;
-                if (!s_last_ptt_raw_down) {
-                    s_talk_down_ms = now;
-                }
-                // HID is already digital/debounced; GPIO needs ~30ms. Use 10ms (1 loop) for GPIO,
-                // but activate immediately (0ms) if the source is HID (hid_talk_held).
-                uint32_t debounce_ms = hid_talk_held ? 0 : 30;
-                if (!s_ptt_active && (now - s_talk_down_ms >= debounce_ms)) {
+            if (gpio_ptt_down) {
+                if (!s_last_gpio_ptt_down) s_gpio_down_ms = now;
+                if (!s_ptt_active && (now - s_gpio_down_ms >= 30)) {
                     s_ptt_active = true;
-                    s_ptt_start_ms = now;
                     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                     audio::set_ptt_active(true);
                     audio::set_talking(true);
                     xSemaphoreGive(s_app_mtx);
                     broadcast_state();
                     audio::tone(880, 25, 350); // PTT talk start chirp
-                    ESP_LOGI(TAG, "PTT: TX active (held)");
+                    ESP_LOGI(TAG, "PTT: TX active (GPIO 4 held)");
                 }
-            } else {
-                if (s_ptt_active) {
-                    if (s_ptt_release_ms == 0) s_ptt_release_ms = now;
-                    // Robust 500ms hangover and 800ms minimum TX window:
-                    // Bridges USB headset HID pulse chatter & contact bounce
-                    // Keeps transmitting continuously until the user actually releases the button
-                    if ((now - s_ptt_release_ms >= 500) && (now - s_ptt_start_ms >= 800)) {
-                        s_ptt_active = false;
-                        s_last_ptt_ended_ms = now;
-                        s_ptt_release_ms = 0;
-                        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                        audio::set_ptt_active(false);
-                        audio::set_talking(false);
-                        xSemaphoreGive(s_app_mtx);
-                        broadcast_state();
-                        // Roger beep on release (descending two-tone)
-                        audio::tone(587, 25, 300);
-                        audio::tone(0, 10);
-                        audio::tone(880, 35, 300);
-                        ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
-                    }
-                }
+            } else if (s_last_gpio_ptt_down && s_ptt_active) {
+                s_ptt_active = false;
+                s_last_ptt_ended_ms = now;
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                audio::set_ptt_active(false);
+                audio::set_talking(false);
+                xSemaphoreGive(s_app_mtx);
+                broadcast_state();
+                audio::tone(587, 25, 300);
+                audio::tone(0, 10);
+                audio::tone(880, 35, 300);
+                ESP_LOGI(TAG, "PTT: TX ended (GPIO 4 released - Roger beep)");
             }
         }
-        s_last_ptt_raw_down = ptt_raw_down;
+        s_last_gpio_ptt_down = gpio_ptt_down;
 
         // Handle pending click evaluation (for voicemail inbox 1x/2x click)
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
