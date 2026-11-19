@@ -50,6 +50,7 @@ static uint32_t s_walk_probe_sent_ms = 0;
 static uint16_t s_walk_seq = 0;
 
 static volatile bool s_distress_active = false;
+static uint32_t s_distress_activated_ms = 0;
 static volatile uint32_t s_distress_peer = 0;
 static char s_distress_peer_name[12] = "";
 static uint32_t s_last_distress_tx_ms = 0;
@@ -205,6 +206,7 @@ void toggle_distress() {
     send_distress_packet(s_distress_active);
     audio::prompt_clear();
     if (s_distress_active) {
+        s_distress_activated_ms = now_ms();
         printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
         audio::prompt(wt::PROMPT_EMERGENCY_ON);
         // Automatically enable microphone when emergency is activated!
@@ -546,7 +548,7 @@ void dismiss_inbox_voicemail() {
 
 static uint32_t s_last_talk_click_ms = 0;
 static uint8_t  s_talk_click_count = 0;
-static constexpr uint32_t kMultiClickWindowMs = 500;
+static constexpr uint32_t kMultiClickWindowMs = 600;
 
 void handle_press(wt::Press p, int which) {
     // which: 0 = Headset Talk, 1 = Vol Up, 2 = Vol Down, 3 = ESP32 BOOT button
@@ -589,8 +591,13 @@ void handle_press(wt::Press p, int which) {
 
     // --- Headset Talk button (HID & kPinTalk) -> Walkie-Talkie & Emergency SOS ---
     if (which == 0) {
+        uint32_t now = now_ms();
         if (s_distress_active) {
-            // Any click or press while distress is active immediately cancels it!
+            // Guard window: ignore any extra clicks in the initial burst of 5+ clicks
+            if (now - s_distress_activated_ms < 1500) {
+                return;
+            }
+            // After guard window, any click or press cancels distress!
             s_talk_click_count = 0;
             toggle_distress();
             return;
@@ -606,17 +613,27 @@ void handle_press(wt::Press p, int which) {
         }
 
         if (p == wt::Press::Click) {
-            uint32_t now = now_ms();
+            // If PTT was actively transmitting, releasing PTT is not a button click
+            if (s_ptt_mode && s_ptt_active) {
+                return;
+            }
+
+            if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
+                s_talk_click_count++;
+            } else {
+                s_talk_click_count = 1;
+            }
+            s_last_talk_click_ms = now;
+
+            if (s_talk_click_count >= 5) {
+                s_talk_click_count = 0;
+                ESP_LOGI(TAG, "5 rapid clicks detected -> Emergency SOS activated!");
+                toggle_distress();
+                return;
+            }
+
             if (s_vm_inbox_has_message) {
-                if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
-                    // Double click: dismiss / remove incoming voicemail
-                    s_talk_click_count = 0;
-                    dismiss_inbox_voicemail();
-                } else {
-                    // Single click: will trigger play_inbox_voicemail() when window expires
-                    s_talk_click_count = 1;
-                    s_last_talk_click_ms = now;
-                }
+                // Voicemail inbox action will be evaluated when multi-click window expires
                 return;
             }
 
@@ -628,15 +645,10 @@ void handle_press(wt::Press p, int which) {
                 // Mode PTT: Quick tap gives a subtle chirp acknowledgment
                 audio::tone(700, 20, 300);
             }
-        } else if (p == wt::Press::Long) {
-            // Pre-warning soft ticks at 1.2s indicating button is being held for distress SOS
-            audio::tone(650, 20, 350);
-            audio::tone(0, 40);
-            audio::tone(750, 25, 350);
-        } else if (p == wt::Press::Hold) {
-            // 2.5s hold: trigger distress SOS!
-            s_talk_click_count = 0;
-            toggle_distress();
+        } else if (p == wt::Press::Long || p == wt::Press::Hold) {
+            // Long and Hold on headset button are ignored (PTT talk can be held indefinitely;
+            // Emergency SOS is strictly triggered by 5 rapid clicks).
+            return;
         }
         return;
     }
@@ -1326,7 +1338,6 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
-    bool hid_talk_hold_sent = false;
     uint32_t last_beacon = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
@@ -1363,18 +1374,12 @@ extern "C" void app_main() {
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
-            hid_talk_hold_sent = false;
         }
-        if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= wt::ButtonDetector::kLongMs)) {
+        if ((hid & wt::HID_BTN_TALK) && !hid_talk_long_sent && (now - hid_talk_start >= 400)) {
             hid_talk_long_sent = true;
-            handle_press(wt::Press::Long, 0);
-        }
-        if ((hid & wt::HID_BTN_TALK) && !hid_talk_hold_sent && (now - hid_talk_start >= wt::ButtonDetector::kHoldMs)) {
-            hid_talk_hold_sent = true;
-            handle_press(wt::Press::Hold, 0);
         }
         if (!(hid & wt::HID_BTN_TALK) && (last_hid & wt::HID_BTN_TALK)) {
-            if (!hid_talk_long_sent && !hid_talk_hold_sent) {
+            if (!hid_talk_long_sent && !s_ptt_active) {
                 handle_press(wt::Press::Click, 0);
             }
         }
@@ -1435,10 +1440,14 @@ extern "C" void app_main() {
 
         // Handle pending click evaluation (for voicemail inbox 1x/2x click)
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
-            s_talk_click_count = 0;
             if (s_vm_inbox_has_message) {
-                play_inbox_voicemail();
+                if (s_talk_click_count == 1) {
+                    play_inbox_voicemail();
+                } else if (s_talk_click_count >= 2) {
+                    dismiss_inbox_voicemail();
+                }
             }
+            s_talk_click_count = 0;
         }
 
         // Audio Voice Menu inactivity timeout (relaxed 60 seconds, paused while voice prompt is playing)
