@@ -15,6 +15,7 @@ struct RangeResp {
     uint32_t token;
     uint16_t seq;
     int8_t   req_rssi;
+    char     name[12];
 };
 #pragma pack(pop)
 

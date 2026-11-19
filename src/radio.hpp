@@ -13,6 +13,7 @@ struct Rx {
     wt::Header hdr;
     uint8_t    hops;          // kDefaultTtl - ttl
     int8_t     rssi;
+    uint32_t   relay_id;      // 0 if direct, or ID of intermediate relay node
     uint8_t    plain[wt::kMaxPlain];
     size_t     len;
 };

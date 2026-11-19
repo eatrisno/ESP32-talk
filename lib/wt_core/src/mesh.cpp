@@ -65,9 +65,10 @@ bool PeerTable::fresh(const Header& h, uint32_t now_ms) const {
     return sessions_.newer(h.sender, h.session, h.seq, now_ms);
 }
 
-bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac) {
+bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac, uint32_t relay_id) {
     if (!fresh(h, now_ms)) return false;
     Peer* p = find(h.sender);
+    bool is_new = (p == nullptr);
     if (!p) {
         p = slot_for(h.sender, now_ms);
         // New slot: seed the window from memory so frames at or below the remembered seq
@@ -77,12 +78,16 @@ bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_
         return false;
     }
     sessions_.put(h.sender, h.session, h.seq, now_ms);
-    p->last_ms = now_ms;
-    p->hops = hops;
     if (hops == 0) {
+        p->hops = 0;
         p->rssi = rssi;
+        p->relay_id = 0;
         if (mac) memcpy(p->mac, mac, 6);
+    } else if (is_new || p->hops != 0 || (now_ms - p->last_ms > 5000)) {
+        p->hops = hops;
+        p->relay_id = relay_id;
     }
+    p->last_ms = now_ms;
     return true;
 }
 
@@ -106,6 +111,36 @@ int PeerTable::count() const {
     int n = 0;
     for (const auto& p : peers_) n += p.used;
     return n;
+}
+
+bool PeerTable::should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const {
+    int active_others = 0;
+    bool needs_relay = false;
+    for (const auto& p : peers_) {
+        if (!p.used || p.id == sender_id) continue;
+        if (now_ms - p.last_ms > kPeerTimeoutMs) continue;
+        active_others++;
+        // If this other peer is reached via hops, or has weak downlink/uplink (< -78 dBm), it needs relay
+        if (p.hops > 0 || p.rssi < -78 || (p.uplink_rssi != 0 && p.uplink_rssi < -78)) {
+            needs_relay = true;
+        }
+    }
+    // No other active peers around: relaying is pointless
+    if (active_others == 0) return false;
+    // If the sender was heard weakly, we act as a bridge
+    if (rx_rssi < -78) return true;
+    return needs_relay;
+}
+
+bool PeerTable::has_weak_or_remote_peer(uint32_t now_ms) const {
+    for (const auto& p : peers_) {
+        if (!p.used) continue;
+        if (now_ms - p.last_ms > kPeerTimeoutMs) continue;
+        if (p.hops > 0 || p.rssi < -75 || (p.uplink_rssi != 0 && p.uplink_rssi < -75)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool RelayQueue::push(const uint8_t* frame, size_t len, uint32_t due_ms) {

@@ -225,7 +225,7 @@ def print_help():
   {CYAN}2: <cmd>{RESET}       Send command to Node 2 only (e.g. '2: scan')
   {CYAN}test-switch [N]{RESET} Test auto channel propagation (default Ch 6 or N)
   {CYAN}test-ping{RESET}      Test radio ping round-trip
-  {CYAN}debug{RESET}          Toggle quiet snowboard mode vs verbose debug alerts
+  {CYAN}debug{RESET}          Toggle quiet mode vs verbose debug alerts
   {CYAN}s{RESET}              Print status on both nodes
   {CYAN}h / help{RESET}       Show this help
   {CYAN}quit / exit{RESET}    Exit monitor
@@ -300,19 +300,19 @@ def main():
                 tests.test_switch_propagation(ch)
             elif cmd == "test-ping":
                 tests.test_ping()
-            elif cmd.startswith("1:"):
+            elif cmd.startswith("1:") or cmd.startswith("1 "):
                 actual_cmd = cmd[2:].strip()
                 if node1:
                     node1.send(actual_cmd)
                 else:
                     print(f"{RED}Node 1 not connected{RESET}")
-            elif cmd.startswith("2:"):
+            elif cmd.startswith("2:") or cmd.startswith("2 "):
                 actual_cmd = cmd[2:].strip()
                 if node2:
                     node2.send(actual_cmd)
                 else:
                     print(f"{RED}Node 2 not connected{RESET}")
-            elif cmd.startswith("b:"):
+            elif cmd.startswith("b:") or cmd.startswith("b "):
                 actual_cmd = cmd[2:].strip()
                 if node1: node1.send(actual_cmd)
                 if node2: node2.send(actual_cmd)

@@ -23,6 +23,8 @@ struct Peer {
     uint8_t  hops = 0;          // 0 = heard directly
     uint32_t last_ms = 0;
     bool     talking = false;
+    uint32_t relay_id = 0;      // ID of intermediate relay node (if hops > 0)
+    int8_t   uplink_rssi = 0;   // Piggybacked Uplink RSSI reported by this peer
     ReplayWindow replay;
 };
 
@@ -50,7 +52,7 @@ public:
     // Before decrypting: is this (sender, session, seq) new? Cheap filter for floods.
     bool fresh(const Header& h, uint32_t now_ms) const;
     // After the packet authenticated: records it. Returns false if it was a duplicate.
-    bool accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac = nullptr);
+    bool accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac = nullptr, uint32_t relay_id = 0);
     void set_name(uint32_t id, const char* name);
     void set_talking(uint32_t id, bool on);
     void prune(uint32_t now_ms);
@@ -58,6 +60,8 @@ public:
     const Peer* begin() const { return peers_; }
     const Peer* end() const { return peers_ + kMaxPeers; }
     int count() const;
+    bool should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const;
+    bool has_weak_or_remote_peer(uint32_t now_ms) const;
 
 private:
     Peer* slot_for(uint32_t id, uint32_t now_ms);
