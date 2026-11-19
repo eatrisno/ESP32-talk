@@ -21,10 +21,20 @@ struct Rx {
 // Called from the radio task for every new authenticated frame (never for duplicates).
 using RxHandler = void (*)(const Rx& rx);
 
+enum RateMode {
+    RATE_LR_250K = 0,
+    RATE_LR_500K = 1,
+    RATE_1M_L    = 2
+};
+
 bool start(uint8_t channel, uint32_t session, RxHandler on_rx);
 bool set_channel(uint8_t channel);
 uint8_t channel();
 uint32_t self_id();
+
+bool set_rate_mode(RateMode mode);
+RateMode rate_mode();
+const char* rate_mode_str(RateMode mode);
 
 // Encrypts and broadcasts. Safe from any task. Returns false if the queue is full.
 bool send(wt::MsgType type, const uint8_t* plain, size_t len);

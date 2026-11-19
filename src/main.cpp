@@ -112,6 +112,74 @@ static uint32_t s_last_hunt_step_ms = 0;
 static uint8_t  s_hunt_ch_index = 0;
 static uint32_t s_recovered_on_backup_ms = 0;
 
+// Debug Audio setting & anti-chatter audio alerts
+static bool     s_debug_audio = false; // false = Quiet Mode, true = Verbose Debug Alerts
+
+// Dynamic Adaptive PHY Rate (1M_L <-> LR 500k) with Hysteresis
+static bool     s_adaptive_rate = true;
+static uint32_t s_rate_promote_start_ms = 0;
+
+void update_adaptive_rate(uint32_t now) {
+    if (!s_adaptive_rate) return;
+
+    int active_direct_peers = 0;
+    int8_t worst_rssi = 0;
+
+    radio::peers_lock();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (p->used && p->hops == 0 && (now - p->last_ms <= wt::kPeerTimeoutMs)) {
+            active_direct_peers++;
+            int8_t eff = p->rssi;
+            if (p->uplink_rssi != 0 && p->uplink_rssi < eff) eff = p->uplink_rssi;
+            if (worst_rssi == 0 || eff < worst_rssi) worst_rssi = eff;
+        }
+    }
+    radio::peers_unlock();
+
+    if (active_direct_peers == 0) {
+        // No direct peers heard recently: default to LR 500k for maximum reach
+        if (radio::rate_mode() != radio::RATE_LR_500K) {
+            radio::set_rate_mode(radio::RATE_LR_500K);
+        }
+        s_rate_promote_start_ms = 0;
+        return;
+    }
+
+    radio::RateMode cur = radio::rate_mode();
+
+    // 1. Immediate demotion if link weakens (RSSI <= -78 dBm)
+    if (worst_rssi <= -78) {
+        s_rate_promote_start_ms = 0;
+        if (cur != radio::RATE_LR_500K && cur != radio::RATE_LR_250K) {
+            radio::set_rate_mode(radio::RATE_LR_500K);
+            if (s_debug_audio) {
+                printf("[ADAPTIVE RATE] Weak signal (RSSI %d dBm <= -78) -> Demoted to %s\n",
+                       worst_rssi, radio::rate_mode_str(radio::RATE_LR_500K));
+            }
+        }
+    }
+    // 2. Promotion with 3-second stability debounce (RSSI >= -72 dBm)
+    else if (worst_rssi >= -72) {
+        if (cur != radio::RATE_1M_L) {
+            if (s_rate_promote_start_ms == 0) {
+                s_rate_promote_start_ms = now;
+            } else if (now - s_rate_promote_start_ms >= 3000) {
+                radio::set_rate_mode(radio::RATE_1M_L);
+                s_rate_promote_start_ms = 0;
+                if (s_debug_audio) {
+                    printf("[ADAPTIVE RATE] Strong signal stable (RSSI %d dBm >= -72 for 3s) -> Promoted to %s\n",
+                           worst_rssi, radio::rate_mode_str(radio::RATE_1M_L));
+                }
+            }
+        } else {
+            s_rate_promote_start_ms = 0;
+        }
+    } else {
+        // Deadband hysteresis (-77 to -73 dBm): keep current rate, reset promotion timer
+        s_rate_promote_start_ms = 0;
+    }
+}
+
 void broadcast_state();
 void enter_menu();
 void exit_menu(bool play_tone = true);
@@ -125,8 +193,6 @@ void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet = fa
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
-// Debug Audio setting & anti-chatter audio alerts
-static bool     s_debug_audio = false; // false = Quiet Mode, true = Verbose Debug Alerts
 static uint32_t s_last_connect_prompt_ms = 0;
 static uint32_t s_last_disconnect_prompt_ms = 0;
 
@@ -1618,8 +1684,8 @@ void print_status() {
     }
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
-    printf("  radio: mode %s  tx-power %d (%.2f dBm)\n",
-           cfg::kLongRange ? "ESP-NOW Long Range (LR 250k, -108 dBm)" : "802.11g 6M (-90 dBm)",
+    printf("  radio: rate %s (Adaptive: %s)  tx-power %d (%.2f dBm)\n",
+           radio::rate_mode_str(radio::rate_mode()), s_adaptive_rate ? "ON" : "OFF",
            pwr, pwr * 0.25f);
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
@@ -1691,6 +1757,7 @@ void help() {
            "  s          status, peers, counters\n"
            "  ch N       radio channel 1..13 (all nodes must match)\n"
            "  backup N   set backup channel 0..13 (0 = disabled)\n"
+           "  rate [X]   switch PHY rate: 1m, 500k, 250k, auto (default)\n"
            "  name X     set this node's name\n"
            "  loop       loopback test: hear your own voice through the codec\n"
            "  selftest   check headset streams and the audio path\n"
@@ -1819,6 +1886,27 @@ void console_task(void*) {
                 nvs_put_u8("backup_ch", s_backup_channel);
                 printf("Backup channel set to: %u\n", s_backup_channel);
             } else printf("backup channel must be 0 (none) or 1..13\n");
+        } else if (!strncmp(line, "rate", 4)) {
+            if (!strcmp(line, "rate 1m") || !strcmp(line, "rate 1")) {
+                s_adaptive_rate = false;
+                radio::set_rate_mode(radio::RATE_1M_L);
+                printf("PHY Rate set to: %s (Adaptive OFF)\n", radio::rate_mode_str(radio::RATE_1M_L));
+            } else if (!strcmp(line, "rate 500k") || !strcmp(line, "rate 500")) {
+                s_adaptive_rate = false;
+                radio::set_rate_mode(radio::RATE_LR_500K);
+                printf("PHY Rate set to: %s (Adaptive OFF)\n", radio::rate_mode_str(radio::RATE_LR_500K));
+            } else if (!strcmp(line, "rate 250k") || !strcmp(line, "rate 250")) {
+                s_adaptive_rate = false;
+                radio::set_rate_mode(radio::RATE_LR_250K);
+                printf("PHY Rate set to: %s (Adaptive OFF)\n", radio::rate_mode_str(radio::RATE_LR_250K));
+            } else if (!strcmp(line, "rate auto")) {
+                s_adaptive_rate = true;
+                printf("Adaptive PHY Rate: ENABLED (1M_L <-> LR 500k auto-switching)\n");
+            } else {
+                printf("Current PHY Rate: %s | Adaptive: %s\n",
+                       radio::rate_mode_str(radio::rate_mode()), s_adaptive_rate ? "ENABLED" : "MANUAL");
+                printf("Usage: rate 1m | rate 500k | rate 250k | rate auto\n");
+            }
         } else if (!strncmp(line, "name ", 5) && line[5]) {
             xSemaphoreTake(s_app_mtx, portMAX_DELAY);
             strncpy(s_name, line + 5, sizeof s_name - 1);
@@ -2075,6 +2163,12 @@ extern "C" void app_main() {
                 audio::prompt_clear();
                 audio::prompt(wt::PROMPT_VM_SENT);
             }
+        }
+
+        static uint32_t last_adaptive_rate_check = 0;
+        if (now - last_adaptive_rate_check >= 200) {
+            last_adaptive_rate_check = now;
+            update_adaptive_rate(now);
         }
 
         // Auto-mute a mic that has been left open too long (disabled when kMaxTalkMs == 0).

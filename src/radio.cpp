@@ -74,6 +74,27 @@ void on_sent(const esp_now_send_info_t*, esp_now_send_status_t st) {
     }
 }
 
+static RateMode s_rate_mode = RATE_LR_500K;
+
+static void fill_rate_config(RateMode mode, esp_now_rate_config_t& rc) {
+    memset(&rc, 0, sizeof(rc));
+    switch (mode) {
+        case RATE_1M_L:
+            rc.phymode = WIFI_PHY_MODE_11B;
+            rc.rate = WIFI_PHY_RATE_1M_L;
+            break;
+        case RATE_LR_500K:
+            rc.phymode = WIFI_PHY_MODE_LR;
+            rc.rate = WIFI_PHY_RATE_LORA_500K;
+            break;
+        case RATE_LR_250K:
+        default:
+            rc.phymode = WIFI_PHY_MODE_LR;
+            rc.rate = WIFI_PHY_RATE_LORA_250K;
+            break;
+    }
+}
+
 void register_unicast_peer(const uint8_t* mac) {
     if (!mac || esp_now_is_peer_exist(mac)) return;
     if (memcmp(mac, kBroadcast, 6) == 0) return;
@@ -89,15 +110,14 @@ void register_unicast_peer(const uint8_t* mac) {
     p.channel = 0;  // follow current channel
     esp_err_t err = esp_now_add_peer(&p);
     if (err == ESP_OK) {
-        esp_now_rate_config_t rc = {};
-        rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
-        rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
+        esp_now_rate_config_t rc;
+        fill_rate_config(s_rate_mode, rc);
         esp_err_t rerr = esp_now_set_peer_rate_config(mac, &rc);
         if (rerr != ESP_OK) {
             ESP_LOGW(TAG, "failed to set rate config for peer: %s", esp_err_to_name(rerr));
         }
-        ESP_LOGI(TAG, "registered unicast peer %02x:%02x:%02x:%02x:%02x:%02x (hardware retries enabled)",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        ESP_LOGI(TAG, "registered unicast peer %02x:%02x:%02x:%02x:%02x:%02x (rate: %s)",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rate_mode_str(s_rate_mode));
     }
 }
 
@@ -360,8 +380,10 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Force default ESP-NOW PHY rate (250 kbps for extreme sensitivity)
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M);
+    // Set ESP-NOW PHY rate (defaults to LR 500k: 2x faster airtime, -105 dBm sensitivity)
+    esp_now_rate_config_t rc;
+    fill_rate_config(s_rate_mode, rc);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, rc.rate);
 
     // Maximize TX power (+20 dBm / +21 dBm)
     esp_wifi_set_max_tx_power(cfg::kTxPowerQdBm);
@@ -373,9 +395,6 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     p.ifidx = WIFI_IF_STA;
     p.channel = 0;  // follow the current channel
     ESP_ERROR_CHECK(esp_now_add_peer(&p));
-    esp_now_rate_config_t rc = {};
-    rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
-    rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
     esp_err_t rerr = esp_now_set_peer_rate_config(kBroadcast, &rc);
     if (rerr != ESP_OK) {
         ESP_LOGE(TAG, "failed to set broadcast rate config: %s", esp_err_to_name(rerr));
@@ -385,7 +404,7 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     esp_wifi_get_max_tx_power(&pwr);
     ESP_LOGI(TAG, "node %08lx session %lu ch %u (phy %s, tx %d = %.2f dBm)",
              (unsigned long)s_self, (unsigned long)session, ch,
-             cfg::kLongRange ? "ESP-NOW LR 250k (-108 dBm)" : "11g 6M (-90 dBm)",
+             rate_mode_str(s_rate_mode),
              pwr, pwr * 0.25f);
     if (cfg::kDefaultKey)
         ESP_LOGW(TAG, "using the PUBLIC default network key: anyone can listen. See README.");
@@ -421,6 +440,47 @@ Stats stats() {
     Stats s = s_stats;
     portEXIT_CRITICAL(&s_stats_mux);
     return s;
+}
+
+const char* rate_mode_str(RateMode mode) {
+    switch (mode) {
+        case RATE_1M_L: return "1M_L (1 Mbps)";
+        case RATE_LR_500K: return "LR 500k (-105 dBm)";
+        case RATE_LR_250K: return "LR 250k (-108 dBm)";
+        default: return "Unknown";
+    }
+}
+
+RateMode rate_mode() {
+    return s_rate_mode;
+}
+
+bool set_rate_mode(RateMode mode) {
+    esp_now_rate_config_t rc;
+    fill_rate_config(mode, rc);
+    esp_err_t err = esp_now_set_peer_rate_config(kBroadcast, &rc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to set broadcast rate config: %s", esp_err_to_name(err));
+        return false;
+    }
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, rc.rate);
+
+    xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+    for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
+        if (p->used && p->hops == 0) {
+            bool has_mac = false;
+            for (int i = 0; i < 6; i++) {
+                if (p->mac[i] != 0) { has_mac = true; break; }
+            }
+            if (has_mac) {
+                esp_now_set_peer_rate_config(p->mac, &rc);
+            }
+        }
+    }
+    xSemaphoreGive(s_peers_mtx);
+    s_rate_mode = mode;
+    ESP_LOGI(TAG, "PHY rate switched to: %s", rate_mode_str(mode));
+    return true;
 }
 
 }  // namespace radio
