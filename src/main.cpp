@@ -832,10 +832,13 @@ void on_rx(const radio::Rx& rx) {
             if (rx.len >= sizeof(wt::RangeReq)) {
                 wt::RangeReq req;
                 memcpy(&req, rx.plain, sizeof(req));
-                wt::RangeResp resp;
+                wt::RangeResp resp = {};
                 resp.token = req.token;
                 resp.seq = req.seq;
                 resp.req_rssi = rx.rssi;
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                strncpy(resp.name, s_name, sizeof(resp.name) - 1);
+                xSemaphoreGive(s_app_mtx);
                 radio::send(wt::MSG_RANGE_RESP, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
                 led::flash(led::Color::Cyan, 40);
             }
@@ -845,6 +848,7 @@ void on_rx(const radio::Rx& rx) {
             if (rx.len >= sizeof(wt::RangeResp)) {
                 wt::RangeResp resp;
                 memcpy(&resp, rx.plain, sizeof(resp));
+                resp.name[sizeof(resp.name) - 1] = 0;
                 if (resp.token == s_range_token) {
                     s_walk_pending = false;
                     s_walk_miss_count = 0;
@@ -910,20 +914,27 @@ void on_rx(const radio::Rx& rx) {
                     float est_m = powf(10.0f, (-50.0f - s_smoothed_rssi) / 24.0f);
                     if (est_m < 0.2f) est_m = 0.2f;
 
-                    char from_name[12] = "?";
-                    radio::peers_lock();
-                    if (const wt::Peer* p = radio::peers().find(id)) {
-                        if (p->name[0]) memcpy(from_name, p->name, sizeof(from_name));
+                    char who[20] = "";
+                    if (resp.name[0]) {
+                        snprintf(who, sizeof(who), "%s", resp.name);
+                    } else {
+                        radio::peers_lock();
+                        if (const wt::Peer* p = radio::peers().find(id)) {
+                            if (p->name[0]) snprintf(who, sizeof(who), "%s", p->name);
+                            else snprintf(who, sizeof(who), "node-%04lx", (unsigned long)(id & 0xFFFF));
+                        } else {
+                            snprintf(who, sizeof(who), "node-%04lx", (unsigned long)(id & 0xFFFF));
+                        }
+                        radio::peers_unlock();
                     }
-                    radio::peers_unlock();
 
                     if (est_m < 1.0f) {
-                        printf("  probe #%-2u [%-11s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
-                               resp.seq, from_name, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
+                        printf("  probe #%-2u from [%-10s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, who, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
                                new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
                     } else {
-                        printf("  probe #%-2u [%-11s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
-                               resp.seq, from_name, pct, rx.rssi, est_m, resp.req_rssi,
+                        printf("  probe #%-2u from [%-10s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, who, pct, rx.rssi, est_m, resp.req_rssi,
                                new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
                     }
                 }
