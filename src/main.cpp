@@ -298,35 +298,22 @@ void radar_check() {
     printf("\n");
 
     // Voice prompt acoustic telemetry in headset:
+    // Voice prompt acoustic telemetry in headset (single unified natural phrase):
     audio::prompt_clear();
     if (count == 0) {
-        audio::prompt(wt::PROMPT_ZERO);
-        audio::prompt(wt::PROMPT_DEVICES);
-        audio::prompt(wt::PROMPT_NEARBY);
+        audio::prompt(wt::PROMPT_RADAR_NONE);
+    } else if (count == 1) {
+        if (has_direct && best_rssi >= -70) audio::prompt(wt::PROMPT_RADAR_1_NEAR);
+        else if (has_direct && best_rssi >= -88) audio::prompt(wt::PROMPT_RADAR_1_MID);
+        else audio::prompt(wt::PROMPT_RADAR_1_FAR);
+    } else if (count == 2) {
+        if (has_direct && best_rssi >= -70) audio::prompt(wt::PROMPT_RADAR_2_NEAR);
+        else if (has_direct && best_rssi >= -88) audio::prompt(wt::PROMPT_RADAR_2_MID);
+        else audio::prompt(wt::PROMPT_RADAR_2_FAR);
     } else {
-        if (count == 1) {
-            audio::prompt(wt::PROMPT_ONE);
-            audio::prompt(wt::PROMPT_DEVICE);
-        } else if (count == 2) {
-            audio::prompt(wt::PROMPT_TWO);
-            audio::prompt(wt::PROMPT_DEVICES);
-        } else if (count == 3) {
-            audio::prompt(wt::PROMPT_THREE);
-            audio::prompt(wt::PROMPT_DEVICES);
-        } else if (count == 4) {
-            audio::prompt(wt::PROMPT_FOUR);
-            audio::prompt(wt::PROMPT_DEVICES);
-        } else {
-            audio::prompt(wt::PROMPT_FIVE);
-            audio::prompt(wt::PROMPT_DEVICES);
-        }
-        if (has_direct && best_rssi >= -70) {
-            audio::prompt(wt::PROMPT_NEARBY);
-        } else if (has_direct && best_rssi >= -88) {
-            audio::prompt(wt::PROMPT_MIDDLE);
-        } else {
-            audio::prompt(wt::PROMPT_FAR);
-        }
+        if (has_direct && best_rssi >= -70) audio::prompt(wt::PROMPT_RADAR_MANY_NEAR);
+        else if (has_direct && best_rssi >= -88) audio::prompt(wt::PROMPT_RADAR_MANY_MID);
+        else audio::prompt(wt::PROMPT_RADAR_MANY_FAR);
     }
 }
 
