@@ -1441,9 +1441,13 @@ extern "C" void app_main() {
             }
         }
 
-        // Audio Voice Menu inactivity timeout (relaxed 30 seconds)
-        if (s_menu_active && (now - s_last_menu_activity_ms >= 30000)) {
-            exit_menu(true);
+        // Audio Voice Menu inactivity timeout (relaxed 60 seconds, paused while voice prompt is playing)
+        if (s_menu_active) {
+            if (audio::prompt_busy()) {
+                s_last_menu_activity_ms = now;
+            } else if (now - s_last_menu_activity_ms >= 60000) {
+                exit_menu(true);
+            }
         }
 
         // Voice mail outbox: automatically deliver stored voice mail when a peer reconnects
