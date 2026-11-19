@@ -114,8 +114,17 @@ uint32_t next_session() {
 
 // --- feedback --------------------------------------------------------------------------
 
-void chime_peer_joined() { audio::prompt_clear(); audio::prompt(wt::PROMPT_CONNECTED); }
-void chime_peer_left() { audio::prompt_clear(); audio::prompt(wt::PROMPT_DISCONNECTED); }
+void chime_peer_joined() {
+    audio::tone(587, 25, 250);
+    audio::tone(0, 15);
+    audio::tone(880, 35, 250);
+}
+
+void chime_peer_left() {
+    audio::tone(880, 25, 250);
+    audio::tone(0, 15);
+    audio::tone(587, 35, 250);
+}
 
 void sound_distress_alert() {
     audio::prompt_clear();
@@ -524,13 +533,52 @@ void dismiss_inbox_voicemail() {
 
 static uint32_t s_last_talk_click_ms = 0;
 static uint8_t  s_talk_click_count = 0;
-static constexpr uint32_t kMultiClickWindowMs = 650; // Comfortable, relaxed multi-click window (was 450ms)
+static uint32_t s_last_boot_click_ms = 0;
+static uint8_t  s_boot_click_count = 0;
+static constexpr uint32_t kMultiClickWindowMs = 500;
 
 void handle_press(wt::Press p, int which) {
-    // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
+    // which: 0 = Headset Talk, 1 = Vol Up, 2 = Vol Down, 3 = ESP32 BOOT button
     if (p == wt::Press::None) return;
     ESP_LOGI(TAG, "Button %d event: %d", which, static_cast<int>(p));
 
+    // --- ESP32 BOOT button (GPIO 0) -> Dedicated to Settings & Audio Menu ---
+    if (which == 3) {
+        if (s_distress_active) {
+            // Any press on BOOT cancels distress immediately!
+            s_boot_click_count = 0;
+            toggle_distress();
+            return;
+        }
+
+        if (!s_menu_active) {
+            if (p == wt::Press::Click) {
+                s_boot_click_count = 0;
+                enter_menu();
+            }
+            return;
+        }
+
+        // Inside Menu:
+        uint32_t now = now_ms();
+        if (p == wt::Press::Click) {
+            if (s_boot_click_count > 0 && (now - s_last_boot_click_ms <= kMultiClickWindowMs)) {
+                // Double click inside menu: exit menu immediately!
+                s_boot_click_count = 0;
+                exit_menu();
+                return;
+            }
+            s_boot_click_count = 1;
+            s_last_boot_click_ms = now;
+            menu_next();
+        } else if (p == wt::Press::Long || p == wt::Press::Hold) {
+            s_boot_click_count = 0;
+            menu_select();
+        }
+        return;
+    }
+
+    // --- Headset Talk button (HID & kPinTalk) -> Walkie-Talkie & Emergency SOS ---
     if (which == 0) {
         if (s_distress_active) {
             // Any click or press while distress is active immediately cancels it!
@@ -539,65 +587,52 @@ void handle_press(wt::Press p, int which) {
             return;
         }
 
-        if (s_menu_active) {
-            uint32_t now = now_ms();
+        if (s_vm_recording) {
+            // In voice mail recording mode: click means STOP & SEND!
             if (p == wt::Press::Click) {
-                if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
-                    // Double click inside menu: exit menu immediately!
-                    s_talk_click_count = 0;
-                    exit_menu();
-                    return;
-                }
-                s_talk_click_count = 1;
-                s_last_talk_click_ms = now;
-                menu_next();
-            } else if (p == wt::Press::Long || p == wt::Press::Hold) {
                 s_talk_click_count = 0;
-                menu_select();
+                send_voicemail();
             }
             return;
         }
 
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
-            if (s_vm_recording) {
-                // In voice mail recording mode: click means STOP & SEND!
-                s_talk_click_count = 0;
-                send_voicemail();
+            if (s_vm_inbox_has_message) {
+                if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
+                    // Double click: dismiss / remove incoming voicemail
+                    s_talk_click_count = 0;
+                    dismiss_inbox_voicemail();
+                } else {
+                    // Single click: will trigger play_inbox_voicemail() when window expires
+                    s_talk_click_count = 1;
+                    s_last_talk_click_ms = now;
+                }
                 return;
             }
-            if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
-                s_talk_click_count++;
-                s_last_talk_click_ms = now;
-                if (s_talk_click_count == 2) {
-                    if (s_vm_inbox_has_message) {
-                        s_talk_click_count = 0;
-                        dismiss_inbox_voicemail();
-                    } else {
-                        // Double click from normal standby: ENTER AUDIO MENU!
-                        s_talk_click_count = 0;
-                        enter_menu();
-                    }
-                } else if (s_talk_click_count >= 3) {
-                    // Triple click: quick direct radar check!
-                    s_talk_click_count = 0;
-                    radar_check();
-                }
+
+            // Normal standby operation:
+            if (!s_ptt_mode) {
+                // Mode Call (Hands-Free VOX): 1x click toggles mic (mute / unmute)!
+                toggle_talk();
             } else {
-                s_talk_click_count = 1;
-                s_last_talk_click_ms = now;
+                // Mode PTT: Quick tap gives a subtle chirp acknowledgment
+                audio::tone(700, 20, 300);
             }
         } else if (p == wt::Press::Long) {
-            // Pre-warning soft ticks at 1.2s indicating button is being held for distress
+            // Pre-warning soft ticks at 1.2s indicating button is being held for distress SOS
             audio::tone(650, 20, 350);
             audio::tone(0, 40);
             audio::tone(750, 25, 350);
         } else if (p == wt::Press::Hold) {
-            // 2.5s hold: trigger distress signal!
+            // 2.5s hold: trigger distress SOS!
             s_talk_click_count = 0;
             toggle_distress();
         }
+        return;
     }
+
+    // --- Vol Up / Vol Down ---
     if (which == 1) { // Vol Up
         if (s_menu_active) {
             menu_prev();
@@ -834,6 +869,7 @@ void toggle_walk_mode() {
 
 void system_power_off() {
     printf("\n*** [SYSTEM] Powering off into Deep Sleep... ***\n\n");
+    nvs_put_u8("pwr_state", 0);
     audio::prompt_clear();
     audio::prompt(wt::PROMPT_POWER_OFF);
     vTaskDelay(pdMS_TO_TICKS(650));
@@ -1199,6 +1235,34 @@ extern "C" void app_main() {
         nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
+
+    esp_reset_reason_t rst_reason = esp_reset_reason();
+    uint8_t pwr_state = nvs_u8("pwr_state", 1); // default 1 (online)
+
+    if (rst_reason == ESP_RST_DEEPSLEEP) {
+        // Woke up from Deep Sleep because user pressed BOOT!
+        pwr_state = 1;
+        nvs_put_u8("pwr_state", 1);
+        ESP_LOGI(TAG, "Woke up from Deep Sleep via button press -> System Online");
+    } else {
+        // Cold boot, power-on, brownout, panic, watchdog, or restart
+        if (pwr_state == 0) {
+            // Deliberately shut down earlier; returning immediately to Deep Sleep until BOOT is pressed
+            ESP_LOGI(TAG, "System was turned off; returning to Deep Sleep. Press BOOT to power on.");
+            for (gpio_num_t p : {cfg::kPinBoot, cfg::kPinTalk}) init_gpio(p);
+            esp_sleep_enable_ext0_wakeup(cfg::kPinBoot, 0);
+            uint64_t mask = (1ULL << cfg::kPinBoot);
+            if (cfg::kPinTalk != GPIO_NUM_NC) mask |= (1ULL << cfg::kPinTalk);
+            esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+            esp_deep_sleep_start();
+        } else {
+            // Was running online when power was disconnected or glitched -> auto-recover online!
+            ESP_LOGI(TAG, "Auto-recovery: restoring online state after reset (reason %d)", rst_reason);
+            pwr_state = 1;
+            nvs_put_u8("pwr_state", 1);
+        }
+    }
+
     s_app_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -1235,7 +1299,7 @@ extern "C" void app_main() {
     printf("\n%s ready on channel %u (mode: %s). Type 'h' for commands.\n", s_name, ch,
            s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
 
-    wt::ButtonDetector talk, up, down;
+    wt::ButtonDetector headset_btn, boot_btn, up, down;
     uint8_t last_toggle = 0;
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
@@ -1273,7 +1337,7 @@ extern "C" void app_main() {
         }
 
         // Talk / Media button on headset (Play/Pause, Voice Command, Mute):
-        // Click on release (< 1.2s), Long press when held (>= 1.2s), Hold when held (>= 2.5s)
+        // which == 0 (zero menu functions)
         if ((hid & wt::HID_BTN_TALK) && !(last_hid & wt::HID_BTN_TALK)) {
             hid_talk_start = now;
             hid_talk_long_sent = false;
@@ -1294,20 +1358,29 @@ extern "C" void app_main() {
         }
         last_hid = hid;
 
-        // Physical GPIO buttons (BOOT, external pins) use debouncer
-        handle_press(talk.update(low(cfg::kPinBoot) || low(cfg::kPinTalk), now), 0);
+        // Physical GPIO buttons:
+        // BOOT button on ESP32 board (dedicated detector for settings & menu, which == 3)
+        handle_press(boot_btn.update(low(cfg::kPinBoot), now), 3);
+
+        // Headset Talk external pin (which == 0)
+        if (cfg::kPinTalk != GPIO_NUM_NC) {
+            handle_press(headset_btn.update(low(cfg::kPinTalk), now), 0);
+        }
+
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Classic PTT mode: press and hold button to talk, release to mute with roger beep
-        bool talk_raw_down = low(cfg::kPinBoot) || low(cfg::kPinTalk) || (hid & wt::HID_BTN_TALK);
-        static bool s_last_talk_raw_down = false;
+        // Classic PTT mode: press and hold HEADSET button to talk, release to mute with roger beep
+        // Note: strictly HEADSET button (not BOOT button)
+        bool headset_raw_down = (hid & wt::HID_BTN_TALK) ||
+                                (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
+        static bool s_last_headset_raw_down = false;
         static uint32_t s_talk_down_ms = 0;
         if (s_ptt_mode && !s_menu_active && !s_vm_recording && !s_distress_active) {
-            if (talk_raw_down && !s_last_talk_raw_down) {
+            if (headset_raw_down && !s_last_headset_raw_down) {
                 s_talk_down_ms = now;
             }
-            if (talk_raw_down && !s_ptt_active && (now - s_talk_down_ms >= 120)) {
+            if (headset_raw_down && !s_ptt_active && (now - s_talk_down_ms >= 120)) {
                 // Held >= 120ms: activate PTT transmission
                 s_ptt_active = true;
                 if (!audio::talking()) {
@@ -1319,7 +1392,7 @@ extern "C" void app_main() {
                     ESP_LOGI(TAG, "PTT: TX active (held)");
                 }
             }
-            if (!talk_raw_down && s_last_talk_raw_down) {
+            if (!headset_raw_down && s_last_headset_raw_down) {
                 if (s_ptt_active) {
                     s_ptt_active = false;
                     if (audio::talking()) {
@@ -1336,29 +1409,19 @@ extern "C" void app_main() {
                 }
             }
         }
-        s_last_talk_raw_down = talk_raw_down;
+        s_last_headset_raw_down = headset_raw_down;
 
-        // Handle pending click evaluation (kMultiClickWindowMs after last click)
+        // Handle pending click evaluation (for voicemail inbox 1x/2x click)
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
-            uint8_t count = s_talk_click_count;
             s_talk_click_count = 0;
-            if (!s_menu_active) {
-                if (s_vm_inbox_has_message) {
-                    if (count == 1) {
-                        // Click once to hear, click 1 more to repeat
-                        play_inbox_voicemail();
-                    }
-                } else {
-                    if (count == 1) {
-                        if (!s_ptt_mode) {
-                            toggle_talk(); // 1 click in Hands-free: toggle mic!
-                        } else {
-                            // In PTT mode: quick tap gives a soft chirp acknowledgment
-                            audio::tone(700, 20, 300);
-                        }
-                    }
-                }
+            if (s_vm_inbox_has_message) {
+                play_inbox_voicemail();
             }
+        }
+
+        // BOOT button double-click timeout inside menu
+        if (s_boot_click_count > 0 && (now - s_last_boot_click_ms > kMultiClickWindowMs)) {
+            s_boot_click_count = 0;
         }
 
         // Audio Voice Menu inactivity timeout (3.5 seconds)

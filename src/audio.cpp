@@ -125,7 +125,7 @@ void mic_task(void*) {
                 if (s_vm_cb) s_vm_cb(a);
                 continue;
             }
-            if (!cfg::kContinuousStream && !voice && !s_loopback) {
+            if (!cfg::kContinuousStream && (!voice || s_prompts.busy()) && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
                     was_sending = false;
@@ -278,6 +278,13 @@ void prompt_clear() {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_prompts.clear();
     xSemaphoreGive(s_mtx);
+}
+
+bool prompt_busy() {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    bool b = s_prompts.busy();
+    xSemaphoreGive(s_mtx);
+    return b;
 }
 
 void on_audio(uint32_t sender, const wt::AudioPayload& a) {

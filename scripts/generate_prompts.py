@@ -84,22 +84,25 @@ def process_single_file(path):
         ch = w.getnchannels()
         sw = w.getsampwidth()
         frames = w.readframes(w.getnframes())
-        raw = np.frombuffer(frames, dtype=np.int16).copy()
+        raw = np.frombuffer(frames, dtype=np.int16).copy().astype(np.float32)
         if ch > 1:
             raw = raw[::ch]  # take first channel if stereo
 
-        # Trim leading and trailing silence
-        threshold = 500
+        # Remove any DC bias
+        raw -= np.mean(raw)
+
+        # Trim leading and trailing silence (tighter 12ms lead-in, 18ms lead-out)
+        threshold = max(250.0, float(0.015 * np.max(np.abs(raw))))
         idx = np.where(np.abs(raw) > threshold)[0]
         if len(idx) > 0:
-            start = max(0, idx[0] - int(0.02 * sr_in))
-            end = min(len(raw), idx[-1] + int(0.03 * sr_in))
+            start = max(0, idx[0] - int(0.012 * sr_in))
+            end = min(len(raw), idx[-1] + int(0.018 * sr_in))
             raw = raw[start:end]
 
         # Resample to 16,000 Hz
         if sr_in != TARGET_SR:
             num_out = int(len(raw) * TARGET_SR / sr_in)
-            resampled = signal.resample(raw, num_out).astype(np.int16)
+            resampled = signal.resample(raw, num_out)
         else:
             resampled = raw
 
@@ -108,10 +111,10 @@ def process_single_file(path):
         if fade_len > 0:
             fade_in = (0.5 * (1 - np.cos(np.linspace(0, np.pi, fade_len)))).astype(np.float32)
             fade_out = (0.5 * (1 + np.cos(np.linspace(0, np.pi, fade_len)))).astype(np.float32)
-            resampled[:fade_len] = (resampled[:fade_len] * fade_in).astype(np.int16)
-            resampled[-fade_len:] = (resampled[-fade_len:] * fade_out).astype(np.int16)
+            resampled[:fade_len] = resampled[:fade_len] * fade_in
+            resampled[-fade_len:] = resampled[-fade_len:] * fade_out
 
-        return resampled
+        return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 def process_prompt(assets_dir, item):
     if isinstance(item, (list, tuple)):
@@ -191,6 +194,8 @@ def main():
         f.write('    PromptId queue_[kMaxQueue] = {};\n')
         f.write('    int head_ = 0, tail_ = 0;\n')
         f.write('    size_t sample_pos_ = 0;\n')
+        f.write('    int16_t fade_last_ = 0;\n')
+        f.write('    int fade_remain_ = 0;\n')
         f.write('};\n\n')
         f.write('}  // namespace wt\n')
 
@@ -237,16 +242,33 @@ def main():
 }
 
 void PromptQueue::clear() {
+    if (head_ != tail_ && sample_pos_ > 0) {
+        PromptId cur_id = queue_[head_];
+        const PromptData& p = s_prompt_table[cur_id];
+        if (p.samples && sample_pos_ < p.count) {
+            fade_last_ = p.samples[sample_pos_];
+            fade_remain_ = 48; // 3ms ramp to zero prevents clicks
+        }
+    }
     head_ = tail_ = 0;
     sample_pos_ = 0;
 }
 
 bool PromptQueue::busy() const {
-    return head_ != tail_;
+    return (head_ != tail_) || (fade_remain_ > 0);
 }
 
 bool PromptQueue::render(int16_t* out, size_t n, float vol_scale) {
-    if (head_ == tail_) return false;
+    if (fade_remain_ > 0) {
+        size_t m = (n < static_cast<size_t>(fade_remain_)) ? n : static_cast<size_t>(fade_remain_);
+        for (size_t i = 0; i < m; i++) {
+            float ramp = static_cast<float>(fade_remain_ - 1 - i) / 48.0f;
+            int32_t val = out[i] + static_cast<int32_t>(fade_last_ * ramp * vol_scale);
+            out[i] = clip16(val);
+        }
+        fade_remain_ -= m;
+    }
+    if (head_ == tail_) return fade_remain_ > 0;
     size_t out_idx = 0;
     while (out_idx < n && head_ != tail_) {
         PromptId cur_id = queue_[head_];

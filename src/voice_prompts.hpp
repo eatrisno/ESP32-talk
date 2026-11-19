@@ -76,6 +76,8 @@ private:
     PromptId queue_[kMaxQueue] = {};
     int head_ = 0, tail_ = 0;
     size_t sample_pos_ = 0;
+    int16_t fade_last_ = 0;
+    int fade_remain_ = 0;
 };
 
 }  // namespace wt
