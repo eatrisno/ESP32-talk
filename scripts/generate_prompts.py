@@ -29,6 +29,7 @@ PROMPT_MAP = [
     ('PROMPT_MENU_PTT',              'push to talk.wav'),
     ('PROMPT_MENU_HANDS_FREE',       'hands free.wav'),
     ('PROMPT_MENU_CHANNEL',          'channel.wav'),
+    ('PROMPT_MENU_EXIT',             'exit.wav'),
 
     # Feature Toggles
     ('PROMPT_WALK_ON',               'walk mode enabled.wav'),

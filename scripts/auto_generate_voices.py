@@ -38,6 +38,7 @@ CUES = [
     ('push to talk.wav',             'Push to talk'),
     ('hands free.wav',               'Hands free'),
     ('channel.wav',                  'Channel'),
+    ('exit.wav',                     'Exit'),
 
     # Feature Toggles
     ('walk mode enabled.wav',        'Walk mode enabled'),

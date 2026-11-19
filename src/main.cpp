@@ -66,6 +66,7 @@ enum MenuItem : uint8_t {
     MENU_TALK_MODE,
     MENU_CHANNEL,
     MENU_POWER_OFF,
+    MENU_EXIT,
     MENU_COUNT
 };
 
@@ -77,6 +78,7 @@ static bool s_menu_channel_active = false;
 static uint8_t s_menu_channel_candidate = 1;
 static uint32_t s_last_menu_activity_ms = 0;
 
+void broadcast_state();
 void enter_menu();
 void exit_menu(bool play_tone = true);
 void menu_next();
@@ -206,9 +208,19 @@ void toggle_distress() {
     if (s_distress_active) {
         printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
         audio::prompt(wt::PROMPT_EMERGENCY_ON);
+        // Automatically enable microphone when emergency is activated!
+        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+        audio::set_talking(true);
+        xSemaphoreGive(s_app_mtx);
+        broadcast_state();
     } else {
         printf("\n*** [DISTRESS CANCELLED] All-clear broadcasted. ***\n\n");
         audio::prompt(wt::PROMPT_EMERGENCY_OFF);
+        // Automatically mute microphone when emergency is cleared
+        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+        audio::set_talking(false);
+        xSemaphoreGive(s_app_mtx);
+        broadcast_state();
     }
 }
 
@@ -565,15 +577,20 @@ void handle_press(wt::Press p, int which) {
             if (s_boot_click_count > 0 && (now - s_last_boot_click_ms <= kMultiClickWindowMs)) {
                 // Double click inside menu: exit menu immediately!
                 s_boot_click_count = 0;
-                exit_menu();
+                exit_menu(true);
                 return;
             }
             s_boot_click_count = 1;
             s_last_boot_click_ms = now;
             menu_next();
-        } else if (p == wt::Press::Long || p == wt::Press::Hold) {
+        } else if (p == wt::Press::Long) {
+            // Long click (~1s): select / toggle active item!
             s_boot_click_count = 0;
             menu_select();
+        } else if (p == wt::Press::Hold) {
+            // Long press held (>= 2.5s): BACK / EXIT menu!
+            s_boot_click_count = 0;
+            exit_menu(true);
         }
         return;
     }
@@ -923,6 +940,9 @@ void announce_current_menu_item() {
         case MENU_POWER_OFF:
             audio::prompt(wt::PROMPT_POWER_OFF);
             break;
+        case MENU_EXIT:
+            audio::prompt(wt::PROMPT_MENU_EXIT);
+            break;
         default:
             break;
     }
@@ -936,7 +956,7 @@ void enter_menu() {
     audio::prompt_clear();
     audio::prompt(wt::PROMPT_MENU);
     audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
-    printf("[Menu] Entered Audio Menu. 1x click to cycle, Hold to select, Double-click to exit.\n");
+    printf("[Menu] Entered Audio Menu. Click to next, Long-click to select, Hold 2.5s to back.\n");
 }
 
 void menu_next() {
@@ -970,7 +990,7 @@ void menu_select() {
         radio::set_channel(s_menu_channel_candidate);
         nvs_put_u8("ch", s_menu_channel_candidate);
         printf("[Menu] Radio Channel confirmed: %u\n", s_menu_channel_candidate);
-        exit_menu(false);
+        s_menu_channel_active = false;
         audio::prompt_clear();
         audio::prompt(wt::PROMPT_CONNECTED);
         return;
@@ -985,10 +1005,10 @@ void menu_select() {
             radar_check();
             break;
         case MENU_WALK:
-            exit_menu(false);
             toggle_walk_mode();
             audio::prompt_clear();
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
+            // Stays in menu!
             break;
         case MENU_TALK_MODE:
             s_ptt_mode = !s_ptt_mode;
@@ -999,10 +1019,10 @@ void menu_select() {
                 xSemaphoreGive(s_app_mtx);
                 broadcast_state();
             }
-            exit_menu(false);
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
             printf("[Menu] Talk mode set to: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
+            // Stays in menu!
             break;
         case MENU_CHANNEL:
             s_menu_channel_active = true;
@@ -1012,6 +1032,9 @@ void menu_select() {
             break;
         case MENU_POWER_OFF:
             system_power_off();
+            break;
+        case MENU_EXIT:
+            exit_menu(true);
             break;
         default:
             exit_menu(true);
@@ -1429,15 +1452,15 @@ extern "C" void app_main() {
             s_boot_click_count = 0;
         }
 
-        // Audio Voice Menu inactivity timeout (3.5 seconds)
-        if (s_menu_active && (now - s_last_menu_activity_ms >= 3500)) {
+        // Audio Voice Menu inactivity timeout (relaxed 30 seconds)
+        if (s_menu_active && (now - s_last_menu_activity_ms >= 30000)) {
             if (s_menu_channel_active) {
                 radio::set_channel(s_menu_channel_candidate);
                 nvs_put_u8("ch", s_menu_channel_candidate);
                 audio::prompt_clear();
                 audio::prompt(wt::PROMPT_CONNECTED);
             }
-            exit_menu();
+            exit_menu(true);
         }
 
         // Voice mail outbox: automatically deliver stored voice mail when a peer reconnects
