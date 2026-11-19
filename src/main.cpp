@@ -637,7 +637,7 @@ void handle_press(wt::Press p, int which) {
         if (p == wt::Press::Click) {
             // If PTT was actively transmitting or just released, releasing PTT is not a button click
             if (s_ptt_mode) {
-                if (s_ptt_active || (now - s_last_ptt_ended_ms < 350)) {
+                if (s_ptt_active || (now - s_last_ptt_ended_ms < 500)) {
                     return;
                 }
             }
@@ -1493,8 +1493,8 @@ extern "C" void app_main() {
                 if (!s_last_ptt_raw_down) {
                     s_talk_down_ms = now;
                 }
-                // Crisp 60ms debounce: immediately streams audio
-                if (!s_ptt_active && (now - s_talk_down_ms >= 60)) {
+                // Fast 30ms start debounce: immediately streams audio
+                if (!s_ptt_active && (now - s_talk_down_ms >= 30)) {
                     s_ptt_active = true;
                     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                     audio::set_ptt_active(true);
@@ -1507,8 +1507,9 @@ extern "C" void app_main() {
             } else {
                 if (s_ptt_active) {
                     if (s_ptt_release_ms == 0) s_ptt_release_ms = now;
-                    // 70ms squelch tail / hangover: protects last syllables and eliminates jitter dropouts
-                    if (now - s_ptt_release_ms >= 70) {
+                    // Robust 350ms hangover: bridges USB headset HID pulse chatter & contact bounce
+                    // Keeps transmitting continuously until the user actually releases the button
+                    if (now - s_ptt_release_ms >= 350) {
                         s_ptt_active = false;
                         s_last_ptt_ended_ms = now;
                         s_ptt_release_ms = 0;
