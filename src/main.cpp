@@ -1,5 +1,6 @@
 // ESP32-S3 mesh walkie-talkie: USB-C headset, ESP-NOW, every node in range joins one
 // conference automatically. See README.md.
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -890,9 +891,18 @@ void on_rx(const radio::Rx& rx) {
                         }
                     }
 
-                    printf("  probe #%-2u: OK | %3d%% Link | Downlink: %4d dBm | Uplink: %4d dBm | Zone: %s\n",
-                           resp.seq, pct, rx.rssi, resp.req_rssi,
-                           new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    float est_m = powf(10.0f, (-40.0f - rx.rssi) / 25.0f);
+                    if (est_m < 0.2f) est_m = 0.2f;
+
+                    if (est_m < 1.0f) {
+                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
+                               new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    } else {
+                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, pct, rx.rssi, est_m, resp.req_rssi,
+                               new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
+                    }
                 }
             }
             break;
@@ -1533,6 +1543,7 @@ void help() {
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
            "  scan       collaborative spectrum scan: consensus best channel & backup for all nodes\n"
+           "  ftm        measure precise distance via Wi-Fi FTM (Fine Timing Measurement)\n"
            "  debug      toggle quiet snowboard mode vs verbose debug alerts\n"
            "  + / -      volume\n"
            "  p          ping all nodes\n"
@@ -1596,6 +1607,39 @@ void console_task(void*) {
         }
         else if (!strcmp(line, "scan")) {
             collaborative_channel_scan();
+        }
+        else if (!strcmp(line, "ftm")) {
+            uint8_t direct_mac[6] = {0};
+            bool found_peer = false;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used && p->hops == 0) {
+                    for (int i = 0; i < 6; i++) {
+                        if (p->mac[i] != 0) {
+                            memcpy(direct_mac, p->mac, 6);
+                            found_peer = true;
+                            break;
+                        }
+                    }
+                    if (found_peer) break;
+                }
+            }
+            radio::peers_unlock();
+            if (found_peer) {
+                wifi_ftm_initiator_cfg_t ftmi_cfg = {};
+                memcpy(ftmi_cfg.resp_mac, direct_mac, 6);
+                ftmi_cfg.channel = radio::channel();
+                ftmi_cfg.frm_count = 16;
+                ftmi_cfg.burst_period = 2;
+                printf("[FTM] Measuring nanosecond RTT distance to peer %02x:%02x:%02x:%02x:%02x:%02x on Ch %u...\n",
+                       direct_mac[0], direct_mac[1], direct_mac[2], direct_mac[3], direct_mac[4], direct_mac[5], radio::channel());
+                esp_err_t err = esp_wifi_ftm_initiate_session(&ftmi_cfg);
+                if (err != ESP_OK) {
+                    printf("[FTM] Failed to initiate session: %s\n", esp_err_to_name(err));
+                }
+            } else {
+                printf("[FTM] No direct peer MAC available in peer table. Send a ping or walk probe first!\n");
+            }
         }
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
         else if (!strcmp(line, "vm") || !strcmp(line, "record")) {
@@ -1670,6 +1714,23 @@ void init_gpio(gpio_num_t pin) {
 
 bool low(gpio_num_t pin) { return gpio_get_level(pin) == 0; }
 
+static void ftm_event_handler(void* arg, esp_event_base_t event_base,
+                              int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_FTM_REPORT) {
+        wifi_event_ftm_report_t *event = static_cast<wifi_event_ftm_report_t *>(event_data);
+        if (event->status == FTM_STATUS_SUCCESS) {
+            uint32_t dist_cm = event->dist_est;
+            uint32_t rtt_ns = event->rtt_est;
+            printf("\n*** [FTM PRECISION DISTANCE] Peer %02x:%02x:%02x:%02x:%02x:%02x -> Distance: %lu cm (%.2f m) | RTT: %lu ns ***\n\n",
+                   event->peer_mac[0], event->peer_mac[1], event->peer_mac[2],
+                   event->peer_mac[3], event->peer_mac[4], event->peer_mac[5],
+                   (unsigned long)dist_cm, dist_cm / 100.0f, (unsigned long)rtt_ns);
+        } else {
+            printf("[FTM] Session status: %d (FTM measurement unavailable, using RF SNR)\n", event->status);
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" void app_main() {
@@ -1685,6 +1746,7 @@ extern "C" void app_main() {
     s_app_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_FTM_REPORT, ftm_event_handler, NULL, NULL);
 
     size_t len = sizeof s_name;
     if (nvs_get_str(s_nvs, "name", s_name, &len) != ESP_OK)

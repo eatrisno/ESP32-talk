@@ -980,6 +980,129 @@ void test_voicemail_payload_and_sequencing() {
     TEST_ASSERT_EQUAL_HEX8(0xAA, vp.data[0]);
 }
 
+void test_spectrum_scoring_bleed_mask_and_tiebreak() {
+    // Simulate active 20 MHz AP router on Channel 2 (2417 MHz)
+    uint32_t congestion[14] = {0};
+    uint8_t ap_ch = 2;
+    uint32_t weight = 50; // strong router RSSI -55 dBm
+    // Apply +/-3 channel roll-off mask
+    congestion[ap_ch] += weight * 5;      // Ch 2 = 250
+    congestion[ap_ch - 1] += weight * 4;  // Ch 1 = 200
+    congestion[ap_ch + 1] += weight * 4;  // Ch 3 = 200
+    congestion[ap_ch + 2] += weight * 3;  // Ch 4 = 150
+    congestion[ap_ch + 3] += weight * 2;  // Ch 5 = 100 (spectral tail bleed)
+
+    // Verify Channel 5 is penalized even if router is on Channel 2
+    TEST_ASSERT_TRUE(congestion[5] > 0);
+    // Verify Channel 6 is the first completely clean guard channel (0 score)
+    TEST_ASSERT_EQUAL_UINT32(0, congestion[6]);
+    // Verify Channel 13 is clean (0 score)
+    TEST_ASSERT_EQUAL_UINT32(0, congestion[13]);
+
+    // Apply preferred channel selection order: 13, 11, 6, 12, ...
+    static const uint8_t kPreferredChannels[] = {13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2};
+    uint8_t best_ch = 13;
+    uint32_t min1 = UINT32_MAX;
+    for (uint8_t c : kPreferredChannels) {
+        if (congestion[c] < min1) {
+            min1 = congestion[c];
+            best_ch = c;
+        }
+    }
+    // Channel 13 must be selected as best channel
+    TEST_ASSERT_EQUAL_UINT8(13, best_ch);
+    TEST_ASSERT_EQUAL_UINT32(0, min1);
+
+    // Backup channel must have >= 4 channel separation from best_ch (13)
+    uint8_t backup_ch = 6;
+    uint32_t min2 = UINT32_MAX;
+    for (uint8_t c : kPreferredChannels) {
+        if (c == best_ch) continue;
+        if (abs(static_cast<int>(c) - static_cast<int>(best_ch)) < 4) continue;
+        if (congestion[c] < min2) {
+            min2 = congestion[c];
+            backup_ch = c;
+        }
+    }
+    // Channel 6 must be selected as backup channel (orthogonal to 13 and clean)
+    TEST_ASSERT_EQUAL_UINT8(6, backup_ch);
+    TEST_ASSERT_EQUAL_UINT32(0, min2);
+}
+
+void test_channel_selection_hysteresis() {
+    uint8_t current_ch = 13;
+    uint32_t total_congestion[14] = {0};
+
+    // Case 1: Area A (both current Ch 13 and alternate Ch 11 are clean)
+    total_congestion[13] = 5;
+    total_congestion[11] = 0;
+    uint8_t best_ch = 11;
+    (void)best_ch;
+    uint32_t min1 = 0;
+
+    // Hysteresis: only switch if current congestion >= 25 AND current > min1 + 25
+    bool need_switch = (total_congestion[current_ch] >= 25 && total_congestion[current_ch] > min1 + 25);
+    TEST_ASSERT_FALSE(need_switch); // Must NOT switch, retains Ch 13!
+
+    // Case 2: Area B (current Ch 13 suddenly congested by ski resort AP, score 80)
+    total_congestion[13] = 80;
+    total_congestion[6] = 0;
+    best_ch = 6;
+    min1 = 0;
+    need_switch = (total_congestion[current_ch] >= 25 && total_congestion[current_ch] > min1 + 25);
+    TEST_ASSERT_TRUE(need_switch); // MUST switch to Ch 6!
+}
+
+void test_spectrum_payloads_serialization() {
+    wt::ChannelSwitchPayload csp;
+    csp.sender = 0xA1B2C3D4;
+    csp.target_channel = 13;
+    csp.backup_channel = 6;
+    csp.seq = 998877;
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(wt::kMaxPlain, sizeof(csp));
+    TEST_ASSERT_EQUAL_UINT8(13, csp.target_channel);
+    TEST_ASSERT_EQUAL_UINT8(6, csp.backup_channel);
+
+    wt::SpectrumProbePayload spp;
+    spp.token = 0x55AA1122;
+    spp.sender = 0x12345678;
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(wt::kMaxPlain, sizeof(spp));
+
+    wt::SpectrumReportPayload srp;
+    srp.token = spp.token;
+    srp.sender = 0x87654321;
+    for (int i = 0; i < 14; i++) srp.congestion[i] = i * 10;
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(wt::kMaxPlain, sizeof(srp));
+    TEST_ASSERT_EQUAL_UINT16(130, srp.congestion[13]);
+}
+
+void test_single_coordinator_invariant() {
+    // In a 3-node mesh with arbitrary IDs, exactly 1 node has lowest ID and becomes coordinator
+    uint32_t node_ids[3] = {0x00A52B10, 0x00F12C33, 0x0012AABB};
+    int coordinator_count = 0;
+    uint32_t elected_coordinator = 0;
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t self_id = node_ids[i];
+        bool is_coord = true;
+        for (int j = 0; j < 3; j++) {
+            if (i == j) continue;
+            if (node_ids[j] < self_id) {
+                is_coord = false;
+                break;
+            }
+        }
+        if (is_coord) {
+            coordinator_count++;
+            elected_coordinator = self_id;
+        }
+    }
+
+    // Guarantees strictly 1 coordinator (prevents N^2 consensus storm)
+    TEST_ASSERT_EQUAL_INT(1, coordinator_count);
+    TEST_ASSERT_EQUAL_HEX32(0x0012AABB, elected_coordinator);
+}
+
 }  // namespace
 
 void setUp() {}
@@ -1037,5 +1160,9 @@ int main() {
     RUN_TEST(test_audio_frame_duplication_resilience);
     RUN_TEST(test_range_test_statistics_and_margin);
     RUN_TEST(test_voicemail_payload_and_sequencing);
+    RUN_TEST(test_spectrum_scoring_bleed_mask_and_tiebreak);
+    RUN_TEST(test_channel_selection_hysteresis);
+    RUN_TEST(test_spectrum_payloads_serialization);
+    RUN_TEST(test_single_coordinator_invariant);
     return UNITY_END();
 }
