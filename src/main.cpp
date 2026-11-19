@@ -13,6 +13,7 @@
 #include "esp_random.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -56,6 +57,32 @@ static uint32_t s_last_distress_beep_ms = 0;
 static uint32_t s_last_distress_rx_ms = 0;
 static volatile bool s_vm_recording = false;
 static temperature_sensor_handle_t s_temp_sensor = nullptr;
+
+// --- Audio Voice Menu & PTT state ---
+enum MenuItem : uint8_t {
+    MENU_VOICE_NOTE = 0,
+    MENU_RADAR,
+    MENU_WALK,
+    MENU_TALK_MODE,
+    MENU_CHANNEL,
+    MENU_POWER_OFF,
+    MENU_COUNT
+};
+
+static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
+static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
+static bool s_menu_active = false;
+static uint8_t s_menu_item = MENU_VOICE_NOTE;
+static bool s_menu_channel_active = false;
+static uint8_t s_menu_channel_candidate = 1;
+static uint32_t s_last_menu_activity_ms = 0;
+
+void enter_menu();
+void exit_menu();
+void menu_next();
+void menu_prev();
+void menu_select();
+void system_power_off();
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -111,6 +138,11 @@ void update_led() {
             s_red_on = !s_red_on;
         }
         led::set(s_red_on ? Color::Red : Color::Off);
+        return;
+    }
+
+    if (s_menu_active) {
+        led::set(Color::White);
         return;
     }
 
@@ -498,6 +530,7 @@ void handle_press(wt::Press p, int which) {
     // which: 0 = talk button (BOOT, external, headset), 1 = vol up, 2 = vol down
     if (p == wt::Press::None) return;
     ESP_LOGI(TAG, "Button %d event: %d", which, static_cast<int>(p));
+
     if (which == 0) {
         if (s_distress_active) {
             // Any click or press while distress is active immediately cancels it!
@@ -505,6 +538,26 @@ void handle_press(wt::Press p, int which) {
             toggle_distress();
             return;
         }
+
+        if (s_menu_active) {
+            uint32_t now = now_ms();
+            if (p == wt::Press::Click) {
+                if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
+                    // Double click inside menu: exit menu immediately!
+                    s_talk_click_count = 0;
+                    exit_menu();
+                    return;
+                }
+                s_talk_click_count = 1;
+                s_last_talk_click_ms = now;
+                menu_next();
+            } else if (p == wt::Press::Long || p == wt::Press::Hold) {
+                s_talk_click_count = 0;
+                menu_select();
+            }
+            return;
+        }
+
         if (p == wt::Press::Click) {
             uint32_t now = now_ms();
             if (s_vm_recording) {
@@ -516,11 +569,19 @@ void handle_press(wt::Press p, int which) {
             if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
                 s_talk_click_count++;
                 s_last_talk_click_ms = now;
-                if (s_talk_click_count >= 3) {
-                    // Triple click: start Voice Mail record!
+                if (s_talk_click_count == 2) {
+                    if (s_vm_inbox_has_message) {
+                        s_talk_click_count = 0;
+                        dismiss_inbox_voicemail();
+                    } else {
+                        // Double click from normal standby: ENTER AUDIO MENU!
+                        s_talk_click_count = 0;
+                        enter_menu();
+                    }
+                } else if (s_talk_click_count >= 3) {
+                    // Triple click: quick direct radar check!
                     s_talk_click_count = 0;
-                    ESP_LOGI(TAG, "Triple click: start Voice Mail recording");
-                    start_voicemail_recording();
+                    radar_check();
                 }
             } else {
                 s_talk_click_count = 1;
@@ -537,8 +598,20 @@ void handle_press(wt::Press p, int which) {
             toggle_distress();
         }
     }
-    if (which == 1 && p == wt::Press::Click) volume_step(+10);
-    if (which == 2 && p == wt::Press::Click) volume_step(-10);
+    if (which == 1) { // Vol Up
+        if (s_menu_active) {
+            menu_prev();
+        } else if (p == wt::Press::Click) {
+            volume_step(+10);
+        }
+    }
+    if (which == 2) { // Vol Down
+        if (s_menu_active) {
+            menu_next();
+        } else if (p == wt::Press::Click) {
+            volume_step(-10);
+        }
+    }
 }
 
 // --- radio rx --------------------------------------------------------------------------
@@ -757,6 +830,154 @@ void toggle_walk_mode() {
     }
 }
 
+// --- Audio Voice Menu Engine -----------------------------------------------------------
+
+void system_power_off() {
+    printf("\n*** [SYSTEM] Powering off into Deep Sleep... ***\n\n");
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_POWER_OFF);
+    vTaskDelay(pdMS_TO_TICKS(650));
+    led::set(led::Color::Off);
+
+    // Wakeup on BOOT button (GPIO 0) and optional external Talk button (GPIO 4)
+    esp_sleep_enable_ext0_wakeup(cfg::kPinBoot, 0);
+    uint64_t mask = (1ULL << cfg::kPinBoot);
+    if (cfg::kPinTalk != GPIO_NUM_NC) {
+        mask |= (1ULL << cfg::kPinTalk);
+    }
+    esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
+
+void exit_menu() {
+    if (!s_menu_active) return;
+    s_menu_active = false;
+    s_menu_channel_active = false;
+    audio::prompt_clear();
+    audio::tone(600, 25, 300);
+    audio::tone(0, 15);
+    audio::tone(450, 35, 300);
+    printf("[Menu] Exited.\n");
+}
+
+void announce_current_menu_item() {
+    audio::prompt_clear();
+    if (s_menu_channel_active) {
+        if (s_menu_channel_candidate >= 1 && s_menu_channel_candidate <= 13) {
+            audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (s_menu_channel_candidate - 1)));
+        }
+        return;
+    }
+    switch (s_menu_item) {
+        case MENU_VOICE_NOTE:
+            audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
+            break;
+        case MENU_RADAR:
+            audio::prompt(wt::PROMPT_MENU_RADAR);
+            break;
+        case MENU_WALK:
+            audio::prompt(wt::PROMPT_MENU_WALK);
+            break;
+        case MENU_TALK_MODE:
+            audio::prompt(s_ptt_mode ? wt::PROMPT_MENU_HANDS_FREE : wt::PROMPT_MENU_PTT);
+            break;
+        case MENU_CHANNEL:
+            audio::prompt(wt::PROMPT_MENU_CHANNEL);
+            break;
+        case MENU_POWER_OFF:
+            audio::prompt(wt::PROMPT_POWER_OFF);
+            break;
+        default:
+            break;
+    }
+}
+
+void enter_menu() {
+    s_menu_active = true;
+    s_menu_channel_active = false;
+    s_menu_item = MENU_VOICE_NOTE;
+    s_last_menu_activity_ms = now_ms();
+    audio::prompt_clear();
+    audio::prompt(wt::PROMPT_MENU);
+    audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
+    printf("[Menu] Entered Audio Menu. 1x click to cycle, Hold to select, Double-click to exit.\n");
+}
+
+void menu_next() {
+    s_last_menu_activity_ms = now_ms();
+    if (s_menu_channel_active) {
+        s_menu_channel_candidate++;
+        if (s_menu_channel_candidate > 13) s_menu_channel_candidate = 1;
+        printf("[Menu] Channel preview: %u\n", s_menu_channel_candidate);
+    } else {
+        s_menu_item = (s_menu_item + 1) % MENU_COUNT;
+        printf("[Menu] Item %u\n", s_menu_item);
+    }
+    announce_current_menu_item();
+}
+
+void menu_prev() {
+    s_last_menu_activity_ms = now_ms();
+    if (s_menu_channel_active) {
+        s_menu_channel_candidate = (s_menu_channel_candidate <= 1) ? 13 : s_menu_channel_candidate - 1;
+        printf("[Menu] Channel preview: %u\n", s_menu_channel_candidate);
+    } else {
+        s_menu_item = (s_menu_item + MENU_COUNT - 1) % MENU_COUNT;
+        printf("[Menu] Item %u\n", s_menu_item);
+    }
+    announce_current_menu_item();
+}
+
+void menu_select() {
+    s_last_menu_activity_ms = now_ms();
+    if (s_menu_channel_active) {
+        radio::set_channel(s_menu_channel_candidate);
+        nvs_put_u8("ch", s_menu_channel_candidate);
+        printf("[Menu] Radio Channel confirmed: %u\n", s_menu_channel_candidate);
+        exit_menu();
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_CONNECTED);
+        return;
+    }
+    switch (s_menu_item) {
+        case MENU_VOICE_NOTE:
+            exit_menu();
+            start_voicemail_recording();
+            break;
+        case MENU_RADAR:
+            exit_menu();
+            radar_check();
+            break;
+        case MENU_WALK:
+            exit_menu();
+            toggle_walk_mode();
+            audio::prompt_clear();
+            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
+            break;
+        case MENU_TALK_MODE:
+            s_ptt_mode = !s_ptt_mode;
+            nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
+            if (audio::talking()) toggle_talk();
+            exit_menu();
+            audio::prompt_clear();
+            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+            printf("[Menu] Talk mode set to: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
+            break;
+        case MENU_CHANNEL:
+            s_menu_channel_active = true;
+            s_menu_channel_candidate = radio::channel();
+            printf("[Menu] Channel selector active. Current: %u. Click to cycle, hold to confirm.\n", s_menu_channel_candidate);
+            announce_current_menu_item();
+            break;
+        case MENU_POWER_OFF:
+            system_power_off();
+            break;
+        default:
+            exit_menu();
+            break;
+    }
+}
+
 // --- console ---------------------------------------------------------------------------
 
 void print_status() {
@@ -766,8 +987,9 @@ void print_status() {
     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
     memcpy(name, s_name, sizeof name);
     xSemaphoreGive(s_app_mtx);
-    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s%s\n", name, (unsigned long)radio::self_id(),
+    printf("\n%s  node %08lx  ch %u  vol %u%%  mic %s  mode %s%s\n", name, (unsigned long)radio::self_id(),
            radio::channel(), audio::volume(), audio::talking() ? "OPEN" : "muted",
+           s_ptt_mode ? "PTT" : "VOX Hands-Free",
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
     printf("  peers:\n");
@@ -803,8 +1025,9 @@ void print_status() {
     if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
     uint32_t free_ram = esp_get_free_heap_size() / 1024;
     uint32_t min_ram = esp_get_minimum_free_heap_size() / 1024;
-    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s%s\n",
+    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s%s%s\n",
            temp_c, (unsigned long)free_ram, (unsigned long)min_ram,
+           s_menu_active ? "  [MENU ACTIVE]" : "",
            s_distress_active ? "  [DISTRESS ACTIVE]" : "",
            s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "",
            s_vm_outbox_pending ? "  [VOICE NOTE IN OUTBOX]" : "");
@@ -848,20 +1071,23 @@ void selftest() {
 }
 
 void help() {
-    printf("\n  t          talk on/off (same as BOOT or headset button click)\n"
-           "  r / c      radar: check peer count and distance (same as double click)\n"
-           "  vm         record voice mail / send (same as triple click, then click to send)\n"
+    printf("\n  t          talk on/off (same as BOOT or headset button click in VOX mode)\n"
+           "  m / menu   open/close audio voice menu (same as double click)\n"
+           "  ptt        toggle Classic PTT vs Hands-Free VOX mode\n"
+           "  r / c      radar: check peer count and distance (same as triple click)\n"
+           "  vm         record voice mail / send\n"
            "  send       send recorded voice mail (or flush outbox)\n"
            "  sos        distress SOS on/off (same as holding button 2.5s)\n"
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
            "  + / -      volume\n"
-           "  p          ping all nodes (same as long press)\n"
+           "  p          ping all nodes\n"
            "  s          status, peers, counters\n"
            "  ch N       radio channel 1..13 (all nodes must match)\n"
            "  name X     set this node's name\n"
            "  loop       loopback test: hear your own voice through the codec\n"
            "  selftest   check headset streams and the audio path\n"
+           "  off        power off / deep sleep (wakes on BOOT press)\n"
            "  reboot\n\n");
 }
 
@@ -882,6 +1108,21 @@ void console_task(void*) {
         line[n] = 0;
         n = 0;
         if (!strcmp(line, "t")) toggle_talk();
+        else if (!strcmp(line, "m") || !strcmp(line, "menu")) {
+            if (s_menu_active) exit_menu();
+            else enter_menu();
+        }
+        else if (!strcmp(line, "ptt")) {
+            s_ptt_mode = !s_ptt_mode;
+            nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
+            if (audio::talking()) toggle_talk();
+            printf("Talk Mode: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
+            audio::prompt_clear();
+            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+        }
+        else if (!strcmp(line, "off") || !strcmp(line, "poweroff") || !strcmp(line, "shutdown")) {
+            system_power_off();
+        }
         else if (!strcmp(line, "r") || !strcmp(line, "c")) radar_check();
         else if (!strcmp(line, "vm") || !strcmp(line, "record")) {
             if (s_vm_recording) send_voicemail();
@@ -967,6 +1208,7 @@ extern "C" void app_main() {
         snprintf(s_name, sizeof s_name, "node-%04x", static_cast<unsigned>(esp_random() & 0xFFFF));
     uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
+    s_ptt_mode = (nvs_u8("ptt", 0) != 0);
 
     led::start();
     led::set(led::Color::Blue);
@@ -990,7 +1232,8 @@ extern "C" void app_main() {
     }
     usb_headset::start(on_hid_buttons, on_headset_state);
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
-    printf("\n%s ready on channel %u. Type 'h' for commands.\n", s_name, ch);
+    printf("\n%s ready on channel %u (mode: %s). Type 'h' for commands.\n", s_name, ch,
+           s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
 
     wt::ButtonDetector talk, up, down;
     uint8_t last_toggle = 0;
@@ -1056,26 +1299,77 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
+        // Classic PTT mode: press and hold button to talk, release to mute with roger beep
+        bool talk_raw_down = low(cfg::kPinBoot) || low(cfg::kPinTalk) || (hid & wt::HID_BTN_TALK);
+        static bool s_last_talk_raw_down = false;
+        static uint32_t s_talk_down_ms = 0;
+        if (s_ptt_mode && !s_menu_active && !s_vm_recording && !s_distress_active) {
+            if (talk_raw_down && !s_last_talk_raw_down) {
+                s_talk_down_ms = now;
+            }
+            if (talk_raw_down && !s_ptt_active && (now - s_talk_down_ms >= 120)) {
+                // Held >= 120ms: activate PTT transmission
+                s_ptt_active = true;
+                if (!audio::talking()) {
+                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                    audio::set_talking(true);
+                    xSemaphoreGive(s_app_mtx);
+                    broadcast_state();
+                    audio::tone(880, 25, 350); // PTT talk start chirp
+                    ESP_LOGI(TAG, "PTT: TX active (held)");
+                }
+            }
+            if (!talk_raw_down && s_last_talk_raw_down) {
+                if (s_ptt_active) {
+                    s_ptt_active = false;
+                    if (audio::talking()) {
+                        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                        audio::set_talking(false);
+                        xSemaphoreGive(s_app_mtx);
+                        broadcast_state();
+                        // Roger beep on release (descending two-tone)
+                        audio::tone(587, 25, 300);
+                        audio::tone(0, 10);
+                        audio::tone(880, 35, 300);
+                        ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
+                    }
+                }
+            }
+        }
+        s_last_talk_raw_down = talk_raw_down;
+
         // Handle pending click evaluation (kMultiClickWindowMs after last click)
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
             uint8_t count = s_talk_click_count;
             s_talk_click_count = 0;
-            if (s_vm_inbox_has_message) {
-                if (count == 1) {
-                    // Click once to hear, click 1 more to repeat
-                    play_inbox_voicemail();
-                } else if (count == 2) {
-                    // Click 2 times to remove or dismiss
-                    dismiss_inbox_voicemail();
-                }
-            } else {
-                if (count == 1) {
-                    toggle_talk();
-                } else if (count == 2) {
-                    ESP_LOGI(TAG, "Double click: radar check");
-                    radar_check();
+            if (!s_menu_active) {
+                if (s_vm_inbox_has_message) {
+                    if (count == 1) {
+                        // Click once to hear, click 1 more to repeat
+                        play_inbox_voicemail();
+                    }
+                } else {
+                    if (count == 1) {
+                        if (!s_ptt_mode) {
+                            toggle_talk(); // 1 click in Hands-free: toggle mic!
+                        } else {
+                            // In PTT mode: quick tap gives a soft chirp acknowledgment
+                            audio::tone(700, 20, 300);
+                        }
+                    }
                 }
             }
+        }
+
+        // Audio Voice Menu inactivity timeout (3.5 seconds)
+        if (s_menu_active && (now - s_last_menu_activity_ms >= 3500)) {
+            if (s_menu_channel_active) {
+                radio::set_channel(s_menu_channel_candidate);
+                nvs_put_u8("ch", s_menu_channel_candidate);
+                audio::prompt_clear();
+                audio::prompt(wt::PROMPT_CONNECTED);
+            }
+            exit_menu();
         }
 
         // Voice mail outbox: automatically deliver stored voice mail when a peer reconnects
