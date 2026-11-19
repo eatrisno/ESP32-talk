@@ -891,7 +891,23 @@ void on_rx(const radio::Rx& rx) {
                         }
                     }
 
-                    float est_m = powf(10.0f, (-40.0f - rx.rssi) / 25.0f);
+                    // Bidirectional RSSI average (combines Downlink and Uplink to eliminate antenna orientation mismatch)
+                    float eff_rssi = (static_cast<float>(rx.rssi) + static_cast<float>(resp.req_rssi)) / 2.0f;
+
+                    // Exponential Moving Average filter to smooth out indoor multipath reflections
+                    static float s_smoothed_rssi = -50.0f;
+                    static bool s_smoothed_init = false;
+                    if (!s_smoothed_init) {
+                        s_smoothed_rssi = eff_rssi;
+                        s_smoothed_init = true;
+                    } else {
+                        s_smoothed_rssi = 0.65f * s_smoothed_rssi + 0.35f * eff_rssi;
+                    }
+
+                    // Calibrated Log-Distance Path-Loss for ESP32-S3 PCB antenna (+21 dBm TX):
+                    // Reference RSSI at 1 meter: ~ -50 dBm
+                    // Path loss exponent n = 2.4 (indoor/outdoor mixed environment)
+                    float est_m = powf(10.0f, (-50.0f - s_smoothed_rssi) / 24.0f);
                     if (est_m < 0.2f) est_m = 0.2f;
 
                     if (est_m < 1.0f) {
