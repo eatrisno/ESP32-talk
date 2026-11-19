@@ -1289,18 +1289,6 @@ void collaborative_channel_scan(bool quiet) {
         }
     }
 
-    // Find Second Best Channel with orthogonal guard band (at least 4 channels away from best_ch)
-    uint8_t backup_ch = (best_ch == 13 || best_ch == 11) ? 6 : 13;
-    uint32_t min2 = UINT32_MAX;
-    for (uint8_t c : kPreferredChannels) {
-        if (c == best_ch) continue;
-        if (abs(static_cast<int>(c) - static_cast<int>(best_ch)) < 4) continue;
-        if (total_congestion[c] < min2) {
-            min2 = total_congestion[c];
-            backup_ch = c;
-        }
-    }
-
     uint32_t cur_congestion = total_congestion[s_primary_channel];
     bool need_primary_switch = false;
 
@@ -1320,17 +1308,33 @@ void collaborative_channel_scan(bool quiet) {
                    s_primary_channel, (unsigned long)cur_congestion, best_ch, (unsigned long)min1);
         } else {
             // Retain current channel to avoid unnecessary hops
-            best_ch = s_primary_channel;
             printf("*** [MESH AUTO-CONSENSUS] Current Ch %u remains adequate (Score: %lu vs best Ch: %lu). Retaining channel. ***\n",
                    s_primary_channel, (unsigned long)cur_congestion, (unsigned long)min1);
         }
     }
 
+    uint8_t effective_primary = need_primary_switch ? best_ch : s_primary_channel;
+
+    // Find Best Backup Channel with orthogonal guard band (at least 4 channels away from effective_primary)
+    uint8_t backup_ch = (effective_primary >= 10) ? 6 : 13;
+    uint32_t min2 = UINT32_MAX;
+    for (uint8_t c : kPreferredChannels) {
+        if (c == effective_primary) continue;
+        if (abs(static_cast<int>(c) - static_cast<int>(effective_primary)) < 4) continue;
+        if (total_congestion[c] < min2) {
+            min2 = total_congestion[c];
+            backup_ch = c;
+        }
+    }
+    if (backup_ch == effective_primary) {
+        backup_ch = (effective_primary >= 10) ? 6 : 13;
+    }
+
     if (need_primary_switch) {
         printf("\n>>> CONSENSUS DECISION FOR MESH: <<<\n");
-        printf("  [PRIMARY] Channel %u (Score: %lu) - Best for all nodes\n", best_ch, (unsigned long)min1);
+        printf("  [PRIMARY] Channel %u (Score: %lu) - Best for all nodes\n", effective_primary, (unsigned long)min1);
         printf("  [BACKUP ] Channel %u (Score: %lu) - Second best for recovery (orthogonal)\n\n", backup_ch, (unsigned long)min2);
-        sync_channel_to_mesh(best_ch, backup_ch, quiet);
+        sync_channel_to_mesh(effective_primary, backup_ch, quiet);
     } else if (backup_ch != s_backup_channel) {
         printf("*** [AUTO-CONSENSUS] Updating Backup Channel to %u (Primary remains Ch %u) ***\n",
                backup_ch, s_primary_channel);

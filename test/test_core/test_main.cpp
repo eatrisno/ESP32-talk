@@ -1051,6 +1051,19 @@ void test_channel_selection_hysteresis() {
     min1 = 0;
     need_switch = (total_congestion[current_ch] >= 25 && total_congestion[current_ch] > min1 + 25);
     TEST_ASSERT_TRUE(need_switch); // MUST switch to Ch 6!
+
+    // Case 3: Primary Ch 6 retained by hysteresis, backup MUST be orthogonal (e.g. 13) and never equal 6
+    uint8_t effective_primary = 6;
+    static const uint8_t kPref[] = {13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2};
+    uint8_t backup_ch = 13;
+    for (uint8_t c : kPref) {
+        if (c == effective_primary) continue;
+        if (abs(static_cast<int>(c) - static_cast<int>(effective_primary)) < 4) continue;
+        backup_ch = c;
+        break;
+    }
+    TEST_ASSERT_NOT_EQUAL(effective_primary, backup_ch);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(4, abs(static_cast<int>(backup_ch) - static_cast<int>(effective_primary)));
 }
 
 void test_spectrum_payloads_serialization() {
