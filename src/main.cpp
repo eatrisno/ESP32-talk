@@ -219,9 +219,10 @@ void toggle_distress() {
     } else {
         printf("\n*** [DISTRESS CANCELLED] All-clear broadcasted. ***\n\n");
         audio::prompt(wt::PROMPT_EMERGENCY_OFF);
-        // Automatically mute microphone when emergency is cleared
+        // Restore saved mic state from NVS
+        uint8_t mic_saved = nvs_u8("mic", 0);
         xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-        audio::set_talking(false);
+        audio::set_talking(!s_ptt_mode && (mic_saved != 0));
         xSemaphoreGive(s_app_mtx);
         broadcast_state();
     }
@@ -248,10 +249,11 @@ void toggle_talk() {
     bool on = !audio::talking();
     audio::set_talking(on);
     xSemaphoreGive(s_app_mtx);
+    nvs_put_u8("mic", on ? 1 : 0);
     audio::prompt_clear();
     audio::prompt(on ? wt::PROMPT_MIC_ON : wt::PROMPT_MIC_OFF);
     broadcast_state();
-    ESP_LOGI(TAG, "mic %s", on ? "OPEN" : "muted");
+    ESP_LOGI(TAG, "mic %s (saved to NVS)", on ? "OPEN" : "muted");
 }
 
 void send_ping() {
@@ -876,6 +878,7 @@ void run_range_test(int count) {
 
 void toggle_walk_mode() {
     s_walk_mode = !s_walk_mode;
+    nvs_put_u8("walk", s_walk_mode ? 1 : 0);
     if (s_walk_mode) {
         s_range_token = esp_random();
         s_walk_seq = 0;
@@ -1017,7 +1020,7 @@ void menu_enter_sub() {
             start_voicemail_recording();
             break;
         case MENU_RADAR:
-            exit_menu(false);
+            printf("[Menu] Radar check triggered (staying in menu). Hold again to scan again, Click for next item.\n");
             radar_check();
             break;
         case MENU_POWER_OFF:
@@ -1044,9 +1047,15 @@ void menu_sub_action() {
         case MENU_TALK_MODE:
             s_ptt_mode = !s_ptt_mode;
             nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-            if (audio::talking()) {
+            if (s_ptt_mode && audio::talking()) {
                 xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                 audio::set_talking(false);
+                xSemaphoreGive(s_app_mtx);
+                broadcast_state();
+            } else if (!s_ptt_mode) {
+                uint8_t mic_saved = nvs_u8("mic", 0);
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                audio::set_talking(mic_saved != 0);
                 xSemaphoreGive(s_app_mtx);
                 broadcast_state();
             }
@@ -1350,6 +1359,8 @@ extern "C" void app_main() {
     uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
     s_ptt_mode = (nvs_u8("ptt", 0) != 0);
+    s_walk_mode = (nvs_u8("walk", 0) != 0);
+    uint8_t mic_saved = nvs_u8("mic", 0);
 
     led::start();
     led::set(led::Color::Blue);
@@ -1367,6 +1378,15 @@ extern "C" void app_main() {
         vTaskDelay(portMAX_DELAY);
     }
     audio::start();
+    if (!s_ptt_mode && mic_saved) {
+        audio::set_talking(true);
+        ESP_LOGI(TAG, "Restored mic state: OPEN (Hands-Free VOX)");
+    }
+    if (s_walk_mode) {
+        s_range_token = esp_random();
+        s_walk_seq = 0;
+        ESP_LOGI(TAG, "Restored Walk Mode: ACTIVE");
+    }
     temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
     if (temperature_sensor_install(&temp_cfg, &s_temp_sensor) == ESP_OK) {
         temperature_sensor_enable(s_temp_sensor);
