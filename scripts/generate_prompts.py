@@ -48,7 +48,7 @@ def process_single_file(path):
         ch = w.getnchannels()
         sw = w.getsampwidth()
         frames = w.readframes(w.getnframes())
-        raw = np.frombuffer(frames, dtype=np.int16)
+        raw = np.frombuffer(frames, dtype=np.int16).copy()
         if ch > 1:
             raw = raw[::ch]  # take first channel if stereo
 
