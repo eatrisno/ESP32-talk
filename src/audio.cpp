@@ -32,8 +32,11 @@ struct Talker {
 SemaphoreHandle_t s_mtx;           // guards talkers, tones, loopback buffer
 Talker s_talkers[kMaxTalkers];
 wt::ToneQueue s_tones;
+wt::PromptQueue s_prompts;
 wt::JitterBuffer s_loop;           // loopback path
 volatile bool s_talking = false, s_sending = false, s_receiving = false, s_loopback = false;
+volatile bool s_recording_vm = false;
+VoicemailRecordCb s_vm_cb = nullptr;
 volatile uint8_t s_volume = 70;
 Stats s_stats;
 
@@ -100,7 +103,7 @@ void mic_task(void*) {
             peak_blocks = 0;
         }
         size_t m = rs.process(mono, n, v8, 512);
-        bool active = s_talking || s_loopback;
+        bool active = s_talking || s_loopback || s_recording_vm;
         for (size_t i = 0; i < m; i++) {
             frame[fill++] = v8[i];
             if (fill < wt::kFrameSamples) continue;
@@ -110,6 +113,18 @@ void mic_task(void*) {
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
             agc.process(frame, wt::kFrameSamples, gate.speech_now());
             if (!active) continue;
+            if (s_recording_vm) {
+                wt::AudioPayload a;
+                uint8_t bytes[wt::kAdpcmBytes];
+                a.voice_id = voice_id;
+                a.frame_no = frame_no++;
+                a.adpcm_pred = enc.predictor;
+                a.adpcm_index = static_cast<uint8_t>(enc.index);
+                a.data_len = wt::adpcm_encode(frame, wt::kFrameSamples, bytes, enc);
+                a.data = bytes;
+                if (s_vm_cb) s_vm_cb(a);
+                continue;
+            }
             if (!cfg::kContinuousStream && !voice && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
@@ -199,6 +214,7 @@ void spk_task(void*) {
         if (any) s_stats.frames_played++;
         float tone_vol = 0.3f + 0.7f * g;  // scales with volume, but stays softly audible
         s_tones.render(mix, wt::kFrameSamples, tone_vol);
+        s_prompts.render(mix, wt::kFrameSamples, tone_vol);
         xSemaphoreGive(s_mtx);
         s_receiving = talkers > 0;
         s_stats.talkers = talkers;
@@ -242,9 +258,25 @@ bool loopback() { return s_loopback; }
 void set_volume(uint8_t p) { s_volume = p > 100 ? 100 : p; }
 uint8_t volume() { return s_volume; }
 
+void set_recording_vm(bool on) { s_recording_vm = on; }
+bool recording_vm() { return s_recording_vm; }
+void set_voicemail_cb(VoicemailRecordCb cb) { s_vm_cb = cb; }
+
 void tone(uint16_t freq, uint16_t ms, uint16_t amp) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_tones.push(freq, ms, amp);
+    xSemaphoreGive(s_mtx);
+}
+
+void prompt(wt::PromptId id) {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_prompts.push(id);
+    xSemaphoreGive(s_mtx);
+}
+
+void prompt_clear() {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_prompts.clear();
     xSemaphoreGive(s_mtx);
 }
 
@@ -267,6 +299,17 @@ void on_audio(uint32_t sender, const wt::AudioPayload& a) {
         t->jb.put(a);
     }
     // ponytail: a 5th simultaneous talker is dropped. Add priority by RSSI if groups grow.
+    xSemaphoreGive(s_mtx);
+}
+
+void clear_talker(uint32_t sender) {
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    for (auto& x : s_talkers) {
+        if (x.used && x.sender == sender) {
+            x.jb.reset();
+            x.used = false;
+        }
+    }
     xSemaphoreGive(s_mtx);
 }
 

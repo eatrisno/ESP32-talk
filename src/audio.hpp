@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "protocol.hpp"
+#include "voice_prompts.hpp"
 
 namespace audio {
 
@@ -19,6 +20,12 @@ bool talking();
 bool sending();          // mic open and voice detected right now
 bool receiving();        // somebody is being played
 
+// Voice mail recording hook
+typedef void (*VoicemailRecordCb)(const wt::AudioPayload& a);
+void set_recording_vm(bool on);
+bool recording_vm();
+void set_voicemail_cb(VoicemailRecordCb cb);
+
 // Local test: mic goes through the codec and jitter buffer straight back to the speaker.
 void set_loopback(bool on);
 bool loopback();
@@ -29,8 +36,13 @@ uint8_t volume();
 // Feedback beep, mixed into the speaker output.
 void tone(uint16_t freq, uint16_t ms, uint16_t amp = 450);
 
+// Human voice prompt playback
+void prompt(wt::PromptId id);
+void prompt_clear();
+
 // From the radio task.
 void on_audio(uint32_t sender, const wt::AudioPayload& a);
+void clear_talker(uint32_t sender);
 
 struct Stats {
     uint32_t frames_sent, frames_gated, frames_played, lost, late, mic_bytes,

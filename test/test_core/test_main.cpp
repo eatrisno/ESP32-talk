@@ -958,6 +958,28 @@ void test_range_test_statistics_and_margin() {
     TEST_ASSERT_GREATER_THAN_FLOAT(20.0f, rs.margin_db(-108.0f));
 }
 
+void test_voicemail_payload_and_sequencing() {
+    wt::VoicemailPayload vp;
+    vp.vm_id = 0x12345678;
+    vp.frame_index = 0;
+    vp.total_frames = 100;
+    strncpy(vp.name, "node-test", sizeof(vp.name));
+    vp.adpcm_pred = 450;
+    vp.adpcm_index = 12;
+    vp.data_len = wt::kAdpcmBytes;
+    for (size_t i = 0; i < wt::kAdpcmBytes; i++) vp.data[i] = static_cast<uint8_t>(i ^ 0xAA);
+
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(wt::kMaxPlain, sizeof(vp));
+    TEST_ASSERT_EQUAL_UINT32(0x12345678, vp.vm_id);
+    TEST_ASSERT_EQUAL_UINT16(0, vp.frame_index);
+    TEST_ASSERT_EQUAL_UINT16(100, vp.total_frames);
+    TEST_ASSERT_EQUAL_STRING("node-test", vp.name);
+    TEST_ASSERT_EQUAL_INT16(450, vp.adpcm_pred);
+    TEST_ASSERT_EQUAL_INT8(12, vp.adpcm_index);
+    TEST_ASSERT_EQUAL_UINT8(wt::kAdpcmBytes, vp.data_len);
+    TEST_ASSERT_EQUAL_HEX8(0xAA, vp.data[0]);
+}
+
 }  // namespace
 
 void setUp() {}
@@ -1014,5 +1036,6 @@ int main() {
     RUN_TEST(test_peer_table_stores_mac_address);
     RUN_TEST(test_audio_frame_duplication_resilience);
     RUN_TEST(test_range_test_statistics_and_margin);
+    RUN_TEST(test_voicemail_payload_and_sequencing);
     return UNITY_END();
 }
