@@ -898,20 +898,39 @@ void on_rx(const radio::Rx& rx) {
                     // Bidirectional RSSI average (combines Downlink and Uplink to eliminate antenna orientation mismatch)
                     float eff_rssi = (static_cast<float>(rx.rssi) + static_cast<float>(resp.req_rssi)) / 2.0f;
 
-                    // Exponential Moving Average filter to smooth out indoor multipath reflections
-                    static float s_smoothed_rssi = -50.0f;
-                    static bool s_smoothed_init = false;
-                    if (!s_smoothed_init) {
-                        s_smoothed_rssi = eff_rssi;
-                        s_smoothed_init = true;
-                    } else {
-                        s_smoothed_rssi = 0.65f * s_smoothed_rssi + 0.35f * eff_rssi;
+                    // Per-peer Exponential Moving Average filter to smooth out indoor multipath reflections
+                    static struct PeerRssiFilter {
+                        uint32_t id;
+                        float smoothed_rssi;
+                        bool inited;
+                    } s_peer_filters[wt::kMaxPeers] = {};
+
+                    int f_idx = -1;
+                    for (int i = 0; i < wt::kMaxPeers; i++) {
+                        if (s_peer_filters[i].inited && s_peer_filters[i].id == id) {
+                            f_idx = i;
+                            break;
+                        }
                     }
+                    if (f_idx == -1) {
+                        for (int i = 0; i < wt::kMaxPeers; i++) {
+                            if (!s_peer_filters[i].inited) {
+                                f_idx = i;
+                                s_peer_filters[i].id = id;
+                                s_peer_filters[i].smoothed_rssi = eff_rssi;
+                                s_peer_filters[i].inited = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        s_peer_filters[f_idx].smoothed_rssi = 0.65f * s_peer_filters[f_idx].smoothed_rssi + 0.35f * eff_rssi;
+                    }
+                    float smoothed_rssi = (f_idx >= 0) ? s_peer_filters[f_idx].smoothed_rssi : eff_rssi;
 
                     // Calibrated Log-Distance Path-Loss for ESP32-S3 PCB antenna (+21 dBm TX):
                     // Reference RSSI at 1 meter: ~ -50 dBm
                     // Path loss exponent n = 2.4 (indoor/outdoor mixed environment)
-                    float est_m = powf(10.0f, (-50.0f - s_smoothed_rssi) / 24.0f);
+                    float est_m = powf(10.0f, (-50.0f - smoothed_rssi) / 24.0f);
                     if (est_m < 0.2f) est_m = 0.2f;
 
                     char who[20] = "";
