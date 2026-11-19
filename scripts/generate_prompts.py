@@ -11,32 +11,70 @@ import numpy as np
 import scipy.signal as signal
 
 PROMPT_MAP = [
-    ('PROMPT_ZERO',          'zero.wav'),
-    ('PROMPT_ONE',           'one.wav'),
-    ('PROMPT_TWO',           'two.wav'),
-    ('PROMPT_THREE',         'three.wav'),
-    ('PROMPT_FOUR',          'four.wav'),
-    ('PROMPT_FIVE',          'five.wav'),
-    ('PROMPT_DEVICE',        'device.wav'),
-    ('PROMPT_DEVICES',       'devices.wav'),
-    ('PROMPT_NEARBY',        'nearby.wav'),
-    ('PROMPT_MIDDLE',        'middle.wav'),
-    ('PROMPT_FAR',           'far.wav'),
-    ('PROMPT_MIC_ON',        'microphone enabled.wav'),
-    ('PROMPT_MIC_OFF',       'microphone disabled.wav'),
-    ('PROMPT_MICROPHONE',    'microphone.wav'),
-    ('PROMPT_ENABLED',       'enabled.wav'),
-    ('PROMPT_DISABLED',      'disabled.wav'),
-    ('PROMPT_VM_RECORDING',  'voice note recording.wav'),
-    ('PROMPT_VM_SENT',       'message sent.wav'),
-    ('PROMPT_VM_OUTBOX',     'saved to outbox.wav'),
-    ('PROMPT_VM_INCOMING',   'incoming voice note.wav'),
-    ('PROMPT_EMERGENCY_ON',  'emergency activated.wav'),
-    ('PROMPT_EMERGENCY_OFF', 'emergency canceled.wav'),
-    ('PROMPT_EMERGENCY_RX',  'emergency alert.wav'),
-    ('PROMPT_CONNECTED',     'connected.wav'),
-    ('PROMPT_DISCONNECTED',  'disconnected.wav'),
-    ('PROMPT_READY',         'ready.wav'),
+    # System & Boot
+    ('PROMPT_READY',                 'ready.wav'),
+    ('PROMPT_SCANNING_CHANNEL',      'scanning channel.wav'),
+    ('PROMPT_CHANGED_TO_CHANNEL',    'changed to channel.wav'),
+    ('PROMPT_CONNECTED',             'connected.wav'),
+    ('PROMPT_DISCONNECTED',          'disconnected.wav'),
+
+    # Microphone
+    ('PROMPT_MIC_ON',                'microphone enabled.wav'),
+    ('PROMPT_MIC_OFF',               'microphone disabled.wav'),
+
+    # Menu items (Audio Voice Menu)
+    ('PROMPT_MENU',                  'menu.wav'),
+    ('PROMPT_MENU_VOICE_NOTE',       'voice note.wav'),
+    ('PROMPT_MENU_RADAR',            'radar.wav'),
+    ('PROMPT_MENU_WALK',             'walk mode.wav'),
+    ('PROMPT_MENU_PTT',              'push to talk.wav'),
+    ('PROMPT_MENU_HANDS_FREE',       'hands free.wav'),
+    ('PROMPT_MENU_CHANNEL',          'channel.wav'),
+    ('PROMPT_MENU_EXIT',             'exit.wav'),
+
+    # Feature Toggles
+    ('PROMPT_WALK_ON',               'walk mode enabled.wav'),
+    ('PROMPT_WALK_OFF',              'walk mode disabled.wav'),
+    ('PROMPT_PTT_ON',                'ptt enabled.wav'),
+    ('PROMPT_HANDS_FREE_ON',         'hands free enabled.wav'),
+
+    # Voicemail / Voice note
+    ('PROMPT_VM_RECORDING',          'voice note recording.wav'),
+    ('PROMPT_VM_SENT',               'message sent.wav'),
+    ('PROMPT_VM_OUTBOX',             'saved to outbox.wav'),
+    ('PROMPT_VM_INCOMING',           'incoming voice note.wav'),
+
+    # Emergency SOS
+    ('PROMPT_EMERGENCY_ON',          'emergency activated.wav'),
+    ('PROMPT_EMERGENCY_OFF',         'emergency canceled.wav'),
+    ('PROMPT_EMERGENCY_RX',          'emergency alert.wav'),
+
+    # Unified Radar Phrases (No disjointed stitching)
+    ('PROMPT_RADAR_NONE',            'no devices found.wav'),
+    ('PROMPT_RADAR_1_NEAR',          'one device nearby.wav'),
+    ('PROMPT_RADAR_1_MID',           'one device in range.wav'),
+    ('PROMPT_RADAR_1_FAR',           'one device far.wav'),
+    ('PROMPT_RADAR_2_NEAR',          'two devices nearby.wav'),
+    ('PROMPT_RADAR_2_MID',           'two devices in range.wav'),
+    ('PROMPT_RADAR_2_FAR',           'two devices far.wav'),
+    ('PROMPT_RADAR_MANY_NEAR',       'multiple devices nearby.wav'),
+    ('PROMPT_RADAR_MANY_MID',        'multiple devices in range.wav'),
+    ('PROMPT_RADAR_MANY_FAR',        'multiple devices far.wav'),
+
+    # Numbers 1..13 (for channel selection & numeric feedback)
+    ('PROMPT_NUM_1',                 'one.wav'),
+    ('PROMPT_NUM_2',                 'two.wav'),
+    ('PROMPT_NUM_3',                 'three.wav'),
+    ('PROMPT_NUM_4',                 'four.wav'),
+    ('PROMPT_NUM_5',                 'five.wav'),
+    ('PROMPT_NUM_6',                 'six.wav'),
+    ('PROMPT_NUM_7',                 'seven.wav'),
+    ('PROMPT_NUM_8',                 'eight.wav'),
+    ('PROMPT_NUM_9',                 'nine.wav'),
+    ('PROMPT_NUM_10',                'ten.wav'),
+    ('PROMPT_NUM_11',                'eleven.wav'),
+    ('PROMPT_NUM_12',                'twelve.wav'),
+    ('PROMPT_NUM_13',                'thirteen.wav'),
 ]
 
 TARGET_SR = 16000
@@ -48,22 +86,25 @@ def process_single_file(path):
         ch = w.getnchannels()
         sw = w.getsampwidth()
         frames = w.readframes(w.getnframes())
-        raw = np.frombuffer(frames, dtype=np.int16)
+        raw = np.frombuffer(frames, dtype=np.int16).copy().astype(np.float32)
         if ch > 1:
             raw = raw[::ch]  # take first channel if stereo
 
-        # Trim leading and trailing silence
-        threshold = 500
+        # Remove any DC bias
+        raw -= np.mean(raw)
+
+        # Trim leading and trailing silence (tighter 12ms lead-in, 18ms lead-out)
+        threshold = max(250.0, float(0.015 * np.max(np.abs(raw))))
         idx = np.where(np.abs(raw) > threshold)[0]
         if len(idx) > 0:
-            start = max(0, idx[0] - int(0.02 * sr_in))
-            end = min(len(raw), idx[-1] + int(0.03 * sr_in))
+            start = max(0, idx[0] - int(0.012 * sr_in))
+            end = min(len(raw), idx[-1] + int(0.018 * sr_in))
             raw = raw[start:end]
 
         # Resample to 16,000 Hz
         if sr_in != TARGET_SR:
             num_out = int(len(raw) * TARGET_SR / sr_in)
-            resampled = signal.resample(raw, num_out).astype(np.int16)
+            resampled = signal.resample(raw, num_out)
         else:
             resampled = raw
 
@@ -72,10 +113,10 @@ def process_single_file(path):
         if fade_len > 0:
             fade_in = (0.5 * (1 - np.cos(np.linspace(0, np.pi, fade_len)))).astype(np.float32)
             fade_out = (0.5 * (1 + np.cos(np.linspace(0, np.pi, fade_len)))).astype(np.float32)
-            resampled[:fade_len] = (resampled[:fade_len] * fade_in).astype(np.int16)
-            resampled[-fade_len:] = (resampled[-fade_len:] * fade_out).astype(np.int16)
+            resampled[:fade_len] = resampled[:fade_len] * fade_in
+            resampled[-fade_len:] = resampled[-fade_len:] * fade_out
 
-        return resampled
+        return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 def process_prompt(assets_dir, item):
     if isinstance(item, (list, tuple)):
@@ -155,6 +196,8 @@ def main():
         f.write('    PromptId queue_[kMaxQueue] = {};\n')
         f.write('    int head_ = 0, tail_ = 0;\n')
         f.write('    size_t sample_pos_ = 0;\n')
+        f.write('    int16_t fade_last_ = 0;\n')
+        f.write('    int fade_remain_ = 0;\n')
         f.write('};\n\n')
         f.write('}  // namespace wt\n')
 
@@ -201,16 +244,33 @@ def main():
 }
 
 void PromptQueue::clear() {
+    if (head_ != tail_ && sample_pos_ > 0) {
+        PromptId cur_id = queue_[head_];
+        const PromptData& p = s_prompt_table[cur_id];
+        if (p.samples && sample_pos_ < p.count) {
+            fade_last_ = p.samples[sample_pos_];
+            fade_remain_ = 48; // 3ms ramp to zero prevents clicks
+        }
+    }
     head_ = tail_ = 0;
     sample_pos_ = 0;
 }
 
 bool PromptQueue::busy() const {
-    return head_ != tail_;
+    return (head_ != tail_) || (fade_remain_ > 0);
 }
 
 bool PromptQueue::render(int16_t* out, size_t n, float vol_scale) {
-    if (head_ == tail_) return false;
+    if (fade_remain_ > 0) {
+        size_t m = (n < static_cast<size_t>(fade_remain_)) ? n : static_cast<size_t>(fade_remain_);
+        for (size_t i = 0; i < m; i++) {
+            float ramp = static_cast<float>(fade_remain_ - 1 - i) / 48.0f;
+            int32_t val = out[i] + static_cast<int32_t>(fade_last_ * ramp * vol_scale);
+            out[i] = clip16(val);
+        }
+        fade_remain_ -= m;
+    }
+    if (head_ == tail_) return fade_remain_ > 0;
     size_t out_idx = 0;
     while (out_idx < n && head_ != tail_) {
         PromptId cur_id = queue_[head_];

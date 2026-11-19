@@ -92,7 +92,10 @@ void register_unicast_peer(const uint8_t* mac) {
         esp_now_rate_config_t rc = {};
         rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
         rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
-        esp_now_set_peer_rate_config(mac, &rc);
+        esp_err_t rerr = esp_now_set_peer_rate_config(mac, &rc);
+        if (rerr != ESP_OK) {
+            ESP_LOGW(TAG, "failed to set rate config for peer: %s", esp_err_to_name(rerr));
+        }
         ESP_LOGI(TAG, "registered unicast peer %02x:%02x:%02x:%02x:%02x:%02x (hardware retries enabled)",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
@@ -297,11 +300,11 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     ESP_ERROR_CHECK(esp_wifi_init(&wc));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE);
     uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
     if (cfg::kLongRange) proto |= WIFI_PROTOCOL_LR;
-    esp_wifi_set_protocol(WIFI_IF_STA, proto);
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_max_tx_power(cfg::kTxPowerQdBm);
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(on_recv);
@@ -314,7 +317,10 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     esp_now_rate_config_t rc = {};
     rc.phymode = cfg::kLongRange ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11G;
     rc.rate = cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M;
-    esp_now_set_peer_rate_config(kBroadcast, &rc);
+    esp_err_t rerr = esp_now_set_peer_rate_config(kBroadcast, &rc);
+    if (rerr != ESP_OK) {
+        ESP_LOGE(TAG, "failed to set broadcast rate config: %s", esp_err_to_name(rerr));
+    }
     set_channel(ch);
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);

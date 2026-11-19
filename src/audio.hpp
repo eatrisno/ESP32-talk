@@ -17,6 +17,8 @@ void start();
 // Talk on/off (open mic). The voice gate still keeps silence off the air.
 void set_talking(bool on);
 bool talking();
+void set_ptt_active(bool on);
+bool ptt_active();
 bool sending();          // mic open and voice detected right now
 bool receiving();        // somebody is being played
 
@@ -39,6 +41,7 @@ void tone(uint16_t freq, uint16_t ms, uint16_t amp = 450);
 // Human voice prompt playback
 void prompt(wt::PromptId id);
 void prompt_clear();
+bool prompt_busy();
 
 // From the radio task.
 void on_audio(uint32_t sender, const wt::AudioPayload& a);
