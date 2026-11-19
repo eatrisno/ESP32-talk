@@ -22,7 +22,8 @@ RATE = "+40%"  # Crisp, articulate tactical radio speed (saves Flash while sound
 CUES = [
     # System & Boot
     ('ready.wav',                    'System ready'),
-    ('power off.wav',                'Power off'),
+    ('scanning channel.wav',         'Scanning channel'),
+    ('changed to channel.wav',       'Changed to channel'),
     ('connected.wav',                'Connected'),
     ('disconnected.wav',             'Disconnected'),
 

@@ -832,7 +832,7 @@ void on_rx(const radio::Rx& rx) {
                         radio::set_channel(csp.target_channel);
                         nvs_put_u8("ch", csp.target_channel);
                         audio::prompt_clear();
-                        audio::prompt(wt::PROMPT_MENU_CHANNEL);
+                        audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
                         audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (csp.target_channel - 1)));
                         led::flash(led::Color::Green, 250);
                     }
@@ -908,9 +908,7 @@ void toggle_walk_mode() {
 
 uint8_t scan_best_channel() {
     audio::prompt_clear();
-    audio::tone(800, 35, 300);
-    audio::tone(0, 15);
-    audio::tone(1000, 45, 300);
+    audio::prompt(wt::PROMPT_SCANNING_CHANNEL);
     printf("\n*** [CHANNEL SCAN] Scanning 2.4GHz WiFi spectrum for clearest channel... ***\n");
 
     wifi_scan_config_t scan_config = {};
@@ -1006,7 +1004,7 @@ void sync_channel_to_mesh(uint8_t target_ch) {
     }
 
     audio::prompt_clear();
-    audio::prompt(wt::PROMPT_MENU_CHANNEL);
+    audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
     audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (target_ch - 1)));
     led::flash(led::Color::Green, 200);
     printf("*** [CHANNEL SYNC] Local node active on Channel %u ***\n\n", target_ch);

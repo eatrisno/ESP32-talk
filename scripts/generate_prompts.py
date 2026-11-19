@@ -13,7 +13,8 @@ import scipy.signal as signal
 PROMPT_MAP = [
     # System & Boot
     ('PROMPT_READY',                 'ready.wav'),
-    ('PROMPT_POWER_OFF',             'power off.wav'),
+    ('PROMPT_SCANNING_CHANNEL',      'scanning channel.wav'),
+    ('PROMPT_CHANGED_TO_CHANNEL',    'changed to channel.wav'),
     ('PROMPT_CONNECTED',             'connected.wav'),
     ('PROMPT_DISCONNECTED',          'disconnected.wav'),
 
