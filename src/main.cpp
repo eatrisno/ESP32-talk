@@ -910,13 +910,20 @@ void on_rx(const radio::Rx& rx) {
                     float est_m = powf(10.0f, (-50.0f - s_smoothed_rssi) / 24.0f);
                     if (est_m < 0.2f) est_m = 0.2f;
 
+                    char from_name[12] = "?";
+                    radio::peers_lock();
+                    if (const wt::Peer* p = radio::peers().find(id)) {
+                        if (p->name[0]) memcpy(from_name, p->name, sizeof(from_name));
+                    }
+                    radio::peers_unlock();
+
                     if (est_m < 1.0f) {
-                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
-                               resp.seq, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
+                        printf("  probe #%-2u [%-11s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%d cm) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, from_name, pct, rx.rssi, static_cast<int>(est_m * 100), resp.req_rssi,
                                new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
                     } else {
-                        printf("  probe #%-2u: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
-                               resp.seq, pct, rx.rssi, est_m, resp.req_rssi,
+                        printf("  probe #%-2u [%-11s]: OK | %3d%% Link | RSSI: %4d dBm (est. ~%.1f m) | Uplink: %4d dBm | Zone: %s\n",
+                               resp.seq, from_name, pct, rx.rssi, est_m, resp.req_rssi,
                                new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
                     }
                 }
@@ -2061,25 +2068,27 @@ extern "C" void app_main() {
 
         // Auto-Recovery Watchdog: if mesh link lost on primary channel for > 15s, switch to backup channel
         static uint32_t last_watchdog_check = 0;
-        if (now - last_watchdog_check >= 1000) {
-            last_watchdog_check = now;
+        uint32_t cur_now = now_ms();
+        if (cur_now - last_watchdog_check >= 1000) {
+            last_watchdog_check = cur_now;
             if (s_backup_channel >= 1 && s_backup_channel <= 13 &&
                 s_primary_channel >= 1 && s_primary_channel <= 13 &&
                 s_backup_channel != s_primary_channel) {
-                uint32_t time_since_peer = (s_last_peer_rx_ms > 0) ? (now - s_last_peer_rx_ms) : 0;
-                if (s_last_peer_rx_ms > 0 && time_since_peer > 15000) {
+                uint32_t rx_ms = s_last_peer_rx_ms;
+                uint32_t time_since_peer = (rx_ms > 0 && cur_now >= rx_ms) ? (cur_now - rx_ms) : 0;
+                if (rx_ms > 0 && cur_now >= rx_ms && time_since_peer > 15000) {
                     if (!s_fallback_active) {
                         s_fallback_active = true;
-                        s_fallback_switch_ms = now;
+                        s_fallback_switch_ms = cur_now;
                         radio::set_channel(s_backup_channel);
                         printf("\n*** [WATCHDOG] Link lost for %lu s on Primary Ch %u! Falling back to Backup Ch %u... ***\n\n",
                                (unsigned long)(time_since_peer / 1000), s_primary_channel, s_backup_channel);
                         audio::tone(400, 35, 300);
                         audio::tone(0, 15);
                         audio::tone(300, 45, 300);
-                    } else if (now - s_fallback_switch_ms > 15000) {
+                    } else if (cur_now - s_fallback_switch_ms > 15000) {
                         // Alternate between primary and backup every 15s to re-establish
-                        s_fallback_switch_ms = now;
+                        s_fallback_switch_ms = cur_now;
                         uint8_t next_ch = (radio::channel() == s_primary_channel) ? s_backup_channel : s_primary_channel;
                         radio::set_channel(next_ch);
                         printf("*** [WATCHDOG] Hunting for mesh peers on alternate Ch %u ***\n", next_ch);
@@ -2087,7 +2096,7 @@ extern "C" void app_main() {
                 } else if (s_fallback_active && time_since_peer < 3000) {
                     // Peer heard! Link restored!
                     s_fallback_active = false;
-                    s_recovered_on_backup_ms = now;
+                    s_recovered_on_backup_ms = cur_now;
                     uint8_t cur = radio::channel();
                     printf("\n*** [WATCHDOG] Reconnected with mesh peer on Backup Channel %u! ***\n\n", cur);
                     notify_connected();
@@ -2096,7 +2105,7 @@ extern "C" void app_main() {
         }
 
         // Auto Re-Consensus on Recovery: 10s after recovering on backup channel, coordinator triggers quiet re-consensus
-        if (s_recovered_on_backup_ms > 0 && (now - s_recovered_on_backup_ms >= 10000)) {
+        if (s_recovered_on_backup_ms > 0 && (cur_now - s_recovered_on_backup_ms >= 10000)) {
             s_recovered_on_backup_ms = 0;
             bool is_coordinator = true;
             radio::peers_lock();
@@ -2118,9 +2127,10 @@ extern "C" void app_main() {
         // the coordinator quietly evaluates mesh RF spectrum and switches channel ONLY if the current
         // channel becomes congested (e.g. riding into a crowded lodge or ski lift area).
         static uint32_t s_last_snowboard_consensus_ms = 0;
-        uint32_t peer_elapsed = (s_last_peer_rx_ms > 0) ? (now - s_last_peer_rx_ms) : 0;
-        bool link_degrading = (s_last_peer_rx_ms > 0 && peer_elapsed >= 7000 && !s_fallback_active);
-        bool periodic_due = (now - s_last_snowboard_consensus_ms >= 90000);
+        uint32_t rx_peer_ms = s_last_peer_rx_ms;
+        uint32_t peer_elapsed = (rx_peer_ms > 0 && cur_now >= rx_peer_ms) ? (cur_now - rx_peer_ms) : 0;
+        bool link_degrading = (rx_peer_ms > 0 && cur_now >= rx_peer_ms && peer_elapsed >= 7000 && !s_fallback_active);
+        bool periodic_due = (cur_now - s_last_snowboard_consensus_ms >= 90000);
 
         if ((periodic_due || link_degrading) &&
             !audio::talking() && !audio::receiving() && !audio::prompt_busy() &&
