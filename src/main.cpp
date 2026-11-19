@@ -1379,7 +1379,7 @@ extern "C" void app_main() {
         snprintf(s_name, sizeof s_name, "node-%04x", static_cast<unsigned>(esp_random() & 0xFFFF));
     uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
-    s_ptt_mode = (nvs_u8("ptt", 0) != 0);
+    s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = (nvs_u8("walk", 0) != 0);
     uint8_t mic_saved = nvs_u8("mic", 0);
 
@@ -1481,45 +1481,52 @@ extern "C" void app_main() {
         handle_press(up.update(low(cfg::kPinVolUp), now), 1);
         handle_press(down.update(low(cfg::kPinVolDown), now), 2);
 
-        // Classic PTT mode: press and hold HEADSET button to talk, release to mute with roger beep
-        // Note: strictly HEADSET button (not BOOT button)
-        bool headset_raw_down = (hid & wt::HID_BTN_TALK) ||
-                                (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
-        static bool s_last_headset_raw_down = false;
+        // Classic PTT mode: strictly middle HEADSET button to talk, release to mute with roger beep
+        bool ptt_raw_down = (hid & wt::HID_BTN_TALK) ||
+                            (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
+        static bool s_last_ptt_raw_down = false;
         static uint32_t s_talk_down_ms = 0;
+        static uint32_t s_ptt_release_ms = 0;
         if (s_ptt_mode && !s_menu_active && !s_vm_recording && !s_distress_active) {
-            if (headset_raw_down && !s_last_headset_raw_down) {
-                s_talk_down_ms = now;
-            }
-            if (headset_raw_down && !s_ptt_active && (now - s_talk_down_ms >= 120)) {
-                // Held >= 120ms: activate PTT transmission
-                s_ptt_active = true;
-                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                audio::set_ptt_active(true);
-                audio::set_talking(true);
-                xSemaphoreGive(s_app_mtx);
-                broadcast_state();
-                audio::tone(880, 25, 350); // PTT talk start chirp
-                ESP_LOGI(TAG, "PTT: TX active (held)");
-            }
-            if (!headset_raw_down && s_last_headset_raw_down) {
-                if (s_ptt_active) {
-                    s_ptt_active = false;
-                    s_last_ptt_ended_ms = now;
+            if (ptt_raw_down) {
+                s_ptt_release_ms = 0;
+                if (!s_last_ptt_raw_down) {
+                    s_talk_down_ms = now;
+                }
+                // Crisp 60ms debounce: immediately streams audio
+                if (!s_ptt_active && (now - s_talk_down_ms >= 60)) {
+                    s_ptt_active = true;
                     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                    audio::set_ptt_active(false);
-                    audio::set_talking(false);
+                    audio::set_ptt_active(true);
+                    audio::set_talking(true);
                     xSemaphoreGive(s_app_mtx);
                     broadcast_state();
-                    // Roger beep on release (descending two-tone)
-                    audio::tone(587, 25, 300);
-                    audio::tone(0, 10);
-                    audio::tone(880, 35, 300);
-                    ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
+                    audio::tone(880, 25, 350); // PTT talk start chirp
+                    ESP_LOGI(TAG, "PTT: TX active (held)");
+                }
+            } else {
+                if (s_ptt_active) {
+                    if (s_ptt_release_ms == 0) s_ptt_release_ms = now;
+                    // 70ms squelch tail / hangover: protects last syllables and eliminates jitter dropouts
+                    if (now - s_ptt_release_ms >= 70) {
+                        s_ptt_active = false;
+                        s_last_ptt_ended_ms = now;
+                        s_ptt_release_ms = 0;
+                        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                        audio::set_ptt_active(false);
+                        audio::set_talking(false);
+                        xSemaphoreGive(s_app_mtx);
+                        broadcast_state();
+                        // Roger beep on release (descending two-tone)
+                        audio::tone(587, 25, 300);
+                        audio::tone(0, 10);
+                        audio::tone(880, 35, 300);
+                        ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
+                    }
                 }
             }
         }
-        s_last_headset_raw_down = headset_raw_down;
+        s_last_ptt_raw_down = ptt_raw_down;
 
         // Handle pending click evaluation (for voicemail inbox 1x/2x click)
         if (s_talk_click_count > 0 && (now - s_last_talk_click_ms > kMultiClickWindowMs)) {
