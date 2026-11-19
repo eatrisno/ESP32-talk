@@ -300,19 +300,19 @@ def main():
                 tests.test_switch_propagation(ch)
             elif cmd == "test-ping":
                 tests.test_ping()
-            elif cmd.startswith("1:"):
+            elif cmd.startswith("1:") or cmd.startswith("1 "):
                 actual_cmd = cmd[2:].strip()
                 if node1:
                     node1.send(actual_cmd)
                 else:
                     print(f"{RED}Node 1 not connected{RESET}")
-            elif cmd.startswith("2:"):
+            elif cmd.startswith("2:") or cmd.startswith("2 "):
                 actual_cmd = cmd[2:].strip()
                 if node2:
                     node2.send(actual_cmd)
                 else:
                     print(f"{RED}Node 2 not connected{RESET}")
-            elif cmd.startswith("b:"):
+            elif cmd.startswith("b:") or cmd.startswith("b "):
                 actual_cmd = cmd[2:].strip()
                 if node1: node1.send(actual_cmd)
                 if node2: node2.send(actual_cmd)
