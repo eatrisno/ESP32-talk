@@ -78,7 +78,7 @@ static uint8_t s_menu_channel_candidate = 1;
 static uint32_t s_last_menu_activity_ms = 0;
 
 void enter_menu();
-void exit_menu();
+void exit_menu(bool play_tone = true);
 void menu_next();
 void menu_prev();
 void menu_select();
@@ -858,10 +858,8 @@ void toggle_walk_mode() {
         s_walk_seq = 0;
         printf("\nWALK RANGE MODE: ON (emitting 1 probe/sec with acoustic pitch)\n");
         printf("Put on headset and walk away. Tone pitch indicates signal strength!\n\n");
-        audio::tone(880, 60, 450);
     } else {
         printf("\nWALK RANGE MODE: OFF\n\n");
-        audio::tone(400, 60, 400);
     }
 }
 
@@ -885,14 +883,16 @@ void system_power_off() {
     esp_deep_sleep_start();
 }
 
-void exit_menu() {
+void exit_menu(bool play_tone) {
     if (!s_menu_active) return;
     s_menu_active = false;
     s_menu_channel_active = false;
-    audio::prompt_clear();
-    audio::tone(600, 25, 300);
-    audio::tone(0, 15);
-    audio::tone(450, 35, 300);
+    if (play_tone) {
+        audio::prompt_clear();
+        audio::tone(600, 25, 300);
+        audio::tone(0, 15);
+        audio::tone(450, 35, 300);
+    }
     printf("[Menu] Exited.\n");
 }
 
@@ -912,10 +912,10 @@ void announce_current_menu_item() {
             audio::prompt(wt::PROMPT_MENU_RADAR);
             break;
         case MENU_WALK:
-            audio::prompt(wt::PROMPT_MENU_WALK);
+            audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
             break;
         case MENU_TALK_MODE:
-            audio::prompt(s_ptt_mode ? wt::PROMPT_MENU_HANDS_FREE : wt::PROMPT_MENU_PTT);
+            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
             break;
         case MENU_CHANNEL:
             audio::prompt(wt::PROMPT_MENU_CHANNEL);
@@ -970,22 +970,22 @@ void menu_select() {
         radio::set_channel(s_menu_channel_candidate);
         nvs_put_u8("ch", s_menu_channel_candidate);
         printf("[Menu] Radio Channel confirmed: %u\n", s_menu_channel_candidate);
-        exit_menu();
+        exit_menu(false);
         audio::prompt_clear();
         audio::prompt(wt::PROMPT_CONNECTED);
         return;
     }
     switch (s_menu_item) {
         case MENU_VOICE_NOTE:
-            exit_menu();
+            exit_menu(false);
             start_voicemail_recording();
             break;
         case MENU_RADAR:
-            exit_menu();
+            exit_menu(false);
             radar_check();
             break;
         case MENU_WALK:
-            exit_menu();
+            exit_menu(false);
             toggle_walk_mode();
             audio::prompt_clear();
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
@@ -993,8 +993,13 @@ void menu_select() {
         case MENU_TALK_MODE:
             s_ptt_mode = !s_ptt_mode;
             nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-            if (audio::talking()) toggle_talk();
-            exit_menu();
+            if (audio::talking()) {
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                audio::set_talking(false);
+                xSemaphoreGive(s_app_mtx);
+                broadcast_state();
+            }
+            exit_menu(false);
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
             printf("[Menu] Talk mode set to: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
@@ -1009,7 +1014,7 @@ void menu_select() {
             system_power_off();
             break;
         default:
-            exit_menu();
+            exit_menu(true);
             break;
     }
 }
@@ -1237,7 +1242,7 @@ extern "C" void app_main() {
     ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
 
     esp_reset_reason_t rst_reason = esp_reset_reason();
-    uint8_t pwr_state = nvs_u8("pwr_state", 1); // default 1 (online)
+    uint8_t pwr_state = nvs_u8("pwr_state", 0); // default 0: shutdown until BOOT is pressed
 
     if (rst_reason == ESP_RST_DEEPSLEEP) {
         // Woke up from Deep Sleep because user pressed BOOT!
