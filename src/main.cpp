@@ -906,6 +906,14 @@ void on_rx(const radio::Rx& rx) {
                     s_walk_miss_count = 0;
                     s_range_stats.add_sample(resp.req_rssi, rx.rssi);
 
+                    radio::peers_lock();
+                    wt::Peer* p = radio::peers().find(id);
+                    if (p) {
+                        p->uplink_rssi = resp.req_rssi;
+                        if (rx.relay_id) p->relay_id = rx.relay_id;
+                    }
+                    radio::peers_unlock();
+
                     // Signal Quality percentage: -60 dBm or better = 100% (flawless link with >48dB margin), -105 dBm = 5%
                     int pct = (rx.rssi - (-105)) * 100 / (-60 - (-105));
                     if (pct > 100) pct = 100;

@@ -132,6 +132,11 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         uint32_t now = now_ms();
         for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
             if (p->used && p->hops == 0 && (now - p->last_ms <= wt::kPeerTimeoutMs)) {
+                // If link is marginal (RSSI < -80 dBm or Uplink < -85 dBm), avoid blocking on 7x hardware MAC retries;
+                // fallback to broadcast so frames are sent instantly and forwarded by the mesh relay!
+                if (p->rssi < -80 || (p->uplink_rssi != 0 && p->uplink_rssi < -85)) {
+                    continue;
+                }
                 bool has_mac = false;
                 for (int i = 0; i < 6; i++) {
                     if (p->mac[i] != 0) { has_mac = true; break; }
