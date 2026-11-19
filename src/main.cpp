@@ -1173,6 +1173,11 @@ void measure_local_spectrum(uint16_t out_congestion[14]) {
         if (ap_list) {
             esp_wifi_scan_get_ap_records(&ap_count, ap_list);
             for (uint16_t i = 0; i < ap_count; i++) {
+                // Filter out our own mesh walkie-talkie nodes! (SoftAP SSID "WT-XXXX")
+                // We only measure external router/hotspot interference.
+                if (!strncmp(reinterpret_cast<const char*>(ap_list[i].ssid), "WT-", 3)) {
+                    continue;
+                }
                 uint8_t ch = ap_list[i].primary;
                 int8_t rssi = ap_list[i].rssi;
                 uint32_t weight = static_cast<uint32_t>(rssi > -100 ? (rssi + 105) : 5);
