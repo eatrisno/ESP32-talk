@@ -198,8 +198,12 @@ void handle_raw(Raw& r) {
     rx.hdr = h;
     rx.hops = static_cast<uint8_t>(wt::kDefaultTtl - h.ttl);
     rx.rssi = r.rssi;
+    rx.relay_id = (rx.hops > 0) ? (static_cast<uint32_t>(r.mac[2]) << 24 |
+                                   static_cast<uint32_t>(r.mac[3]) << 16 |
+                                   static_cast<uint32_t>(r.mac[4]) << 8  |
+                                   static_cast<uint32_t>(r.mac[5])) : 0;
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-    bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms(), r.mac);
+    bool accepted = s_peers.accept(h, rx.hops, r.rssi, now_ms(), r.mac, rx.relay_id);
     int num_peers = s_peers.count();
     xSemaphoreGive(s_peers_mtx);
     if (!accepted) return;
@@ -287,7 +291,10 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     }
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    s_self = mac[2] << 24 | mac[3] << 16 | mac[4] << 8 | mac[5];
+    s_self = static_cast<uint32_t>(mac[2]) << 24 |
+             static_cast<uint32_t>(mac[3]) << 16 |
+             static_cast<uint32_t>(mac[4]) << 8  |
+             static_cast<uint32_t>(mac[5]);
     s_session = session;
     s_on_rx = on_rx;
     s_rxq = xQueueCreate(24, sizeof(Raw));

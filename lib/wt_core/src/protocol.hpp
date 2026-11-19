@@ -86,8 +86,19 @@ struct VoicemailPayload {
     uint8_t  data_len;     // bytes of ADPCM data (usually 160)
     uint8_t  data[kAdpcmBytes]; // 160 bytes
 };
+
+struct PiggybackBeacon {
+    uint8_t  flags;          // Bit 0: talking/PTT, Bit 1: SOS, Bit 2: Voicemail inbox
+    uint8_t  primary_ch;     // Consensus primary channel
+    uint8_t  backup_ch;      // Consensus backup channel
+    uint16_t ack_seq;        // Application ACK: sequence number of last frame from peer
+    int8_t   uplink_rssi;    // Piggybacked Uplink RSSI of peer
+    uint32_t relay_id;       // Piggybacked Relay ID (0 if direct, or ID of relay hop)
+    char     name[12];       // Node name
+};
 #pragma pack(pop)
 static_assert(sizeof(VoicemailPayload) <= kMaxPlain, "VoicemailPayload exceeds max plain size");
+static_assert(sizeof(PiggybackBeacon) <= kMaxPlain, "PiggybackBeacon exceeds max plain size");
 
 struct Header {
     uint8_t  type = 0;

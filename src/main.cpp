@@ -68,6 +68,7 @@ static uint32_t s_last_distress_tx_ms = 0;
 static uint32_t s_last_distress_beep_ms = 0;
 static uint32_t s_last_distress_rx_ms = 0;
 static volatile bool s_vm_recording = false;
+static bool s_vm_inbox_has_message = false;
 static temperature_sensor_handle_t s_temp_sensor = nullptr;
 
 // --- Audio Voice Menu & PTT state ---
@@ -294,18 +295,32 @@ void toggle_distress() {
 
 // --- actions ---------------------------------------------------------------------------
 
-// Name + talking flag, as sent in BEACON / JOIN / LEAVE. Caller holds s_app_mtx.
-void state_payload(uint8_t* p) {
-    p[0] = audio::talking();
-    memcpy(p + 1, s_name, sizeof s_name);
+static uint32_t s_last_peer_seq = 0;
+static int8_t   s_last_peer_rssi = 0;
+
+// Piggyback Beacon: state + node identity + consensus channels + reverse RSSI & ACK
+void build_piggyback_beacon(wt::PiggybackBeacon& pb) {
+    memset(&pb, 0, sizeof(pb));
+    uint8_t flags = 0;
+    if (audio::talking() || s_ptt_active) flags |= 0x01;
+    if (s_distress_active) flags |= 0x02;
+    if (s_vm_inbox_has_message) flags |= 0x04;
+    pb.flags = flags;
+    pb.primary_ch = s_primary_channel;
+    pb.backup_ch = s_backup_channel;
+    pb.ack_seq = static_cast<uint16_t>(s_last_peer_seq & 0xFFFF);
+    pb.uplink_rssi = s_last_peer_rssi;
+    pb.relay_id = 0;
+    memcpy(pb.name, s_name, sizeof(pb.name));
 }
 
 void broadcast_state() {
-    uint8_t p[1 + sizeof s_name];
+    wt::PiggybackBeacon pb;
     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-    state_payload(p);
+    build_piggyback_beacon(pb);
     xSemaphoreGive(s_app_mtx);
-    radio::send(p[0] ? wt::MSG_JOIN : wt::MSG_LEAVE, p, sizeof p);
+    radio::send((pb.flags & 0x01) ? wt::MSG_JOIN : wt::MSG_LEAVE,
+                reinterpret_cast<const uint8_t*>(&pb), sizeof(pb));
 }
 
 void toggle_talk() {
@@ -383,7 +398,6 @@ struct VmStorage {
 static VmStorage* s_vm_storage = nullptr;
 static bool s_vm_outbox_pending = false;
 static VmStorage* s_vm_inbox = nullptr;
-static bool s_vm_inbox_has_message = false;
 static uint32_t s_last_received_vm_id = 0;
 static TaskHandle_t s_vm_playback_task = nullptr;
 static constexpr uint32_t kVmLocalSender = 0xFFFFFFFE;
@@ -778,6 +792,8 @@ void handle_press(wt::Press p, int which) {
 
 void on_rx(const radio::Rx& rx) {
     s_last_peer_rx_ms = now_ms();
+    s_last_peer_seq = rx.hdr.seq;
+    s_last_peer_rssi = rx.rssi;
     const uint32_t id = rx.hdr.sender;
     switch (rx.hdr.type) {
         case wt::MSG_AUDIO: {
@@ -788,19 +804,39 @@ void on_rx(const radio::Rx& rx) {
         case wt::MSG_BEACON:
         case wt::MSG_JOIN:
         case wt::MSG_LEAVE: {
-            if (rx.len < 1 + sizeof s_name) break;
-            char name[sizeof s_name];
-            memcpy(name, rx.plain + 1, sizeof name);
-            name[sizeof name - 1] = 0;
-            radio::peers_lock();
-            wt::Peer* p = radio::peers().find(id);
-            bool was = p && p->talking, now = rx.plain[0] != 0;
-            radio::peers().set_name(id, name);
-            radio::peers().set_talking(id, now);
-            radio::peers_unlock();
-            if (now != was && rx.hdr.type != wt::MSG_BEACON) {
-                now ? chime_peer_joined() : chime_peer_left();
-                ESP_LOGI(TAG, "%s %s", name, now ? "joined" : "left");
+            if (rx.len >= sizeof(wt::PiggybackBeacon)) {
+                wt::PiggybackBeacon pb;
+                memcpy(&pb, rx.plain, sizeof(pb));
+                pb.name[sizeof(pb.name) - 1] = 0;
+                radio::peers_lock();
+                wt::Peer* p = radio::peers().find(id);
+                bool was = p && p->talking;
+                bool now = (pb.flags & 0x01) != 0;
+                radio::peers().set_name(id, pb.name);
+                radio::peers().set_talking(id, now);
+                if (p) {
+                    p->uplink_rssi = pb.uplink_rssi;
+                    if (rx.relay_id) p->relay_id = rx.relay_id;
+                }
+                radio::peers_unlock();
+                if (now != was && rx.hdr.type != wt::MSG_BEACON) {
+                    now ? chime_peer_joined() : chime_peer_left();
+                    ESP_LOGI(TAG, "%s %s", pb.name, now ? "joined" : "left");
+                }
+            } else if (rx.len >= 1 + sizeof s_name) {
+                char name[sizeof s_name];
+                memcpy(name, rx.plain + 1, sizeof name);
+                name[sizeof name - 1] = 0;
+                radio::peers_lock();
+                wt::Peer* p = radio::peers().find(id);
+                bool was = p && p->talking, now = rx.plain[0] != 0;
+                radio::peers().set_name(id, name);
+                radio::peers().set_talking(id, now);
+                radio::peers_unlock();
+                if (now != was && rx.hdr.type != wt::MSG_BEACON) {
+                    now ? chime_peer_joined() : chime_peer_left();
+                    ESP_LOGI(TAG, "%s %s", name, now ? "joined" : "left");
+                }
             }
             break;
         }
@@ -822,10 +858,26 @@ void on_rx(const radio::Rx& rx) {
             if (const wt::Peer* p = radio::peers().find(id))
                 if (p->name[0]) memcpy(name, p->name, sizeof name);
             radio::peers_unlock();
+            char relay_info[32] = "direct";
+            if (rx.hops) {
+                char rname[sizeof s_name] = "";
+                if (rx.relay_id) {
+                    radio::peers_lock();
+                    if (const wt::Peer* rp = radio::peers().find(rx.relay_id)) {
+                        if (rp->name[0]) memcpy(rname, rp->name, sizeof rname);
+                    }
+                    radio::peers_unlock();
+                }
+                if (rname[0]) {
+                    snprintf(relay_info, sizeof(relay_info), "via %s", rname);
+                } else {
+                    snprintf(relay_info, sizeof(relay_info), "via relay 0x%04lx", (unsigned long)(rx.relay_id & 0xFFFF));
+                }
+            }
             // ponytail: printf from the radio task blocks it ~5 ms per line at 115200 baud;
             // fine for a ping reply. Move to a log queue if pings get frequent.
-            printf("pong %-11s %3lu ms  %s  rssi %d\n", name, (unsigned long)(now_ms() - sent_ms),
-                   rx.hops ? "via relay" : "direct", rx.rssi);
+            printf("pong %-11s %3lu ms  %-16s  rssi %d\n", name, (unsigned long)(now_ms() - sent_ms),
+                   relay_info, rx.rssi);
             break;
         }
         case wt::MSG_RANGE_REQ: {
@@ -1528,7 +1580,7 @@ void print_status() {
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
     printf("  peers:\n");
-    struct Row { uint32_t id, age; char name[12]; int8_t rssi; bool relay, talking; };
+    struct Row { uint32_t id, age; char name[12]; int8_t rssi, uplink_rssi; uint32_t relay_id; bool relay, talking; };
     Row rows[wt::kMaxPeers];
     int nrows = 0;
     radio::peers_lock();  // copy only: printing here would stall the radio task
@@ -1540,14 +1592,22 @@ void print_status() {
         r.age = (now - p->last_ms) / 1000;
         memcpy(r.name, p->name, sizeof r.name);
         r.rssi = p->rssi;
+        r.uplink_rssi = p->uplink_rssi;
+        r.relay_id = p->relay_id;
         r.relay = p->hops != 0;
         r.talking = p->talking;
     }
     radio::peers_unlock();
-    for (int i = 0; i < nrows; i++)
-        printf("    %-11s %08lx  %s  rssi %4d  seen %lus ago%s\n", rows[i].name[0] ? rows[i].name : "?",
-               (unsigned long)rows[i].id, rows[i].relay ? "relay " : "direct", rows[i].rssi,
+    for (int i = 0; i < nrows; i++) {
+        char relay_str[24] = "direct";
+        if (rows[i].relay) {
+            snprintf(relay_str, sizeof(relay_str), "relay (via %04lx)", (unsigned long)(rows[i].relay_id & 0xFFFF));
+        }
+        printf("    %-11s %08lx  %-16s  rssi %4d (up %4d)  seen %lus ago%s\n",
+               rows[i].name[0] ? rows[i].name : "?",
+               (unsigned long)rows[i].id, relay_str, rows[i].rssi, rows[i].uplink_rssi,
                (unsigned long)rows[i].age, rows[i].talking ? "  talking" : "");
+    }
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
     printf("  radio: mode %s  tx-power %d (%.2f dBm)\n",
@@ -2022,11 +2082,11 @@ extern "C" void app_main() {
 
         if (now - last_beacon >= cfg::kBeaconMs) {
             last_beacon = now;
-            uint8_t p[1 + sizeof s_name];
+            wt::PiggybackBeacon pb;
             xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-            state_payload(p);
+            build_piggyback_beacon(pb);
             xSemaphoreGive(s_app_mtx);
-            radio::send(wt::MSG_BEACON, p, sizeof p);
+            radio::send(wt::MSG_BEACON, reinterpret_cast<const uint8_t*>(&pb), sizeof(pb));
             radio::peers_lock();
             radio::peers().prune(now);
             radio::peers_unlock();

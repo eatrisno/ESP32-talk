@@ -65,7 +65,7 @@ bool PeerTable::fresh(const Header& h, uint32_t now_ms) const {
     return sessions_.newer(h.sender, h.session, h.seq, now_ms);
 }
 
-bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac) {
+bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac, uint32_t relay_id) {
     if (!fresh(h, now_ms)) return false;
     Peer* p = find(h.sender);
     bool is_new = (p == nullptr);
@@ -81,9 +81,11 @@ bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_
     if (hops == 0) {
         p->hops = 0;
         p->rssi = rssi;
+        p->relay_id = 0;
         if (mac) memcpy(p->mac, mac, 6);
     } else if (is_new || p->hops != 0 || (now_ms - p->last_ms > 5000)) {
         p->hops = hops;
+        p->relay_id = relay_id;
     }
     p->last_ms = now_ms;
     return true;
