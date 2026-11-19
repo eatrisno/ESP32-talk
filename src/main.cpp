@@ -48,6 +48,16 @@ static volatile bool s_walk_mode = false;
 static volatile bool s_walk_pending = false;
 static uint32_t s_walk_probe_sent_ms = 0;
 static uint16_t s_walk_seq = 0;
+enum WalkZone : uint8_t {
+    WALK_ZONE_UNKNOWN = 0,
+    WALK_ZONE_NEAR,     // RSSI >= -75 dBm (Strong)
+    WALK_ZONE_MID,      // -76 to -90 dBm (Medium)
+    WALK_ZONE_FAR,      // < -90 dBm (Weak / Edge)
+    WALK_ZONE_OUT       // Link lost / Out of range
+};
+static WalkZone s_walk_zone = WALK_ZONE_UNKNOWN;
+static uint8_t s_walk_miss_count = 0;
+static uint32_t s_walk_last_spoken_ms = 0;
 
 static volatile bool s_distress_active = false;
 static uint32_t s_distress_activated_ms = 0;
@@ -780,13 +790,54 @@ void on_rx(const radio::Rx& rx) {
                 memcpy(&resp, rx.plain, sizeof(resp));
                 if (resp.token == s_range_token) {
                     s_walk_pending = false;
+                    s_walk_miss_count = 0;
                     s_range_stats.add_sample(resp.req_rssi, rx.rssi);
-                    // Acoustic pitch proportional to link strength
-                    if (rx.rssi >= -75) audio::tone(880, 40, 450);      // Strong
-                    else if (rx.rssi >= -90) audio::tone(580, 40, 400); // Medium
-                    else audio::tone(380, 50, 400);                     // Edge of range
-                    printf("  probe #%-2u: OK | Downlink: %4d dBm | Uplink: %4d dBm\n",
-                           resp.seq, rx.rssi, resp.req_rssi);
+
+                    // Signal Quality percentage (-45 dBm = 100%, -105 dBm = 5%)
+                    int pct = (rx.rssi - (-105)) * 100 / (-45 - (-105));
+                    if (pct > 100) pct = 100;
+                    if (pct < 5) pct = 5;
+
+                    WalkZone new_zone;
+                    if (rx.rssi >= -75) new_zone = WALK_ZONE_NEAR;
+                    else if (rx.rssi >= -90) new_zone = WALK_ZONE_MID;
+                    else new_zone = WALK_ZONE_FAR;
+
+                    uint32_t now = now_ms();
+                    if (s_walk_zone == WALK_ZONE_OUT) {
+                        // Reconnected after losing signal!
+                        audio::prompt_clear();
+                        audio::prompt(wt::PROMPT_CONNECTED);
+                        s_walk_last_spoken_ms = now;
+                    } else if (new_zone != s_walk_zone && (now - s_walk_last_spoken_ms >= 5000)) {
+                        // Zone transition: voice announcement of distance
+                        s_walk_last_spoken_ms = now;
+                        audio::prompt_clear();
+                        if (new_zone == WALK_ZONE_NEAR) audio::prompt(wt::PROMPT_RADAR_1_NEAR);
+                        else if (new_zone == WALK_ZONE_MID) audio::prompt(wt::PROMPT_RADAR_1_MID);
+                        else if (new_zone == WALK_ZONE_FAR) audio::prompt(wt::PROMPT_RADAR_1_FAR);
+                    }
+                    s_walk_zone = new_zone;
+
+                    // Real-time acoustic pitch (dramatically distinct tones)
+                    if (!audio::prompt_busy()) {
+                        if (new_zone == WALK_ZONE_NEAR) {
+                            // High bright double-chirp: ding-ding! (800Hz -> 1000Hz)
+                            audio::tone(800, 25, 400);
+                            audio::tone(0, 10);
+                            audio::tone(1000, 35, 450);
+                        } else if (new_zone == WALK_ZONE_MID) {
+                            // Solid single mid-tone: 600Hz
+                            audio::tone(600, 45, 380);
+                        } else {
+                            // Deep low warning pip: 380Hz
+                            audio::tone(380, 55, 400);
+                        }
+                    }
+
+                    printf("  probe #%-2u: OK | %3d%% Link | Downlink: %4d dBm | Uplink: %4d dBm | Zone: %s\n",
+                           resp.seq, pct, rx.rssi, resp.req_rssi,
+                           new_zone == WALK_ZONE_NEAR ? "NEAR (Strong)" : (new_zone == WALK_ZONE_MID ? "MID (Medium)" : "FAR (Weak)"));
                 }
             }
             break;
@@ -935,6 +986,9 @@ void toggle_walk_mode() {
     if (s_walk_mode) {
         s_range_token = esp_random();
         s_walk_seq = 0;
+        s_walk_zone = WALK_ZONE_UNKNOWN;
+        s_walk_miss_count = 0;
+        s_walk_last_spoken_ms = 0;
         printf("\nWALK RANGE MODE: ON (emitting 1 probe/sec with acoustic pitch)\n");
         printf("Put on headset and walk away. Tone pitch indicates signal strength!\n\n");
     } else {
@@ -1617,7 +1671,24 @@ extern "C" void app_main() {
         }
         if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 400)) {
             s_walk_pending = false;
-            audio::tone(250, 40, 350);  // low warning tone: missed probe
+            s_walk_miss_count++;
+            if (s_walk_miss_count < 3) {
+                // Low descending dual error buzz (200Hz -> 140Hz)
+                audio::tone(200, 35, 350);
+                audio::tone(0, 15);
+                audio::tone(140, 50, 350);
+                printf("  probe #%-2u: [DROPPED] (miss %u/3)\n", s_walk_seq, s_walk_miss_count);
+            } else if (s_walk_miss_count == 3) {
+                s_walk_zone = WALK_ZONE_OUT;
+                audio::prompt_clear();
+                audio::prompt(wt::PROMPT_DISCONNECTED);
+                printf("  probe #%-2u: [OUT OF RANGE] Link lost! Announcing 'Disconnected'.\n", s_walk_seq);
+            } else {
+                if (s_walk_miss_count % 2 == 0) {
+                    audio::tone(140, 30, 200);
+                }
+                printf("  probe #%-2u: [OUT OF RANGE]\n", s_walk_seq);
+            }
         }
 
         // Distress SOS periodic broadcasting & audible reminder
