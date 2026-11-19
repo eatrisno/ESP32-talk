@@ -1065,7 +1065,16 @@ void on_rx(const radio::Rx& rx) {
                 wt::SpectrumReportPayload rep;
                 memcpy(&rep, rx.plain, sizeof(rep));
                 if (rep.token == s_spectrum_token && s_num_spectrum_reports < kMaxSpectrumReports) {
-                    s_spectrum_reports[s_num_spectrum_reports++] = rep;
+                    bool already_have = false;
+                    for (int i = 0; i < s_num_spectrum_reports; i++) {
+                        if (s_spectrum_reports[i].sender == rep.sender) {
+                            already_have = true;
+                            break;
+                        }
+                    }
+                    if (!already_have) {
+                        s_spectrum_reports[s_num_spectrum_reports++] = rep;
+                    }
                 }
             }
             break;
@@ -2133,49 +2142,7 @@ extern "C" void app_main() {
             }
         }
 
-        // Snowboard Dynamic Auto-Consensus:
-        // Periodically (every 90s) while active, or proactively if link quality degrades (no peer for > 7s),
-        // the coordinator quietly evaluates mesh RF spectrum and switches channel ONLY if the current
-        // channel becomes congested (e.g. riding into a crowded lodge or ski lift area).
-        static uint32_t s_last_snowboard_consensus_ms = 0;
-        uint32_t rx_peer_ms = s_last_peer_rx_ms;
-        uint32_t peer_elapsed = (rx_peer_ms > 0 && cur_now >= rx_peer_ms) ? (cur_now - rx_peer_ms) : 0;
-        bool link_degrading = (rx_peer_ms > 0 && cur_now >= rx_peer_ms && peer_elapsed >= 7000 && !s_fallback_active);
-        bool periodic_due = (cur_now - s_last_snowboard_consensus_ms >= 90000);
 
-        if ((periodic_due || link_degrading) &&
-            !audio::talking() && !audio::receiving() && !audio::prompt_busy() &&
-            (now - talk_since > 8000) && !s_vm_recording && !s_menu_active &&
-            !s_distress_active && (s_distress_peer == 0) &&
-            !s_boot_hunting_active && (s_recovered_on_backup_ms == 0)) {
-
-            bool is_coordinator = true;
-            int peer_count = 0;
-            radio::peers_lock();
-            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
-                if (p->used) {
-                    peer_count++;
-                    if (p->id < radio::self_id()) {
-                        is_coordinator = false;
-                        break;
-                    }
-                }
-            }
-            radio::peers_unlock();
-
-            if (is_coordinator && peer_count > 0) {
-                s_last_snowboard_consensus_ms = now;
-                if (link_degrading) {
-                    printf("\n*** [SNOWBOARD AUTO-CONSENSUS] RF link degrading (no peer for %lu s). Proactively checking spectrum... ***\n",
-                           (unsigned long)(peer_elapsed / 1000));
-                } else {
-                    printf("\n*** [SNOWBOARD AUTO-CONSENSUS] Periodic background RF evaluation (Snowboard mode)... ***\n");
-                }
-                collaborative_channel_scan(true /* quiet */);
-            } else if (periodic_due) {
-                s_last_snowboard_consensus_ms = now;
-            }
-        }
 
         update_led();
         vTaskDelay(pdMS_TO_TICKS(10));
