@@ -300,11 +300,29 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     ESP_ERROR_CHECK(esp_wifi_init(&wc));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
-    if (cfg::kLongRange) proto |= WIFI_PROTOCOL_LR;
+
+    // Configure manual country info (Ch 1-14, up to 21 dBm) to avoid regional power capping
+    wifi_country_t country = {
+        .cc = "01",
+        .schan = 1,
+        .nchan = 14,
+        .max_tx_power = cfg::kTxPowerQdBm,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+
+    // Lock protocol: WIFI_PROTOCOL_LR rejects non-LR frames at PHY level
+    uint8_t proto = cfg::kLongRange ? WIFI_PROTOCOL_LR : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Force default ESP-NOW PHY rate (250 kbps for extreme sensitivity)
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, cfg::kLongRange ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_6M);
+
+    // Maximize TX power (+20 dBm / +21 dBm)
     esp_wifi_set_max_tx_power(cfg::kTxPowerQdBm);
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(on_recv);
