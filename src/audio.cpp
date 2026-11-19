@@ -34,7 +34,7 @@ Talker s_talkers[kMaxTalkers];
 wt::ToneQueue s_tones;
 wt::PromptQueue s_prompts;
 wt::JitterBuffer s_loop;           // loopback path
-volatile bool s_talking = false, s_sending = false, s_receiving = false, s_loopback = false;
+volatile bool s_talking = false, s_ptt_active = false, s_sending = false, s_receiving = false, s_loopback = false;
 volatile bool s_recording_vm = false;
 VoicemailRecordCb s_vm_cb = nullptr;
 volatile uint8_t s_volume = 70;
@@ -103,7 +103,8 @@ void mic_task(void*) {
             peak_blocks = 0;
         }
         size_t m = rs.process(mono, n, v8, 512);
-        bool active = s_talking || s_loopback || s_recording_vm;
+        bool ptt = s_ptt_active;
+        bool active = s_talking || ptt || s_loopback || s_recording_vm;
         for (size_t i = 0; i < m; i++) {
             frame[fill++] = v8[i];
             if (fill < wt::kFrameSamples) continue;
@@ -111,7 +112,7 @@ void mic_task(void*) {
             for (auto& s : frame) s = wt::clip16(dc.run(s));
             // Gate first, on the frame before gain, so a gain change never opens or closes it.
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
-            agc.process(frame, wt::kFrameSamples, gate.speech_now());
+            agc.process(frame, wt::kFrameSamples, ptt || gate.speech_now());
             if (!active) continue;
             if (s_recording_vm) {
                 wt::AudioPayload a;
@@ -125,7 +126,8 @@ void mic_task(void*) {
                 if (s_vm_cb) s_vm_cb(a);
                 continue;
             }
-            if (!cfg::kContinuousStream && (!voice || s_prompts.busy()) && !s_loopback) {
+            bool should_gate = !ptt && !cfg::kContinuousStream;
+            if (should_gate && (!voice || s_prompts.busy()) && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {
                     was_sending = false;
@@ -244,6 +246,8 @@ void start() {
 
 void set_talking(bool on) { s_talking = on; }
 bool talking() { return s_talking; }
+void set_ptt_active(bool on) { s_ptt_active = on; }
+bool ptt_active() { return s_ptt_active; }
 bool sending() { return s_sending; }
 bool receiving() { return s_receiving; }
 

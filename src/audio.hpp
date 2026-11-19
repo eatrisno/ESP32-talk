@@ -17,6 +17,8 @@ void start();
 // Talk on/off (open mic). The voice gate still keeps silence off the air.
 void set_talking(bool on);
 bool talking();
+void set_ptt_active(bool on);
+bool ptt_active();
 bool sending();          // mic open and voice detected right now
 bool receiving();        // somebody is being played
 

@@ -63,7 +63,6 @@ static temperature_sensor_handle_t s_temp_sensor = nullptr;
 enum MenuItem : uint8_t {
     MENU_VOICE_NOTE = 0,
     MENU_TALK_MODE,
-    MENU_CHANNEL,
     MENU_RADAR,
     MENU_WALK,
     MENU_EXIT,
@@ -72,6 +71,7 @@ enum MenuItem : uint8_t {
 
 static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
 static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
+static uint32_t s_last_ptt_ended_ms = 0; // timestamp when last PTT hold ended
 static bool s_menu_active = false;
 static MenuItem s_menu_item = MENU_VOICE_NOTE;
 static uint32_t s_last_menu_activity_ms = 0;
@@ -566,6 +566,28 @@ void handle_press(wt::Press p, int which) {
         if (!s_menu_active) {
             if (p == wt::Press::Click) {
                 enter_menu();
+            } else if (p == wt::Press::Long || p == wt::Press::Hold) {
+                // Fast shortcut: Hold BOOT button toggles Talk Mode (PTT <-> Hands-Free VOX) immediately!
+                s_ptt_mode = !s_ptt_mode;
+                nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
+                if (s_ptt_mode && audio::talking()) {
+                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                    audio::set_talking(false);
+                    audio::set_ptt_active(false);
+                    xSemaphoreGive(s_app_mtx);
+                    broadcast_state();
+                } else if (!s_ptt_mode) {
+                    uint8_t mic_saved = nvs_u8("mic", 0);
+                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                    audio::set_talking(mic_saved != 0);
+                    audio::set_ptt_active(false);
+                    xSemaphoreGive(s_app_mtx);
+                    broadcast_state();
+                }
+                audio::prompt_clear();
+                audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+                led::flash(s_ptt_mode ? led::Color::Green : led::Color::Blue, 250);
+                printf("[Fast Toggle] Talk mode changed to %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
             }
             return;
         }
@@ -613,9 +635,11 @@ void handle_press(wt::Press p, int which) {
         }
 
         if (p == wt::Press::Click) {
-            // If PTT was actively transmitting, releasing PTT is not a button click
-            if (s_ptt_mode && s_ptt_active) {
-                return;
+            // If PTT was actively transmitting or just released, releasing PTT is not a button click
+            if (s_ptt_mode) {
+                if (s_ptt_active || (now - s_last_ptt_ended_ms < 350)) {
+                    return;
+                }
             }
 
             if (s_talk_click_count > 0 && (now - s_last_talk_click_ms <= kMultiClickWindowMs)) {
@@ -1031,12 +1055,6 @@ void announce_main_menu_item() {
         case MENU_TALK_MODE:
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
             break;
-        case MENU_CHANNEL:
-            audio::prompt(wt::PROMPT_MENU_CHANNEL);
-            if (radio::channel() >= 1 && radio::channel() <= 13) {
-                audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (radio::channel() - 1)));
-            }
-            break;
         case MENU_RADAR:
             audio::prompt(wt::PROMPT_MENU_RADAR);
             break;
@@ -1089,12 +1107,14 @@ void menu_action() {
             if (s_ptt_mode && audio::talking()) {
                 xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                 audio::set_talking(false);
+                audio::set_ptt_active(false);
                 xSemaphoreGive(s_app_mtx);
                 broadcast_state();
             } else if (!s_ptt_mode) {
                 uint8_t mic_saved = nvs_u8("mic", 0);
                 xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                 audio::set_talking(mic_saved != 0);
+                audio::set_ptt_active(false);
                 xSemaphoreGive(s_app_mtx);
                 broadcast_state();
             }
@@ -1102,12 +1122,6 @@ void menu_action() {
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
             printf("[Menu] Talk mode toggled: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
             break;
-
-        case MENU_CHANNEL: {
-            uint8_t best_ch = scan_best_channel();
-            sync_channel_to_mesh(best_ch);
-            break;
-        }
 
         case MENU_RADAR:
             printf("[Menu] Radar check triggered (staying in menu). Hold again to scan again, Click for next item.\n");
@@ -1130,6 +1144,7 @@ void menu_action() {
             break;
     }
 }
+
 
 // --- console ---------------------------------------------------------------------------
 
@@ -1479,29 +1494,28 @@ extern "C" void app_main() {
             if (headset_raw_down && !s_ptt_active && (now - s_talk_down_ms >= 120)) {
                 // Held >= 120ms: activate PTT transmission
                 s_ptt_active = true;
-                if (!audio::talking()) {
-                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                    audio::set_talking(true);
-                    xSemaphoreGive(s_app_mtx);
-                    broadcast_state();
-                    audio::tone(880, 25, 350); // PTT talk start chirp
-                    ESP_LOGI(TAG, "PTT: TX active (held)");
-                }
+                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                audio::set_ptt_active(true);
+                audio::set_talking(true);
+                xSemaphoreGive(s_app_mtx);
+                broadcast_state();
+                audio::tone(880, 25, 350); // PTT talk start chirp
+                ESP_LOGI(TAG, "PTT: TX active (held)");
             }
             if (!headset_raw_down && s_last_headset_raw_down) {
                 if (s_ptt_active) {
                     s_ptt_active = false;
-                    if (audio::talking()) {
-                        xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                        audio::set_talking(false);
-                        xSemaphoreGive(s_app_mtx);
-                        broadcast_state();
-                        // Roger beep on release (descending two-tone)
-                        audio::tone(587, 25, 300);
-                        audio::tone(0, 10);
-                        audio::tone(880, 35, 300);
-                        ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
-                    }
+                    s_last_ptt_ended_ms = now;
+                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+                    audio::set_ptt_active(false);
+                    audio::set_talking(false);
+                    xSemaphoreGive(s_app_mtx);
+                    broadcast_state();
+                    // Roger beep on release (descending two-tone)
+                    audio::tone(587, 25, 300);
+                    audio::tone(0, 10);
+                    audio::tone(880, 35, 300);
+                    ESP_LOGI(TAG, "PTT: TX ended (roger beep)");
                 }
             }
         }

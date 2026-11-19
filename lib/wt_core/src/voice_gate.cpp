@@ -27,8 +27,8 @@ bool VoiceGate::update(const int16_t* x, size_t n) {
     else if (hang_ == 0) floor_ *= 1.0139f;
     else if (open_frames_ > kMaxOpenFrames) floor_ *= 1.0139f;  // stuck open on noise
     if (floor_ < 30.f) floor_ = 30.f;
-    const float kAbsMin = 150.f;              // about -47 dBFS
-    float thr = floor_ * 2.5f;                // 8 dB above the floor
+    const float kAbsMin = 100.f;              // about -50 dBFS, responsive to softer headset mics
+    float thr = floor_ * 2.0f;                // 6 dB above the floor
     if (thr < kAbsMin) thr = kAbsMin;
     speech_now_ = rms_ > thr;
     if (speech_now_) hang_ = kHangFrames;
