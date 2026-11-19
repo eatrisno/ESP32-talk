@@ -854,8 +854,8 @@ void on_rx(const radio::Rx& rx) {
                     s_walk_miss_count = 0;
                     s_range_stats.add_sample(resp.req_rssi, rx.rssi);
 
-                    // Signal Quality percentage (-45 dBm = 100%, -105 dBm = 5%)
-                    int pct = (rx.rssi - (-105)) * 100 / (-45 - (-105));
+                    // Signal Quality percentage: -60 dBm or better = 100% (flawless link with >48dB margin), -105 dBm = 5%
+                    int pct = (rx.rssi - (-105)) * 100 / (-60 - (-105));
                     if (pct > 100) pct = 100;
                     if (pct < 5) pct = 5;
 
