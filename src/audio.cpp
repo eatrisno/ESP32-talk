@@ -105,6 +105,12 @@ void mic_task(void*) {
         size_t m = rs.process(mono, n, v8, 512);
         bool ptt = s_ptt_active;
         bool active = s_talking || ptt || s_loopback || s_recording_vm;
+        static bool was_ptt_active = false;
+        static int ptt_lead_mute_frames = 0;
+        if (ptt && !was_ptt_active) {
+            ptt_lead_mute_frames = 2;  // Discard first 2 frames (~80ms) to eliminate mechanical button click sound
+        }
+        was_ptt_active = ptt;
         for (size_t i = 0; i < m; i++) {
             frame[fill++] = v8[i];
             if (fill < wt::kFrameSamples) continue;
@@ -114,6 +120,10 @@ void mic_task(void*) {
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
             agc.process(frame, wt::kFrameSamples, ptt || gate.speech_now());
             if (!active) continue;
+            if (ptt && ptt_lead_mute_frames > 0) {
+                ptt_lead_mute_frames--;
+                continue;
+            }
             if (s_recording_vm) {
                 wt::AudioPayload a;
                 uint8_t bytes[wt::kAdpcmBytes];

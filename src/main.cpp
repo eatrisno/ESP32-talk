@@ -637,7 +637,7 @@ void handle_press(wt::Press p, int which) {
         if (p == wt::Press::Click) {
             // If PTT was actively transmitting or just released, releasing PTT is not a button click
             if (s_ptt_mode) {
-                if (s_ptt_active || (now - s_last_ptt_ended_ms < 500)) {
+                if (s_ptt_active || (now - s_last_ptt_ended_ms < 600)) {
                     return;
                 }
             }
@@ -1486,6 +1486,7 @@ extern "C" void app_main() {
                             (cfg::kPinTalk != GPIO_NUM_NC && low(cfg::kPinTalk));
         static bool s_last_ptt_raw_down = false;
         static uint32_t s_talk_down_ms = 0;
+        static uint32_t s_ptt_start_ms = 0;
         static uint32_t s_ptt_release_ms = 0;
         if (s_ptt_mode && !s_menu_active && !s_vm_recording && !s_distress_active) {
             if (ptt_raw_down) {
@@ -1493,9 +1494,10 @@ extern "C" void app_main() {
                 if (!s_last_ptt_raw_down) {
                     s_talk_down_ms = now;
                 }
-                // Fast 30ms start debounce: immediately streams audio
+                // Crisp 30ms start debounce:
                 if (!s_ptt_active && (now - s_talk_down_ms >= 30)) {
                     s_ptt_active = true;
+                    s_ptt_start_ms = now;
                     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                     audio::set_ptt_active(true);
                     audio::set_talking(true);
@@ -1507,9 +1509,10 @@ extern "C" void app_main() {
             } else {
                 if (s_ptt_active) {
                     if (s_ptt_release_ms == 0) s_ptt_release_ms = now;
-                    // Robust 350ms hangover: bridges USB headset HID pulse chatter & contact bounce
+                    // Robust 500ms hangover and 800ms minimum TX window:
+                    // Bridges USB headset HID pulse chatter & contact bounce
                     // Keeps transmitting continuously until the user actually releases the button
-                    if (now - s_ptt_release_ms >= 350) {
+                    if ((now - s_ptt_release_ms >= 500) && (now - s_ptt_start_ms >= 800)) {
                         s_ptt_active = false;
                         s_last_ptt_ended_ms = now;
                         s_ptt_release_ms = 0;
