@@ -60,6 +60,8 @@ public:
     const Peer* begin() const { return peers_; }
     const Peer* end() const { return peers_ + kMaxPeers; }
     int count() const;
+    bool should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const;
+    bool has_weak_or_remote_peer(uint32_t now_ms) const;
 
 private:
     Peer* slot_for(uint32_t id, uint32_t now_ms);

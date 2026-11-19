@@ -144,8 +144,22 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         xSemaphoreGive(s_peers_mtx);
     }
 
-    if (n_direct > 0 && !force_broadcast) {
-        // Send unicast to each direct peer (uses 802.11 MAC ACK + hardware retries!)
+    // If 1 direct peer, use unicast (with 802.11 MAC ACK and hardware retries).
+    // If multiple direct peers and transmitting audio, use broadcast to reach everyone in 1 frame (7 ms total),
+    // avoiding airtime saturation. For control/data unicast, keep unicast loop.
+    wt::Header h;
+    bool is_audio = wt::read_header(frame, len, h) && (h.type == wt::MSG_AUDIO);
+    if (n_direct == 1 && !force_broadcast) {
+        esp_err_t e = esp_now_send(direct_macs[0], frame, len);
+        if (e == ESP_ERR_ESPNOW_NO_MEM) {
+            vTaskDelay(1);
+            e = esp_now_send(direct_macs[0], frame, len);
+        }
+        portENTER_CRITICAL(&s_stats_mux);
+        if (e == ESP_OK) s_stats.tx++;
+        else s_stats.tx_fail++;
+        portEXIT_CRITICAL(&s_stats_mux);
+    } else if (n_direct > 1 && !force_broadcast && !is_audio) {
         for (int i = 0; i < n_direct; i++) {
             esp_err_t e = esp_now_send(direct_macs[i], frame, len);
             if (e == ESP_ERR_ESPNOW_NO_MEM) {
@@ -158,7 +172,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
             portEXIT_CRITICAL(&s_stats_mux);
         }
     } else {
-        // Broadcast (for beacons, discovery, or when no direct peers are active yet)
+        // Broadcast (for beacons, audio to multiple peers, discovery, or when no direct peers)
         esp_err_t e = esp_now_send(kBroadcast, frame, len);
         if (e == ESP_ERR_ESPNOW_NO_MEM) {
             vTaskDelay(1);
@@ -211,14 +225,23 @@ void handle_raw(Raw& r) {
     if (rx.hops == 0) {
         register_unicast_peer(r.mac);
     }
-    // Only relay if there are other nodes that need it (peer_count > 1).
-    // In a direct 2-node pair, echoing packets back to the sender causes self-collision.
+    // Smart Selective Relay:
+    // Emergency / control frames (SOS, channel switch) always relay if ttl > 1.
+    // Audio and beacons only relay if there is a weak or multi-hop peer, or if the sender was weak.
     if (h.ttl > 1 && num_peers > 1) {
-        r.data[3] = h.ttl - 1;
-        // 2..12 ms random hold-off; weaker receivers relay sooner because they are more
-        // likely at the edge of the group, where relays matter.
-        uint32_t base = r.rssi < -80 ? 2 : (r.rssi < -65 ? 5 : 8);
-        s_relay.push(r.data, r.len, now_ms() + base + esp_random() % 5);
+        bool do_relay = true;
+        if (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON) {
+            xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+            do_relay = s_peers.should_relay(h.sender, r.rssi, now_ms());
+            xSemaphoreGive(s_peers_mtx);
+        }
+        if (do_relay) {
+            r.data[3] = h.ttl - 1;
+            // 2..12 ms random hold-off; weaker receivers relay sooner because they are more
+            // likely at the edge of the group, where relays matter.
+            uint32_t base = r.rssi < -80 ? 2 : (r.rssi < -65 ? 5 : 8);
+            s_relay.push(r.data, r.len, now_ms() + base + esp_random() % 5);
+        }
     }
     if (s_on_rx) s_on_rx(rx);
 }
@@ -241,9 +264,15 @@ void task(void*) {
             if (seal(h, t.plain, t.len, frame, &n)) {
                 bool force_bcast = (t.type == wt::MSG_BEACON);
                 transmit(frame, n, force_bcast);
+                // Adaptive Audio Duplication: only duplicate if at least one peer is weak/remote
                 if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                    transmit(frame, n, false);
+                    xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+                    bool need_dup = s_peers.has_weak_or_remote_peer(now_ms());
+                    xSemaphoreGive(s_peers_mtx);
+                    if (need_dup) {
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        transmit(frame, n, false);
+                    }
                 }
             }
         }
@@ -306,16 +335,7 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     wifi_init_config_t wc = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wc));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-
-    // Configure SoftAP for FTM Responder mode (Fine Timing Measurement)
-    wifi_config_t ap_config = {};
-    snprintf(reinterpret_cast<char*>(ap_config.ap.ssid), sizeof(ap_config.ap.ssid), "WT-%08lx", (unsigned long)s_self);
-    ap_config.ap.channel = ch;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    ap_config.ap.max_connection = 4;
-    ap_config.ap.ftm_responder = true;
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     // Configure manual country info (JP: Ch 1-14, up to 21 dBm) to enable Channel 13 at maximum power
     wifi_country_t country = {
@@ -327,10 +347,9 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     };
     esp_wifi_set_country(&country);
 
-    // Protocol: LR for ESP-NOW + standard 802.11 for FTM nanosecond measurement frames
-    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_LR | WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N) : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    // Protocol: LR for ESP-NOW + standard 802.11
+    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_LR | WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G) : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_AP, proto));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Disable power saving to keep radio awake at full readiness

@@ -475,6 +475,34 @@ void test_peer_table_prunes_and_caps() {
     TEST_ASSERT_EQUAL(0, t.count());
 }
 
+void test_smart_selective_relay_and_adaptive_duplication() {
+    PeerTable t;
+    Header h1, h2;
+    h1.sender = 0x1111; h1.session = 1; h1.seq = 1;
+    h2.sender = 0x2222; h2.session = 1; h2.seq = 1;
+
+    // Both peers are direct and strong (-50 dBm)
+    t.accept(h1, 0, -50, 1000);
+    t.accept(h2, 0, -50, 1000);
+
+    // No peer is weak, so adaptive duplication is false
+    TEST_ASSERT_FALSE(t.has_weak_or_remote_peer(1000));
+
+    // When 0x1111 sends with strong RSSI (-50), 0x2222 is also strong (-50), so relay is NOT needed
+    TEST_ASSERT_FALSE(t.should_relay(0x1111, -50, 1000));
+
+    // Now 0x2222 becomes weak (-85 dBm, behind a metal door or distant)
+    h2.seq = 2;
+    t.accept(h2, 0, -85, 2000);
+    TEST_ASSERT_TRUE(t.has_weak_or_remote_peer(2000));
+
+    // Now when 0x1111 sends, 0x2222 is weak, so relay IS needed to help 0x2222
+    TEST_ASSERT_TRUE(t.should_relay(0x1111, -50, 2000));
+
+    // Also, if a packet from 0x1111 is heard weakly (-82 dBm), we act as a bridge
+    TEST_ASSERT_TRUE(t.should_relay(0x1111, -82, 2000));
+}
+
 // ---------------------------------------------------------------------------------------
 
 void test_hid_bitfield_headset() {
@@ -1170,6 +1198,7 @@ int main() {
     RUN_TEST(test_tones_mix_without_clicks);
     RUN_TEST(test_volume_curve);
     RUN_TEST(test_peer_table_stores_mac_address);
+    RUN_TEST(test_smart_selective_relay_and_adaptive_duplication);
     RUN_TEST(test_audio_frame_duplication_resilience);
     RUN_TEST(test_range_test_statistics_and_margin);
     RUN_TEST(test_voicemail_payload_and_sequencing);
