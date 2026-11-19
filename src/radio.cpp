@@ -301,9 +301,9 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    // Configure manual country info (Ch 1-14, up to 21 dBm) to avoid regional power capping
+    // Configure manual country info (JP: Ch 1-14, up to 21 dBm) to enable Channel 13 at maximum power
     wifi_country_t country = {
-        .cc = "01",
+        .cc = "JP",
         .schan = 1,
         .nchan = 14,
         .max_tx_power = cfg::kTxPowerQdBm,

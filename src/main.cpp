@@ -87,8 +87,8 @@ static MenuItem s_menu_item = MENU_VOICE_NOTE;
 static uint32_t s_last_menu_activity_ms = 0;
 
 // Collaborative Channel & Backup Watchdog state
-static uint8_t  s_primary_channel = 1;
-static uint8_t  s_backup_channel = 0;
+static uint8_t  s_primary_channel = cfg::kDefaultChannel;
+static uint8_t  s_backup_channel = cfg::kDefaultBackupChannel;
 static uint32_t s_last_peer_rx_ms = 0;
 static bool     s_fallback_active = false;
 static uint32_t s_fallback_switch_ms = 0;
@@ -102,6 +102,14 @@ static uint32_t s_last_spectrum_scan_ms = 0;
 static uint16_t s_cached_local_congestion[14] = {0};
 static bool     s_has_cached_spectrum = false;
 
+// Auto-Join Channel Hunting on Boot & Auto Re-Consensus
+static bool     s_boot_hunting_active = false;
+static bool     s_boot_hunting_done = false;
+static uint32_t s_boot_ms = 0;
+static uint32_t s_last_hunt_step_ms = 0;
+static uint8_t  s_hunt_ch_index = 0;
+static uint32_t s_recovered_on_backup_ms = 0;
+
 void broadcast_state();
 void enter_menu();
 void exit_menu(bool play_tone = true);
@@ -110,8 +118,8 @@ void menu_prev();
 void menu_action();
 void announce_main_menu_item();
 void measure_local_spectrum(uint16_t out_congestion[14]);
-void collaborative_channel_scan();
-void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch);
+void collaborative_channel_scan(bool quiet = false);
+void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet = false);
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -1080,11 +1088,15 @@ void measure_local_spectrum(uint16_t out_congestion[14]) {
                 int8_t rssi = ap_list[i].rssi;
                 uint32_t weight = static_cast<uint32_t>(rssi > -100 ? (rssi + 105) : 5);
                 if (ch >= 1 && ch <= 13) {
-                    congestion[ch] += weight * 3;
-                    if (ch > 1) congestion[ch - 1] += weight * 2;
-                    if (ch < 13) congestion[ch + 1] += weight * 2;
-                    if (ch > 2) congestion[ch - 2] += weight;
-                    if (ch < 12) congestion[ch + 2] += weight;
+                    // Full 20MHz bandwidth (+/- 2 ch) plus spectral sideband bleed (+/- 3 ch).
+                    // An active router on Ch 2 occupies 1..4 and bleeds sideband into Ch 5.
+                    congestion[ch] += weight * 5;
+                    if (ch >= 2) congestion[ch - 1] += weight * 4;
+                    if (ch <= 12) congestion[ch + 1] += weight * 4;
+                    if (ch >= 3) congestion[ch - 2] += weight * 3;
+                    if (ch <= 11) congestion[ch + 2] += weight * 3;
+                    if (ch >= 4) congestion[ch - 3] += weight * 2;
+                    if (ch <= 10) congestion[ch + 3] += weight * 2;
                 }
             }
             free(ap_list);
@@ -1099,10 +1111,14 @@ void measure_local_spectrum(uint16_t out_congestion[14]) {
     }
 }
 
-void collaborative_channel_scan() {
-    audio::prompt_clear();
-    audio::prompt(wt::PROMPT_SCANNING_CHANNEL);
-    printf("\n*** [COLLABORATIVE SCAN] Probing mesh peers & scanning 2.4GHz spectrum... ***\n");
+void collaborative_channel_scan(bool quiet) {
+    if (!quiet) {
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_SCANNING_CHANNEL);
+        printf("\n*** [COLLABORATIVE SCAN] Probing mesh peers & scanning 2.4GHz spectrum... ***\n");
+    } else {
+        printf("\n*** [AUTO RE-CONSENSUS] Background spectrum scan triggered... ***\n");
+    }
 
     s_spectrum_collecting = true;
     s_spectrum_token = esp_random();
@@ -1148,21 +1164,24 @@ void collaborative_channel_scan() {
         printf("--> %lu\n", (unsigned long)total_congestion[c]);
     }
 
-    // Find Best Channel (minimum total congestion)
-    uint8_t best_ch = 1;
+    // Channel selection prioritizing clean high-band (Ch 13 / 11) and orthogonal backup (Ch 6)
+    // Preference order for tie-breaking: 13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2
+    static const uint8_t kPreferredChannels[] = {13, 11, 6, 12, 10, 9, 8, 7, 1, 5, 4, 3, 2};
+    uint8_t best_ch = 13;
     uint32_t min1 = UINT32_MAX;
-    for (uint8_t c = 1; c <= 13; c++) {
+    for (uint8_t c : kPreferredChannels) {
         if (total_congestion[c] < min1) {
             min1 = total_congestion[c];
             best_ch = c;
         }
     }
 
-    // Find Second Best Channel (Backup)
-    uint8_t backup_ch = (best_ch == 1) ? 6 : 1;
+    // Find Second Best Channel with orthogonal guard band (at least 4 channels away from best_ch)
+    uint8_t backup_ch = (best_ch == 13 || best_ch == 11) ? 6 : 13;
     uint32_t min2 = UINT32_MAX;
-    for (uint8_t c = 1; c <= 13; c++) {
+    for (uint8_t c : kPreferredChannels) {
         if (c == best_ch) continue;
+        if (abs(static_cast<int>(c) - static_cast<int>(best_ch)) < 4) continue;
         if (total_congestion[c] < min2) {
             min2 = total_congestion[c];
             backup_ch = c;
@@ -1171,12 +1190,12 @@ void collaborative_channel_scan() {
 
     printf("\n>>> CONSENSUS DECISION FOR MESH: <<<\n");
     printf("  [PRIMARY] Channel %u (Score: %lu) - Best for all nodes\n", best_ch, (unsigned long)min1);
-    printf("  [BACKUP ] Channel %u (Score: %lu) - Second best for recovery\n\n", backup_ch, (unsigned long)min2);
+    printf("  [BACKUP ] Channel %u (Score: %lu) - Second best for recovery (orthogonal)\n\n", backup_ch, (unsigned long)min2);
 
-    sync_channel_to_mesh(best_ch, backup_ch);
+    sync_channel_to_mesh(best_ch, backup_ch, quiet);
 }
 
-void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch) {
+void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch, bool quiet) {
     wt::ChannelSwitchPayload csp;
     csp.sender = radio::self_id();
     csp.target_channel = primary_ch;
@@ -1206,9 +1225,11 @@ void sync_channel_to_mesh(uint8_t primary_ch, uint8_t backup_ch) {
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 
-    audio::prompt_clear();
-    audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
-    audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (primary_ch - 1)));
+    if (!quiet) {
+        audio::prompt_clear();
+        audio::prompt(wt::PROMPT_CHANGED_TO_CHANNEL);
+        audio::prompt(static_cast<wt::PromptId>(wt::PROMPT_NUM_1 + (primary_ch - 1)));
+    }
     led::flash(led::Color::Green, 200);
     printf("*** [CHANNEL SYNC] Local node active on Primary Ch %u (Backup: %u) ***\n\n", primary_ch, backup_ch);
 }
@@ -1577,7 +1598,7 @@ extern "C" void app_main() {
         snprintf(s_name, sizeof s_name, "node-%04x", static_cast<unsigned>(esp_random() & 0xFFFF));
     uint8_t ch = nvs_u8("ch", cfg::kDefaultChannel);
     s_primary_channel = ch;
-    s_backup_channel = nvs_u8("backup_ch", 0);
+    s_backup_channel = nvs_u8("backup_ch", cfg::kDefaultBackupChannel);
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
     s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = (nvs_u8("walk", 0) != 0);
@@ -1617,6 +1638,7 @@ extern "C" void app_main() {
     printf("\n%s ready on channel %u (mode: %s). Type 'h' for commands.\n", s_name, ch,
            s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
 
+    s_boot_ms = now_ms();
     wt::ButtonDetector headset_btn, boot_btn, up, down;
     uint8_t last_toggle = 0;
     uint8_t last_hid = 0;
@@ -1833,6 +1855,39 @@ extern "C" void app_main() {
             }
         }
 
+        // Auto-Join Channel Hunting on Boot:
+        // If a newly powered-on node doesn't hear any mesh peer after 6s on its boot channel,
+        // it hunts through priority channels [13, 6, 11, 1, 5, 8, 12, 10, 7, 9, 2, 3, 4]
+        // so it seamlessly joins any running mesh network.
+        if (!s_boot_hunting_done) {
+            if (s_last_peer_rx_ms > 0) {
+                if (s_boot_hunting_active) {
+                    uint8_t cur = radio::channel();
+                    printf("\n*** [AUTO-JOIN] Discovered and joined active mesh on Channel %u! ***\n\n", cur);
+                    s_primary_channel = cur;
+                    nvs_put_u8("ch", cur);
+                    audio::prompt_clear();
+                    audio::prompt(wt::PROMPT_CONNECTED);
+                    broadcast_state();
+                }
+                s_boot_hunting_done = true;
+                s_boot_hunting_active = false;
+            } else if (now - s_boot_ms > 6000) {
+                static const uint8_t kHuntChannels[] = {13, 6, 11, 1, 5, 8, 12, 10, 7, 9, 2, 3, 4};
+                static constexpr size_t kNumHuntChannels = sizeof(kHuntChannels) / sizeof(kHuntChannels[0]);
+                if (!s_boot_hunting_active) {
+                    s_boot_hunting_active = true;
+                    s_hunt_ch_index = 0;
+                    s_last_hunt_step_ms = now;
+                    printf("\n*** [AUTO-JOIN] No mesh peers on boot channel %u. Hunting channels to auto-join mesh... ***\n", radio::channel());
+                } else if (now - s_last_hunt_step_ms >= 180) {
+                    s_last_hunt_step_ms = now;
+                    s_hunt_ch_index = (s_hunt_ch_index + 1) % kNumHuntChannels;
+                    radio::set_channel(kHuntChannels[s_hunt_ch_index]);
+                }
+            }
+        }
+
         // Auto-Recovery Watchdog: if mesh link lost on primary channel for > 15s, switch to backup channel
         static uint32_t last_watchdog_check = 0;
         if (now - last_watchdog_check >= 1000) {
@@ -1861,11 +1916,30 @@ extern "C" void app_main() {
                 } else if (s_fallback_active && time_since_peer < 3000) {
                     // Peer heard! Link restored!
                     s_fallback_active = false;
+                    s_recovered_on_backup_ms = now;
                     uint8_t cur = radio::channel();
-                    printf("\n*** [WATCHDOG] Reconnected with mesh peer on Channel %u! ***\n\n", cur);
+                    printf("\n*** [WATCHDOG] Reconnected with mesh peer on Backup Channel %u! ***\n\n", cur);
                     audio::prompt_clear();
                     audio::prompt(wt::PROMPT_CONNECTED);
                 }
+            }
+        }
+
+        // Auto Re-Consensus: 10s after recovering on backup channel, coordinator triggers quiet re-consensus
+        if (s_recovered_on_backup_ms > 0 && (now - s_recovered_on_backup_ms >= 10000)) {
+            s_recovered_on_backup_ms = 0;
+            bool is_coordinator = true;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used && p->id < radio::self_id()) {
+                    is_coordinator = false;
+                    break;
+                }
+            }
+            radio::peers_unlock();
+            if (is_coordinator) {
+                printf("\n*** [AUTO RE-CONSENSUS] Mesh link stable on backup channel. Calculating fresh optimal channels... ***\n");
+                collaborative_channel_scan(true /* quiet */);
             }
         }
 
