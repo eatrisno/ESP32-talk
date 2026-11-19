@@ -68,6 +68,7 @@ bool PeerTable::fresh(const Header& h, uint32_t now_ms) const {
 bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_ms, const uint8_t* mac) {
     if (!fresh(h, now_ms)) return false;
     Peer* p = find(h.sender);
+    bool is_new = (p == nullptr);
     if (!p) {
         p = slot_for(h.sender, now_ms);
         // New slot: seed the window from memory so frames at or below the remembered seq
@@ -77,12 +78,14 @@ bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_
         return false;
     }
     sessions_.put(h.sender, h.session, h.seq, now_ms);
-    p->last_ms = now_ms;
-    p->hops = hops;
     if (hops == 0) {
+        p->hops = 0;
         p->rssi = rssi;
         if (mac) memcpy(p->mac, mac, 6);
+    } else if (is_new || p->hops != 0 || (now_ms - p->last_ms > 5000)) {
+        p->hops = hops;
     }
+    p->last_ms = now_ms;
     return true;
 }
 
