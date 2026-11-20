@@ -252,10 +252,10 @@ void handle_raw(Raw& r) {
     }
     // Smart Selective Relay:
     // Emergency / control frames (SOS, channel switch) always relay if ttl > 1.
-    // Audio and beacons only relay if there is a weak or multi-hop peer, or if the sender was weak.
+    // Routine frames (audio, beacon, ping/pong, range req/resp) only relay if there is a weak or multi-hop peer.
     if (h.ttl > 1 && num_peers > 1) {
         bool do_relay = true;
-        if (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON) {
+        if (h.type != wt::MSG_DISTRESS && h.type != wt::MSG_CHANNEL_SWITCH) {
             xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
             do_relay = s_peers.should_relay(h.sender, r.rssi, now_ms());
             xSemaphoreGive(s_peers_mtx);
