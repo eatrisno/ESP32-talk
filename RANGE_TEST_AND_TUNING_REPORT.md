@@ -119,7 +119,68 @@ Link Quality:    EXCELLENT
 
 ---
 
-## 4. How to Test & Tune Next Time (Operational Procedures)
+## 4. Test Comparison Table Across All Testing Iterations
+
+The following table summarizes all real-world test runs, measuring the impact of each code optimization:
+
+| Test Run / Configuration | Distance / Obstacle | Probes Sent / Rcvd | Packet Loss % | Downlink RSSI | Uplink RSSI | Link Margin (@ -108 dBm) | Transport & Retries | Observed Result / Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Old Baseline (Before Fixes)** | > 30 meters outdoors | 20 / 0 | **100.0% loss** | < -88 dBm | < -90 dBm | 0 dB (cutoff) | 802.11 Broadcast (0 ACKs, 0 retries) | Hard cutoff at ~30m. Radio halted on sleep. |
+| **Initial 1-Meter Benchmark** | 1.0 m direct line-of-sight | 20 / 20 | **0.0% loss** | Avg -71.1 dBm | Avg -46.0 dBm | +36.9 dB | Unicast RESP, 250k LR, Ch 13 | 100% link, 15ms ping latency, zero errors. |
+| **Walk & Wall Penetration Test** | ~5 to 7m through solid interior wall | 150 / 150 | **0.0% loss** | Avg -50.6 dBm (Min -73 dBm) | Avg -74.5 dBm (Min -97 dBm) | **+11.0 dB** (at peak -97 dBm wall penetration) | Broadcast probe, Unicast response | Survived wall penetration. Uplink dropped to -97 dBm due to hand shadowing & broadcast. |
+| **Mismatched Pairing Cleared + 5 cm Calibrated** | 5 cm close proximity | 20 / 20 | **0.0% loss** | Avg -5.4 dBm | Avg -5.8 dBm | **+102.6 dB** | Full Unicast + 7x Retries (both ways) | Complete symmetry (-5.4 vs -5.8 dBm). Peak RF power verified. |
+| **Current Target (Unicast Audio + 120s Peer Lock)** | 8m to 30m through 2–4 walls | Theoretical / Target | **< 2.0% loss** | -75 to -85 dBm | -78 to -88 dBm | **+20 to +30 dB** | Hardware MAC ACKs + 7x retries on Audio & Probes | Retries guarantee penetration; quiet periods no longer expire peer MACs. |
+
+---
+
+## 5. Engineering Levers: What Can We Change to Make Packets Faster or Reach Farther?
+
+To maximize distance (the primary priority) while keeping audio latency below 80ms mouth-to-ear, we evaluated the following technical levers:
+
+### A. Encryption Overhead: Does AES-CCM Slow Us Down?
+* **Current Implementation**: AES-CCM (128-bit key) with an 8-byte authentication tag (`kTagLen = 8`) and a 16-byte header (`kHeaderLen = 16`). Total crypto wrapper = **24 bytes**.
+* **CPU Execution Speed**: 
+  - The ESP32-S3 contains a **hardware cryptographic accelerator peripheral** (`esp-crypto` hardware engine).
+  - Encrypting an 80-byte audio frame takes approximately **$18\ \mu\text{s}$** (0.018 ms) of CPU time on the 240 MHz dual-core Xtensa chip.
+  - **Conclusion on CPU speed**: Encryption does **not** slow down audio processing or introduce noticeable mouth-to-ear delay ($0.018\text{ ms}$ is imperceptible compared to the $40\text{ ms}$ audio frame interval).
+* **Airtime Impact (Packet Size)**:
+  - At 250 kbit/s ($31.25\text{ bytes/ms}$), the 24 bytes of crypto wrapper occupy **$0.77\text{ ms}$ of RF airtime**.
+  - **Optimization Option (Lighter Framing)**:
+    - We can reduce the Auth Tag from 8 bytes to **4 bytes** (`kTagLen = 4`), saving 4 bytes ($0.13\text{ ms}$ airtime).
+    - Shorter packets have a slightly lower probability of suffering a bit error in extreme noise.
+  - **Security Trade-off**:
+    - Disabling encryption completely would save only $0.77\text{ ms}$ of airtime, but would expose all voice communications to public eavesdropping and replay attacks. Keeping hardware AES-CCM is strongly recommended.
+
+---
+
+### B. Transport & Airtime Levers (Speed vs Distance Trade-offs)
+
+| Optimization Lever | Current Setting | Alternative Option | Impact on Speed / Latency | Impact on Range / Distance | Recommendation |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **PHY Bitrate** | **LR 250 kbit/s** (DSSS) | **LR 500 kbit/s** | Packets transmit $2\times$ faster ($1.6\text{ ms}$ vs $3.3\text{ ms}$ airtime). | Sensitivity drops by **$3\text{ dB}$** (from $-108\text{ dBm}$ to $-105\text{ dBm}$), reducing max distance by ~30%. | **Keep LR 250k** for max range through walls and extreme distances. |
+| **Hardware Retries** | **Unicast (7x retries)** | Broadcast (0 retries) | Unicast adds ~2–4 ms if retries occur. | **Dramatically increases range** through obstacles (recovers lost frames). | **Essential**: Always use unicast when peer MAC is known. |
+| **Audio Duplication** | `kDuplicateAudioFrames = true` | `false` | Disabling saves 50% airtime and radio queue space. | Slightly higher chance of voice glitch at the absolute range boundary. | Keep `true` for maximum edge-of-range voice intelligibility. |
+| **Audio Frame Interval** | **40 ms** (80-byte ADPCM) | **20 ms** (40-byte ADPCM) | Reduces buffering latency by 20 ms. | Doubles packet count, increasing airtime contention. | Keep **40 ms** (optimal balance of header efficiency and latency). |
+
+---
+
+### C. Hardware Levers: The #1 Factor for 2x to 3x Distance Boost
+
+If software and firmware parameters are tuned to maximum physical power (+20 dBm) and maximum sensitivity (-108 dBm), **hardware physics becomes the dominating factor**:
+
+1. **External Dipole Antenna (IPEX / U.FL connector)**:
+   - The on-board PCB antenna has $\sim 0\text{ to }1.5\text{ dBi}$ gain and is omnidirectional but highly sensitive to hand placement.
+   - An external $+3\text{ dBi}$ or $+5\text{ dBi}$ 2.4 GHz dipole antenna increases link gain by **$+6\text{ to }+10\text{ dB}$**.
+   - **Every $+6\text{ dB}$ doubles line-of-sight distance!** An external antenna will immediately push line-of-sight range from 500m to **1,000+ meters**.
+2. **Hand Grip Isolation**:
+   - When holding an ESP32 board directly in your palm, human tissue absorbs 10–15 dB of 2.4 GHz RF energy.
+   - Placing the board inside a simple 3D-printed plastic enclosure or holding it by the bottom USB edge (away from the antenna trace) prevents hand detuning.
+3. **Dedicated Middle-Point Repeater (`repeater on`)**:
+   - Placing a node on a 2nd-floor balcony or central window with `repeater on` doubles total mesh coverage without requiring any hardware modifications.
+
+---
+
+## 6. How to Test & Tune Next Time (Operational Procedures)
 
 ### Dual-Terminal Interactive Monitor
 Run the included python monitor from the project directory:
@@ -141,7 +202,7 @@ When moving outdoors or into complex buildings:
 2. **Medium Distance Milestone (100–250 meters)**:
    - Type `range 50`.
    - Expected RSSI: $-88\text{ dBm}$ to $-98\text{ dBm}$.
-   - Voice packets benefit from the proactive duplicate redundancy (`kDuplicateAudioFrames = true`) which ensures clear audio even if occasional packets drop.
+   - Voice packets benefit from proactive duplicate redundancy (`kDuplicateAudioFrames = true`) which ensures clear audio even if occasional packets drop.
 3. **Extreme Distance Milestone (300–500+ meters)**:
    - Direct line-of-sight: Range can reach 400–500m at $-100\text{ dBm}$ to $-104\text{ dBm}$ (above the $-108\text{ dBm}$ noise floor).
    - Non line-of-sight / Dense Obstacles:
@@ -149,14 +210,3 @@ When moving outdoors or into complex buildings:
      - Issue `repeater on` to Node 2.
      - Move Node 1 and Node 3 to opposite sides of the obstacle. Both nodes will seamlessly route packets through Node 2 via the new nearest-path routing algorithm.
 
----
-
-## 5. Future Hardware & RF Tuning Recommendations
-
-1. **Antenna Upgrade (PCB Trace vs External Dipole)**:
-   - The on-board inverted-F PCB antenna on ESP32-S3-DevKitC has approximately $0\text{ to }1.5\text{ dBi}$ gain and is vulnerable to hand attenuation.
-   - For tests exceeding 500 meters, using an ESP32-S3 module with an **IPEX / U.FL connector** and an external $+3\text{ dBi}$ or $+5\text{ dBi}$ omnidirectional dipole antenna will provide $+6\text{ to }+10\text{ dB}$ link margin improvement (effectively doubling range).
-2. **RF Ground Plane & Hand Proximity**:
-   - Holding the PCB directly over the antenna trace detunes the matching network by 5–10 dB. Use an enclosure or avoid gripping the top edge of the board where the antenna trace is etched.
-3. **USB-C Headset Digital Noise Filtering**:
-   - The ESP32-S3's internal DCDC converter and high-speed USB PHY can inject high-frequency ripple into the 3.3V rail. Adding a $10\,\mu\text{F}$ low-ESR ceramic decoupling capacitor near the 3.3V / GND pins keeps the RF noise floor below $-108\text{ dBm}$.
