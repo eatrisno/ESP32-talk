@@ -74,7 +74,7 @@ void on_sent(const esp_now_send_info_t*, esp_now_send_status_t st) {
     }
 }
 
-static RateMode s_rate_mode = RATE_LR_500K;
+static RateMode s_rate_mode = cfg::kLongRange ? RATE_LR_250K : RATE_1M_L;
 
 static void fill_rate_config(RateMode mode, esp_now_rate_config_t& rc) {
     memset(&rc, 0, sizeof(rc));
@@ -169,11 +169,11 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         xSemaphoreGive(s_peers_mtx);
     }
 
-    // If 1 direct peer, use unicast (with 802.11 MAC ACK and hardware retries).
-    // If multiple direct peers and transmitting audio, use broadcast to reach everyone in 1 frame (7 ms total),
-    // avoiding airtime saturation. For control/data unicast, keep unicast loop.
+    // Audio and beacons are inherently group broadcast frames: they should be transmitted to kBroadcast
+    // in 1 frame without blocking on unicast MAC ACK retries. Unicast is reserved for targeted control messages.
     wt::Header h;
     bool is_audio = wt::read_header(frame, len, h) && (h.type == wt::MSG_AUDIO);
+    if (is_audio) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
         if (e == ESP_ERR_ESPNOW_NO_MEM) {
@@ -367,13 +367,15 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
         .cc = "JP",
         .schan = 1,
         .nchan = 14,
-        .max_tx_power = cfg::kTxPowerQdBm,
+        .max_tx_power = 20, // 20 dBm max (unit for wifi_country_t is dBm, not 0.25 dBm)
         .policy = WIFI_COUNTRY_POLICY_MANUAL
     };
     esp_wifi_set_country(&country);
 
-    // Protocol: LR for ESP-NOW + standard 802.11
-    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_LR | WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G) : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    // Protocol: pure LR mode as specified in Espressif official docs:
+    // "Call esp_wifi_set_protocol(ifx, WIFI_PROTOCOL_LR) to set the station/AP only to the LR mode.
+    // This mode is an Espressif-patented mode which can achieve a one-kilometer line of sight range."
+    uint8_t proto = cfg::kLongRange ? WIFI_PROTOCOL_LR : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
     ESP_ERROR_CHECK(esp_wifi_start());
 

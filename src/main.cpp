@@ -137,9 +137,9 @@ void update_adaptive_rate(uint32_t now) {
     radio::peers_unlock();
 
     if (active_direct_peers == 0) {
-        // No direct peers heard recently: default to LR 500k for maximum reach
-        if (radio::rate_mode() != radio::RATE_LR_500K) {
-            radio::set_rate_mode(radio::RATE_LR_500K);
+        // No direct peers heard recently: default to LR 250k for maximum -108 dBm sensitivity floor
+        if (radio::rate_mode() != radio::RATE_LR_250K) {
+            radio::set_rate_mode(radio::RATE_LR_250K);
         }
         s_rate_promote_start_ms = 0;
         return;
@@ -147,35 +147,37 @@ void update_adaptive_rate(uint32_t now) {
 
     radio::RateMode cur = radio::rate_mode();
 
-    // 1. Immediate demotion if link weakens (RSSI <= -78 dBm)
-    if (worst_rssi <= -78) {
+    // In pure Long Range mode, stay strictly within LR modes (LR 250K <-> LR 500K).
+    // Never jump to standard 802.11b (1M_L) which drops sensitivity by 11 dB and breaks pure LR.
+    // 1. Demote to LR 250K immediately if signal drops (worst_rssi <= -75 dBm)
+    if (worst_rssi <= -75) {
         s_rate_promote_start_ms = 0;
-        if (cur != radio::RATE_LR_500K && cur != radio::RATE_LR_250K) {
-            radio::set_rate_mode(radio::RATE_LR_500K);
+        if (cur != radio::RATE_LR_250K) {
+            radio::set_rate_mode(radio::RATE_LR_250K);
             if (s_debug_audio) {
-                printf("[ADAPTIVE RATE] Weak signal (RSSI %d dBm <= -78) -> Demoted to %s\n",
-                       worst_rssi, radio::rate_mode_str(radio::RATE_LR_500K));
+                printf("[ADAPTIVE RATE] Signal weakened (RSSI %d dBm <= -75) -> Locked to %s (-108 dBm max sensitivity)\n",
+                       worst_rssi, radio::rate_mode_str(radio::RATE_LR_250K));
             }
         }
     }
-    // 2. Promotion with 3-second stability debounce (RSSI >= -72 dBm)
-    else if (worst_rssi >= -72) {
-        if (cur != radio::RATE_1M_L) {
+    // 2. Promote to LR 500K only if signal is very strong & stable (worst_rssi >= -65 dBm for 3 seconds)
+    else if (worst_rssi >= -65) {
+        if (cur != radio::RATE_LR_500K) {
             if (s_rate_promote_start_ms == 0) {
                 s_rate_promote_start_ms = now;
             } else if (now - s_rate_promote_start_ms >= 3000) {
-                radio::set_rate_mode(radio::RATE_1M_L);
+                radio::set_rate_mode(radio::RATE_LR_500K);
                 s_rate_promote_start_ms = 0;
                 if (s_debug_audio) {
-                    printf("[ADAPTIVE RATE] Strong signal stable (RSSI %d dBm >= -72 for 3s) -> Promoted to %s\n",
-                           worst_rssi, radio::rate_mode_str(radio::RATE_1M_L));
+                    printf("[ADAPTIVE RATE] Signal strong & stable (RSSI %d dBm >= -65 for 3s) -> Promoted to %s (faster airtime)\n",
+                           worst_rssi, radio::rate_mode_str(radio::RATE_LR_500K));
                 }
             }
         } else {
             s_rate_promote_start_ms = 0;
         }
     } else {
-        // Deadband hysteresis (-77 to -73 dBm): keep current rate, reset promotion timer
+        // Deadband hysteresis (-74 to -66 dBm): keep current rate, reset promotion timer
         s_rate_promote_start_ms = 0;
     }
 }
