@@ -174,7 +174,8 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
     wt::Header h;
     bool is_bcast_type = wt::read_header(frame, len, h) && 
         (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON || h.type == wt::MSG_RANGE_REQ || 
-         h.type == wt::MSG_PING || h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
+         h.type == wt::MSG_RANGE_RESP || h.type == wt::MSG_PING || h.type == wt::MSG_PONG ||
+         h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON || h.type == wt::MSG_PAIR_ACK);
     if (is_bcast_type) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
@@ -291,15 +292,10 @@ void task(void*) {
             if (seal(h, t.plain, t.len, frame, &n)) {
                 bool force_bcast = (t.type == wt::MSG_BEACON);
                 transmit(frame, n, force_bcast);
-                // Adaptive Audio Duplication: duplicate if at least one peer is weak/remote, or if no peers heard yet
+                // Proactive 2x Audio Redundancy: send duplicate frame for maximum wall penetration and zero-loss audio
                 if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
-                    xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-                    bool need_dup = s_peers.has_weak_or_remote_peer(now_ms()) || (s_peers.count() == 0);
-                    xSemaphoreGive(s_peers_mtx);
-                    if (need_dup) {
-                        vTaskDelay(pdMS_TO_TICKS(1));
-                        transmit(frame, n, false);
-                    }
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    transmit(frame, n, false);
                 }
             }
         }
@@ -374,12 +370,10 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     };
     esp_wifi_set_country(&country);
 
-    // Protocol: pure LR mode as specified in Espressif official docs:
-    // "Call esp_wifi_set_protocol(ifx, WIFI_PROTOCOL_LR) to set the station/AP only to the LR mode.
-    // This mode is an Espressif-patented mode which can achieve a one-kilometer line of sight range."
-    uint8_t proto = cfg::kLongRange ? WIFI_PROTOCOL_LR : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
     ESP_ERROR_CHECK(esp_wifi_start());
+    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR)
+                                    : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
 
     // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
