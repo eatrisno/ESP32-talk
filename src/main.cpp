@@ -1894,11 +1894,6 @@ extern "C" void app_main() {
     s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = false; // Zero background probe: 100% airtime reserved for voice
     s_debug_audio = (nvs_u8("dbg", 0) != 0);
-    s_repeater_mode = (nvs_u8("rep", 0) != 0);
-    radio::set_repeater_mode(s_repeater_mode);
-    if (s_repeater_mode) {
-        ESP_LOGI(TAG, "Mode: ACTIVE REPEATER (Fast mesh range extender)");
-    }
     uint8_t mic_saved = nvs_u8("mic", 0);
 
     led::start();
@@ -1915,6 +1910,11 @@ extern "C" void app_main() {
         led::set(led::Color::Red);
         ESP_LOGE(TAG, "radio failed, halting");
         vTaskDelay(portMAX_DELAY);
+    }
+    s_repeater_mode = (nvs_u8("rep", 0) != 0);
+    radio::set_repeater_mode(s_repeater_mode);
+    if (s_repeater_mode) {
+        ESP_LOGI(TAG, "Mode: ACTIVE REPEATER (Fast mesh range extender)");
     }
     audio::start();
     if (!s_ptt_mode && mic_saved) {

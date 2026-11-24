@@ -443,9 +443,13 @@ uint32_t self_id() { return s_self; }
 
 void set_repeater_mode(bool on) {
     s_repeater_mode = on;
-    xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-    s_peers.set_repeater_mode(on);
-    xSemaphoreGive(s_peers_mtx);
+    if (s_peers_mtx) {
+        xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+        s_peers.set_repeater_mode(on);
+        xSemaphoreGive(s_peers_mtx);
+    } else {
+        s_peers.set_repeater_mode(on);
+    }
 }
 
 bool is_repeater_mode() {
@@ -470,8 +474,8 @@ bool send(wt::MsgType type, const uint8_t* plain, size_t len) {
 }
 
 wt::PeerTable& peers() { return s_peers; }
-void peers_lock() { xSemaphoreTake(s_peers_mtx, portMAX_DELAY); }
-void peers_unlock() { xSemaphoreGive(s_peers_mtx); }
+void peers_lock() { if (s_peers_mtx) xSemaphoreTake(s_peers_mtx, portMAX_DELAY); }
+void peers_unlock() { if (s_peers_mtx) xSemaphoreGive(s_peers_mtx); }
 Stats stats() {
     portENTER_CRITICAL(&s_stats_mux);
     Stats s = s_stats;
