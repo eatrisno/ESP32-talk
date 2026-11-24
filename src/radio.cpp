@@ -172,8 +172,10 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
     // Audio and beacons are inherently group broadcast frames: they should be transmitted to kBroadcast
     // in 1 frame without blocking on unicast MAC ACK retries. Unicast is reserved for targeted control messages.
     wt::Header h;
-    bool is_audio = wt::read_header(frame, len, h) && (h.type == wt::MSG_AUDIO);
-    if (is_audio) force_broadcast = true;
+    bool is_bcast_type = wt::read_header(frame, len, h) && 
+        (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON || h.type == wt::MSG_RANGE_REQ || 
+         h.type == wt::MSG_PING || h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
+    if (is_bcast_type) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
         if (e == ESP_ERR_ESPNOW_NO_MEM) {
@@ -184,7 +186,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         if (e == ESP_OK) s_stats.tx++;
         else s_stats.tx_fail++;
         portEXIT_CRITICAL(&s_stats_mux);
-    } else if (n_direct > 1 && !force_broadcast && !is_audio) {
+    } else if (n_direct > 1 && !force_broadcast) {
         for (int i = 0; i < n_direct; i++) {
             esp_err_t e = esp_now_send(direct_macs[i], frame, len);
             if (e == ESP_ERR_ESPNOW_NO_MEM) {
