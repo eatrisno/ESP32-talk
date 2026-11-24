@@ -49,7 +49,18 @@ enum MsgType : uint8_t {
     MSG_CHANNEL_SWITCH  = 11,
     MSG_SPECTRUM_PROBE  = 12,
     MSG_SPECTRUM_REPORT = 13,
+    MSG_PAIR_BEACON     = 14,
+    MSG_PAIR_ACK        = 15,
 };
+
+#pragma pack(push, 1)
+struct PairPayload {
+    uint32_t sender;
+    uint8_t  mac[6];
+    char     name[16];
+    uint8_t  expected_group;
+};
+#pragma pack(pop)
 
 #pragma pack(push, 1)
 struct ChannelSwitchPayload {

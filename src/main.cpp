@@ -1,11 +1,13 @@
 // ESP32-S3 mesh walkie-talkie: USB-C headset, ESP-NOW, every node in range joins one
 // conference automatically. See README.md.
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 
+#include "esp_mac.h"
 #include "audio.hpp"
 #include "button.hpp"
 #include "config.hpp"
@@ -77,6 +79,7 @@ enum MenuItem : uint8_t {
     MENU_TALK_MODE,
     MENU_RADAR,
     MENU_WALK,
+    MENU_PAIR,
     MENU_EXIT,
     MENU_COUNT
 };
@@ -233,6 +236,74 @@ uint8_t nvs_u8(const char* k, uint8_t def) {
 void nvs_put_u8(const char* k, uint8_t v) {
     nvs_set_u8(s_nvs, k, v);
     nvs_commit(s_nvs);
+}
+
+// --- Pairing Group & Zero-Scan Static Lock ---
+struct PairedPeer {
+    uint32_t id;
+    uint8_t  mac[6];
+    char     name[16];
+};
+
+struct PairingGroup {
+    uint8_t    count;             // number of paired other peers (e.g. 2 peers for a 3-node group)
+    uint8_t    expected_group;    // total nodes in group (e.g. 3)
+    PairedPeer peers[4];
+};
+
+static PairingGroup s_pairing_group = {};
+static bool         s_pairing_active = false;
+static uint32_t     s_pairing_start_ms = 0;
+static uint8_t      s_pairing_target_count = 3;
+static PairingGroup s_pairing_staging = {};
+
+void load_pairing_group() {
+    size_t len = sizeof(s_pairing_group);
+    if (nvs_get_blob(s_nvs, "pair_grp", &s_pairing_group, &len) == ESP_OK && len == sizeof(s_pairing_group)) {
+        if (s_pairing_group.count > 4) s_pairing_group.count = 0;
+    } else {
+        memset(&s_pairing_group, 0, sizeof(s_pairing_group));
+    }
+}
+
+void save_pairing_group() {
+    nvs_set_blob(s_nvs, "pair_grp", &s_pairing_group, sizeof(s_pairing_group));
+    nvs_commit(s_nvs);
+}
+
+void start_pairing(uint8_t target_group_size = 3) {
+    s_pairing_active = true;
+    s_pairing_start_ms = now_ms();
+    s_pairing_target_count = target_group_size;
+    memset(&s_pairing_staging, 0, sizeof(s_pairing_staging));
+    s_pairing_staging.expected_group = target_group_size;
+    printf("\n=======================================================\n");
+    printf("  ENTERING PAIRING MODE (Group Size: %u Nodes)\n", target_group_size);
+    printf("  Bring all %u nodes close together (< 1m).\n", target_group_size);
+    printf("  Pairing beacon active for 10 seconds...\n");
+    printf("=======================================================\n\n");
+    audio::tone(880, 50, 200);
+}
+
+void finish_pairing(bool success) {
+    if (!s_pairing_active) return;
+    s_pairing_active = false;
+    if (success && s_pairing_staging.count > 0) {
+        s_pairing_group = s_pairing_staging;
+        save_pairing_group();
+        printf("\n*** [PAIRING SUCCESS] %u peer(s) paired and saved to NVS! ***\n", s_pairing_group.count);
+        for (uint8_t i = 0; i < s_pairing_group.count; i++) {
+            printf("  #%u: [%s] (ID %08lx) MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   i + 1, s_pairing_group.peers[i].name, (unsigned long)s_pairing_group.peers[i].id,
+                   s_pairing_group.peers[i].mac[0], s_pairing_group.peers[i].mac[1], s_pairing_group.peers[i].mac[2],
+                   s_pairing_group.peers[i].mac[3], s_pairing_group.peers[i].mac[4], s_pairing_group.peers[i].mac[5]);
+        }
+        printf("Zero-Scan Static Lock is now ACTIVE. Background scans are permanently OFF.\n\n");
+        notify_connected(true);
+    } else {
+        printf("\n*** [PAIRING TIMEOUT] No new peers added. Current paired count: %u ***\n\n", s_pairing_group.count);
+        notify_disconnected();
+    }
 }
 
 // The session is half of the CCM nonce (sender|session|seq), so it must never repeat under
@@ -1237,6 +1308,70 @@ void on_rx(const radio::Rx& rx) {
             }
             break;
         }
+        case wt::MSG_PAIR_BEACON: {
+            if (rx.len >= sizeof(wt::PairPayload)) {
+                wt::PairPayload pp;
+                memcpy(&pp, rx.plain, sizeof(pp));
+                pp.name[sizeof(pp.name) - 1] = 0;
+                if (s_pairing_active && pp.sender != radio::self_id()) {
+                    bool already = false;
+                    for (uint8_t i = 0; i < s_pairing_staging.count; i++) {
+                        if (s_pairing_staging.peers[i].id == pp.sender) { already = true; break; }
+                    }
+                    if (!already && s_pairing_staging.count < 4) {
+                        PairedPeer& p = s_pairing_staging.peers[s_pairing_staging.count++];
+                        p.id = pp.sender;
+                        memcpy(p.mac, pp.mac, 6);
+                        strncpy(p.name, pp.name, sizeof(p.name) - 1);
+                        p.name[sizeof(p.name) - 1] = 0;
+                        printf("  -> Paired with [%s] (ID %08lx, MAC %02x:%02x:%02x:%02x:%02x:%02x) [%u/%u]\n",
+                               p.name, (unsigned long)p.id, p.mac[0], p.mac[1], p.mac[2], p.mac[3], p.mac[4], p.mac[5],
+                               s_pairing_staging.count + 1, s_pairing_target_count);
+                        audio::tone(1046, 30, 200);
+
+                        wt::PairPayload ack;
+                        ack.sender = radio::self_id();
+                        esp_read_mac(ack.mac, ESP_MAC_WIFI_STA);
+                        strncpy(ack.name, s_name, sizeof(ack.name) - 1);
+                        ack.name[sizeof(ack.name) - 1] = 0;
+                        ack.expected_group = s_pairing_target_count;
+                        radio::send(wt::MSG_PAIR_ACK, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+
+                        if (s_pairing_staging.count + 1 >= s_pairing_target_count) {
+                            finish_pairing(true);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case wt::MSG_PAIR_ACK: {
+            if (rx.len >= sizeof(wt::PairPayload)) {
+                wt::PairPayload pp;
+                memcpy(&pp, rx.plain, sizeof(pp));
+                pp.name[sizeof(pp.name) - 1] = 0;
+                if (s_pairing_active && pp.sender != radio::self_id()) {
+                    bool already = false;
+                    for (uint8_t i = 0; i < s_pairing_staging.count; i++) {
+                        if (s_pairing_staging.peers[i].id == pp.sender) { already = true; break; }
+                    }
+                    if (!already && s_pairing_staging.count < 4) {
+                        PairedPeer& p = s_pairing_staging.peers[s_pairing_staging.count++];
+                        p.id = pp.sender;
+                        memcpy(p.mac, pp.mac, 6);
+                        strncpy(p.name, pp.name, sizeof(p.name) - 1);
+                        p.name[sizeof(p.name) - 1] = 0;
+                        printf("  -> ACK from [%s] (ID %08lx) [%u/%u]\n",
+                               p.name, (unsigned long)p.id, s_pairing_staging.count + 1, s_pairing_target_count);
+                        audio::tone(1046, 30, 200);
+                        if (s_pairing_staging.count + 1 >= s_pairing_target_count) {
+                            finish_pairing(true);
+                        }
+                    }
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -1565,6 +1700,10 @@ void announce_main_menu_item() {
         case MENU_WALK:
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
             break;
+        case MENU_PAIR:
+            audio::prompt(wt::PROMPT_CONNECTED);
+            printf("[Menu] Item: 3-Node Pairing Mode (Hold to Start)\n");
+            break;
         case MENU_EXIT:
             audio::prompt(wt::PROMPT_MENU_EXIT);
             break;
@@ -1639,6 +1778,11 @@ void menu_action() {
             printf("[Menu] Walk mode toggled: %s\n", s_walk_mode ? "ON" : "OFF");
             break;
 
+        case MENU_PAIR:
+            exit_menu(false);
+            start_pairing(3);
+            break;
+
         case MENU_EXIT:
             exit_menu(true);
             break;
@@ -1703,6 +1847,15 @@ void print_status() {
     printf("  radio: tx %lu rx %lu relayed %lu dup %lu rx-drop %lu auth-fail %lu tx-fail %lu\n",
            (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.relayed, (unsigned long)r.dup,
            (unsigned long)r.rx_drop, (unsigned long)r.auth_fail, (unsigned long)r.tx_fail);
+    if (s_pairing_group.count > 0) {
+        printf("  group: %u-node pairing [", s_pairing_group.count + 1);
+        for (uint8_t i = 0; i < s_pairing_group.count; i++) {
+            printf("%s%s", i > 0 ? ", " : "", s_pairing_group.peers[i].name);
+        }
+        printf("] (Zero-Scan Static Lock: ACTIVE)\n");
+    } else {
+        printf("  group: OPEN MESH (Type 'pair' to bind dedicated 3-node group)\n");
+    }
     float temp_c = 0.0f;
     if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
     uint32_t free_ram = esp_get_free_heap_size() / 1024;
@@ -1757,6 +1910,9 @@ void help() {
            "  m / menu   open/close audio voice menu (same as double click)\n"
            "  ptt        toggle Classic PTT vs Hands-Free VOX mode\n"
            "  r / c      radar: check peer count and distance (same as triple click)\n"
+           "  pair [N]   enter pairing mode for N nodes (default 3)\n"
+           "  pair info  display registered paired nodes\n"
+           "  pair clear erase pairing group from NVS (open mesh)\n"
            "  vm         record voice mail / send\n"
            "  send       send recorded voice mail (or flush outbox)\n"
            "  sos        distress SOS on/off (same as holding button 2.5s)\n"
@@ -1877,6 +2033,39 @@ void console_task(void*) {
             if (count <= 0 || count > 200) count = 20;
             run_range_test(count);
         }
+        else if (!strncmp(line, "pair", 4)) {
+            char* arg = line + 4;
+            while (*arg == ' ') arg++;
+            if (!strcmp(arg, "clear") || !strcmp(arg, "reset")) {
+                memset(&s_pairing_group, 0, sizeof(s_pairing_group));
+                save_pairing_group();
+                printf("\n*** [PAIRING] Pairing group cleared. Network set to OPEN Mesh. ***\n\n");
+            } else if (!strcmp(arg, "status") || !strcmp(arg, "info")) {
+                printf("\n=== [PAIRING GROUP STATUS] ===\n");
+                printf("  Total Paired Peers: %u (Expected Group Size: %u)\n",
+                       s_pairing_group.count, s_pairing_group.expected_group ? s_pairing_group.expected_group : 3);
+                if (s_pairing_group.count == 0) {
+                    printf("  Status: OPEN MESH (Not paired to specific group)\n");
+                } else {
+                    for (uint8_t i = 0; i < s_pairing_group.count; i++) {
+                        printf("  #%u: [%-12s] ID: %08lx  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                               i + 1, s_pairing_group.peers[i].name, (unsigned long)s_pairing_group.peers[i].id,
+                               s_pairing_group.peers[i].mac[0], s_pairing_group.peers[i].mac[1], s_pairing_group.peers[i].mac[2],
+                               s_pairing_group.peers[i].mac[3], s_pairing_group.peers[i].mac[4], s_pairing_group.peers[i].mac[5]);
+                    }
+                    printf("  Static Lock: ACTIVE (Zero background scanning, locked on Ch %u)\n", radio::channel());
+                }
+                printf("==============================\n\n");
+            } else {
+                int grp_size = 3;
+                if (isdigit((unsigned char)*arg)) {
+                    grp_size = atoi(arg);
+                    if (grp_size < 2) grp_size = 2;
+                    if (grp_size > 5) grp_size = 5;
+                }
+                start_pairing(grp_size);
+            }
+        }
         else if (!strcmp(line, "walk")) toggle_walk_mode();
         else if (!strcmp(line, "+")) volume_step(+10);
         else if (!strcmp(line, "-")) volume_step(-10);
@@ -1982,6 +2171,12 @@ extern "C" void app_main() {
         nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_open("wt", NVS_READWRITE, &s_nvs));
+
+    load_pairing_group();
+    if (s_pairing_group.count > 0) {
+        s_boot_hunting_done = true;
+        ESP_LOGI(TAG, "Pairing Group: %u peer(s) registered. Zero-Scan Static Lock active.", s_pairing_group.count);
+    }
 
     ESP_LOGI(TAG, "ESP32 Walkie-Talkie Online (reset reason: %d)", esp_reset_reason());
 
@@ -2269,7 +2464,10 @@ extern "C" void app_main() {
         // it hunts through priority channels [13, 6, 11, 1, 5, 8, 12, 10, 7, 9, 2, 3, 4]
         // so it seamlessly joins any running mesh network.
         if (!s_boot_hunting_done) {
-            if (s_last_peer_rx_ms > 0) {
+            if (s_pairing_group.count > 0) {
+                // When paired to a dedicated group, zero channel hunting! Stay locked on primary channel.
+                s_boot_hunting_done = true;
+            } else if (s_last_peer_rx_ms > 0) {
                 if (s_boot_hunting_active) {
                     uint8_t cur = radio::channel();
                     printf("\n*** [AUTO-JOIN] Discovered and joined active mesh on Channel %u! ***\n\n", cur);
@@ -2334,64 +2532,21 @@ extern "C" void app_main() {
             }
         }
 
-        // Auto Re-Consensus on Recovery: 10s after recovering on backup channel, coordinator triggers quiet re-consensus
-        if (s_recovered_on_backup_ms > 0 && (cur_now - s_recovered_on_backup_ms >= 10000)) {
-            s_recovered_on_backup_ms = 0;
-            bool is_coordinator = true;
-            radio::peers_lock();
-            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
-                if (p->used && p->id < radio::self_id()) {
-                    is_coordinator = false;
-                    break;
-                }
+        // Active Pairing Mode beacon transmission & timeout:
+        if (s_pairing_active) {
+            static uint32_t last_pair_beacon = 0;
+            if (now - last_pair_beacon >= 400) {
+                last_pair_beacon = now;
+                wt::PairPayload pp;
+                pp.sender = radio::self_id();
+                esp_read_mac(pp.mac, ESP_MAC_WIFI_STA);
+                strncpy(pp.name, s_name, sizeof(pp.name) - 1);
+                pp.name[sizeof(pp.name) - 1] = 0;
+                pp.expected_group = s_pairing_target_count;
+                radio::send(wt::MSG_PAIR_BEACON, reinterpret_cast<const uint8_t*>(&pp), sizeof(pp));
             }
-            radio::peers_unlock();
-            if (is_coordinator) {
-                printf("\n*** [AUTO RE-CONSENSUS] Mesh link stable on backup channel. Calculating fresh optimal channels... ***\n");
-                collaborative_channel_scan(true /* quiet */);
-            }
-        }
-
-        // Dynamic Mesh Auto-Consensus:
-        // Evaluates mesh RF spectrum periodically (every 5 minutes cooldown) or when link degrades (> 15s silence),
-        // but ONLY if the channel is idle and strictly controlled by the coordinator.
-        static uint32_t s_last_mesh_consensus_ms = 0;
-        uint32_t rx_peer_ms = s_last_peer_rx_ms;
-        uint32_t peer_elapsed = (rx_peer_ms > 0 && cur_now >= rx_peer_ms) ? (cur_now - rx_peer_ms) : 0;
-        bool link_degraded = (rx_peer_ms > 0 && cur_now >= rx_peer_ms && peer_elapsed >= 15000 && !s_fallback_active);
-        bool periodic_check = (cur_now - s_last_mesh_consensus_ms >= 300000); // 5 minutes cooldown
-
-        if ((periodic_check || link_degraded) &&
-            !audio::talking() && !audio::receiving() && !audio::prompt_busy() &&
-            (cur_now - talk_since > 10000) && !s_vm_recording && !s_menu_active &&
-            !s_distress_active && (s_distress_peer == 0) &&
-            !s_boot_hunting_active && (s_recovered_on_backup_ms == 0)) {
-
-            bool is_coordinator = true;
-            int peer_count = 0;
-            radio::peers_lock();
-            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
-                if (p->used) {
-                    peer_count++;
-                    if (p->id < radio::self_id()) {
-                        is_coordinator = false;
-                        break;
-                    }
-                }
-            }
-            radio::peers_unlock();
-
-            if (is_coordinator && peer_count > 0) {
-                s_last_mesh_consensus_ms = cur_now;
-                if (link_degraded) {
-                    printf("\n*** [MESH AUTO-CONSENSUS] RF link degraded (no peer for %lu s). Checking spectrum... ***\n",
-                           (unsigned long)(peer_elapsed / 1000));
-                } else {
-                    printf("\n*** [MESH AUTO-CONSENSUS] Periodic background RF evaluation (5m cooldown)... ***\n");
-                }
-                collaborative_channel_scan(true /* quiet */);
-            } else if (periodic_check) {
-                s_last_mesh_consensus_ms = cur_now;
+            if (now - s_pairing_start_ms >= 10000) {
+                finish_pairing(s_pairing_staging.count > 0);
             }
         }
         update_led();
