@@ -1056,12 +1056,25 @@ void on_rx(const radio::Rx& rx) {
                         notify_connected();
                         s_walk_last_spoken_ms = now;
                     } else if (new_zone != s_walk_zone && (now - s_walk_last_spoken_ms >= 5000)) {
-                        // Zone transition: voice announcement of distance
+                        // Zone transition: voice announcement of distance & count
                         s_walk_last_spoken_ms = now;
                         audio::prompt_clear();
-                        if (new_zone == WALK_ZONE_NEAR) audio::prompt(wt::PROMPT_RADAR_1_NEAR);
-                        else if (new_zone == WALK_ZONE_MID) audio::prompt(wt::PROMPT_RADAR_1_MID);
-                        else if (new_zone == WALK_ZONE_FAR) audio::prompt(wt::PROMPT_RADAR_1_FAR);
+                        radio::peers_lock();
+                        int p_count = radio::peers().count();
+                        radio::peers_unlock();
+                        if (p_count <= 1) {
+                            if (new_zone == WALK_ZONE_NEAR) audio::prompt(wt::PROMPT_RADAR_1_NEAR);
+                            else if (new_zone == WALK_ZONE_MID) audio::prompt(wt::PROMPT_RADAR_1_MID);
+                            else if (new_zone == WALK_ZONE_FAR) audio::prompt(wt::PROMPT_RADAR_1_FAR);
+                        } else if (p_count == 2) {
+                            if (new_zone == WALK_ZONE_NEAR) audio::prompt(wt::PROMPT_RADAR_2_NEAR);
+                            else if (new_zone == WALK_ZONE_MID) audio::prompt(wt::PROMPT_RADAR_2_MID);
+                            else if (new_zone == WALK_ZONE_FAR) audio::prompt(wt::PROMPT_RADAR_2_FAR);
+                        } else {
+                            if (new_zone == WALK_ZONE_NEAR) audio::prompt(wt::PROMPT_RADAR_MANY_NEAR);
+                            else if (new_zone == WALK_ZONE_MID) audio::prompt(wt::PROMPT_RADAR_MANY_MID);
+                            else if (new_zone == WALK_ZONE_FAR) audio::prompt(wt::PROMPT_RADAR_MANY_FAR);
+                        }
                     }
                     s_walk_zone = new_zone;
 
