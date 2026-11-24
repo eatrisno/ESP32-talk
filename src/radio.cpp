@@ -382,7 +382,7 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Set ESP-NOW PHY rate (defaults to LR 500k: 2x faster airtime, -105 dBm sensitivity)
+    // Set ESP-NOW PHY rate: Pure LR 250k (-108 dBm max sensitivity, maximum range)
     esp_now_rate_config_t rc;
     fill_rate_config(s_rate_mode, rc);
     esp_wifi_config_espnow_rate(WIFI_IF_STA, rc.rate);
