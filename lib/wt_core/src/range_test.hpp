@@ -19,6 +19,15 @@ struct RangeResp {
 };
 #pragma pack(pop)
 
+inline int rssi_to_percent(int8_t rssi) {
+    if (rssi == 0 || rssi <= -108) return 0;
+    if (rssi >= -65) return 100;
+    int pct = (static_cast<int>(rssi) - (-108)) * 100 / (-65 - (-108));
+    if (pct > 100) return 100;
+    if (pct < 0) return 0;
+    return pct;
+}
+
 struct RangeStats {
     uint16_t sent = 0;
     uint16_t received = 0;
@@ -63,6 +72,20 @@ struct RangeStats {
     float margin_db(float sensitivity_floor = -108.0f) const {
         if (received == 0) return 0.0f;
         return avg_downlink_rssi() - sensitivity_floor;
+    }
+
+    int downlink_percent() const {
+        if (received == 0) return 0;
+        float avg = avg_downlink_rssi();
+        int8_t r = static_cast<int8_t>(avg >= 0.0f ? avg + 0.5f : avg - 0.5f);
+        return rssi_to_percent(r);
+    }
+
+    int uplink_percent() const {
+        if (received == 0) return 0;
+        float avg = avg_uplink_rssi();
+        int8_t r = static_cast<int8_t>(avg >= 0.0f ? avg + 0.5f : avg - 0.5f);
+        return rssi_to_percent(r);
     }
 };
 

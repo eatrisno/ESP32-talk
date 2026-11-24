@@ -561,10 +561,10 @@ void radar_check() {
         } else {
             dist = "relayed via mesh (beep pendek)";
         }
-        printf("  - %-11s %s  RSSI %4d dBm  (%s)\n",
+        printf("  - %-11s %s  RSSI %4d dBm (%3d%%)  (%s)\n",
                active[i].name[0] ? active[i].name : "?",
                active[i].hops ? "mesh relay" : "direct    ",
-               active[i].rssi, dist);
+               active[i].rssi, wt::rssi_to_percent(active[i].rssi), dist);
     }
     if (count == 0) printf("  No peers in range.\n");
     if (s_vm_outbox_pending && s_vm_storage && s_vm_storage->total_frames > 0) {
@@ -998,8 +998,8 @@ void on_rx(const radio::Rx& rx) {
             }
             // ponytail: printf from the radio task blocks it ~5 ms per line at 115200 baud;
             // fine for a ping reply. Move to a log queue if pings get frequent.
-            printf("pong %-11s %3lu ms  %-16s  rssi %d\n", name, (unsigned long)(now_ms() - sent_ms),
-                   relay_info, rx.rssi);
+            printf("pong %-11s %3lu ms  %-16s  rssi %d (%d%%)\n", name, (unsigned long)(now_ms() - sent_ms),
+                   relay_info, rx.rssi, wt::rssi_to_percent(rx.rssi));
             break;
         }
         case wt::MSG_RANGE_REQ: {
@@ -1037,10 +1037,8 @@ void on_rx(const radio::Rx& rx) {
                     }
                     radio::peers_unlock();
 
-                    // Signal Quality percentage: >= -68 dBm gives 100% (flawless link with >37dB margin above -105 dBm floor)
-                    int pct = (rx.rssi - (-105)) * 100 / (-68 - (-105));
-                    if (pct > 100) pct = 100;
-                    if (pct < 5) pct = 5;
+                    // Signal Quality percentage (calibrated: -108 dBm sensitivity floor -> 0%, >= -65 dBm -> 100%)
+                    int pct = wt::rssi_to_percent(rx.rssi);
 
                     WalkZone new_zone;
                     if (rx.rssi >= -75) new_zone = WALK_ZONE_NEAR;
@@ -1355,9 +1353,13 @@ void run_range_test(int count) {
     printf("  Probes Received: %u\n", s_range_stats.received);
     printf("  Packet Loss:     %.1f%%\n", s_range_stats.loss_percent());
     if (s_range_stats.received > 0) {
-        printf("  Downlink RSSI:   Avg %.1f dBm (Min %d, Max %d)\n",
-               s_range_stats.avg_downlink_rssi(), s_range_stats.min_rssi, s_range_stats.max_rssi);
-        printf("  Uplink RSSI:     Avg %.1f dBm\n", s_range_stats.avg_uplink_rssi());
+        printf("  Signal Strength: %d%% (Downlink) | %d%% (Uplink)\n",
+               s_range_stats.downlink_percent(), s_range_stats.uplink_percent());
+        printf("  Downlink RSSI:   Avg %.1f dBm (%d%%) (Min %d, Max %d)\n",
+               s_range_stats.avg_downlink_rssi(), s_range_stats.downlink_percent(),
+               s_range_stats.min_rssi, s_range_stats.max_rssi);
+        printf("  Uplink RSSI:     Avg %.1f dBm (%d%%)\n",
+               s_range_stats.avg_uplink_rssi(), s_range_stats.uplink_percent());
         printf("  Link Margin:     +%.1f dB above -108 dBm sensitivity floor\n",
                s_range_stats.margin_db(-108.0f));
         const char* quality = "EXCELLENT";
@@ -1555,6 +1557,50 @@ void menu_action() {
 
 // --- console ---------------------------------------------------------------------------
 
+void print_signal_strength() {
+    uint32_t now = now_ms();
+    printf("\n=== [SIGNAL STRENGTH & LINK QUALITY] ===\n");
+    int count = 0;
+    radio::peers_lock();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (!p->used) continue;
+        count++;
+        uint32_t age_s = (now - p->last_ms) / 1000;
+        int down_pct = wt::rssi_to_percent(p->rssi);
+        int up_pct = wt::rssi_to_percent(p->uplink_rssi);
+        char name[16] = "";
+        if (p->name[0]) snprintf(name, sizeof(name), "%s", p->name);
+        else snprintf(name, sizeof(name), "node-%04lx", (unsigned long)(p->id & 0xFFFF));
+
+        char relay_str[32] = "Direct (P2P)";
+        if (p->hops > 0) {
+            snprintf(relay_str, sizeof(relay_str), "Mesh Relay (%u hops, via %04lx)",
+                     p->hops, (unsigned long)(p->relay_id & 0xFFFF));
+        }
+
+        const char* quality = "EXCELLENT (100% Speech Clarity)";
+        if (down_pct < 20) quality = "CRITICAL / MARGINAL (Near Sensitivity Floor)";
+        else if (down_pct < 50) quality = "FAIR / WEAK (Edge of Range)";
+        else if (down_pct < 80) quality = "GOOD (Through 2-3 Walls)";
+
+        printf("  Peer #%d: [%-11s] ID: %08lx\n", count, name, (unsigned long)p->id);
+        printf("    Signal Strength:  %3d%% (Downlink: %4d dBm)\n", down_pct, p->rssi);
+        if (p->uplink_rssi != 0) {
+            printf("    Uplink Return:    %3d%% (Uplink:   %4d dBm)\n", up_pct, p->uplink_rssi);
+        }
+        printf("    Link Margin:      +%.1f dB above -108 dBm sensitivity floor\n", p->rssi - (-108.0f));
+        printf("    Routing Path:     %s\n", relay_str);
+        printf("    Link Quality:     %s\n", quality);
+        printf("    Last Heard:       %lu sec ago%s\n", (unsigned long)age_s, p->talking ? " [TALKING NOW]" : "");
+    }
+    radio::peers_unlock();
+    if (count == 0) {
+        printf("  No peers currently detected on Channel %u.\n", radio::channel());
+        printf("  Make sure peer nodes are powered on and on Channel %u.\n", radio::channel());
+    }
+    printf("=========================================\n\n");
+}
+
 void print_status() {
     radio::Stats r = radio::stats();
     audio::Stats a = audio::stats();
@@ -1594,9 +1640,11 @@ void print_status() {
         if (rows[i].relay) {
             snprintf(relay_str, sizeof(relay_str), "relay (via %04lx)", (unsigned long)(rows[i].relay_id & 0xFFFF));
         }
-        printf("    %-11s %08lx  %-16s  rssi %4d (up %4d)  seen %lus ago%s\n",
+        printf("    %-11s %08lx  %-16s  rssi %4d (%3d%%) [up %4d (%3d%%)]  seen %lus ago%s\n",
                rows[i].name[0] ? rows[i].name : "?",
-               (unsigned long)rows[i].id, relay_str, rows[i].rssi, rows[i].uplink_rssi,
+               (unsigned long)rows[i].id, relay_str,
+               rows[i].rssi, wt::rssi_to_percent(rows[i].rssi),
+               rows[i].uplink_rssi, wt::rssi_to_percent(rows[i].uplink_rssi),
                (unsigned long)rows[i].age, rows[i].talking ? "  talking" : "");
     }
     int8_t pwr = 0;
@@ -1683,6 +1731,7 @@ void help() {
            "  + / -      volume\n"
            "  p          ping all nodes\n"
            "  s          status, peers, counters\n"
+           "  sig / rssi show peer signal strength in percentage and dBm\n"
            "  ch N       radio channel 1..13 (all nodes must match)\n"
            "  backup N   set backup channel 0..13 (0 = disabled)\n"
            "  rate [X]   switch PHY rate: 1m, 500k, 250k (default, max range), auto\n"
@@ -1811,6 +1860,7 @@ void console_task(void*) {
         else if (!strcmp(line, "-")) volume_step(-10);
         else if (!strcmp(line, "p")) send_ping();
         else if (!strcmp(line, "s")) print_status();
+        else if (!strcmp(line, "sig") || !strcmp(line, "signal") || !strcmp(line, "rssi")) print_signal_strength();
         else if (!strcmp(line, "loop")) {
             audio::set_loopback(!audio::loopback());
             printf("loopback %s\n", audio::loopback() ? "ON (speak now)" : "off");

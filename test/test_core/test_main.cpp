@@ -984,6 +984,13 @@ void test_range_test_statistics_and_margin() {
     TEST_ASSERT_EQUAL_INT8(-80, rs.max_rssi);
     // Sensitivity floor -108 dBm, avg downlink ~ -84.5 -> margin ~ +23.5 dB
     TEST_ASSERT_GREATER_THAN_FLOAT(20.0f, rs.margin_db(-108.0f));
+    TEST_ASSERT_EQUAL_INT(100, wt::rssi_to_percent(-65));
+    TEST_ASSERT_EQUAL_INT(100, wt::rssi_to_percent(-50));
+    TEST_ASSERT_EQUAL_INT(0, wt::rssi_to_percent(-108));
+    TEST_ASSERT_EQUAL_INT(0, wt::rssi_to_percent(-115));
+    TEST_ASSERT_EQUAL_INT(0, wt::rssi_to_percent(0));
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(50, rs.downlink_percent());
+    TEST_ASSERT_LESS_OR_EQUAL_INT(60, rs.downlink_percent());
 }
 
 void test_voicemail_payload_and_sequencing() {
