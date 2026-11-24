@@ -13,7 +13,7 @@ namespace wt {
 class JitterBuffer {
 public:
     static constexpr int kSlots = 16;          // 640 ms of capacity
-    static constexpr int kTargetDepth = 3;     // 120 ms start-up delay
+    static constexpr int kTargetDepth = 2;     // 80 ms start-up delay (low latency)
 
     void reset();
     // Stores a received audio frame (decoded immediately with the state it carries).

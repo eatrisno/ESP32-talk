@@ -108,7 +108,7 @@ void mic_task(void*) {
         static bool was_ptt_active = false;
         static int ptt_lead_mute_frames = 0;
         if (ptt && !was_ptt_active) {
-            ptt_lead_mute_frames = 2;  // Discard first 2 frames (~80ms) to eliminate mechanical button click sound
+            ptt_lead_mute_frames = 1;  // Discard first 1 frame (~40ms) to eliminate mechanical button click sound without extra lag
         }
         was_ptt_active = ptt;
         for (size_t i = 0; i < m; i++) {

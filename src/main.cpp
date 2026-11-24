@@ -960,9 +960,9 @@ void on_rx(const radio::Rx& rx) {
         }
         case wt::MSG_PING:
             if (rx.len >= 4) {
-                // Stagger pong replies based on node ID to prevent RF collision when multiple peers reply
-                uint32_t stagger_ms = (radio::self_id() & 0x03) * 12 + 4;
-                vTaskDelay(pdMS_TO_TICKS(stagger_ms));
+                // Ultra-low latency pong reply: immediate or 2ms stagger max to avoid RF collision
+                uint32_t stagger_ms = (radio::self_id() & 0x01) * 2;
+                if (stagger_ms > 0) vTaskDelay(pdMS_TO_TICKS(stagger_ms));
                 radio::send(wt::MSG_PONG, rx.plain, 4);
             }
             led::flash(led::Color::Cyan, 150);
