@@ -289,10 +289,10 @@ void task(void*) {
             if (seal(h, t.plain, t.len, frame, &n)) {
                 bool force_bcast = (t.type == wt::MSG_BEACON);
                 transmit(frame, n, force_bcast);
-                // Adaptive Audio Duplication: only duplicate if at least one peer is weak/remote
+                // Adaptive Audio Duplication: duplicate if at least one peer is weak/remote, or if no peers heard yet
                 if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
                     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
-                    bool need_dup = s_peers.has_weak_or_remote_peer(now_ms());
+                    bool need_dup = s_peers.has_weak_or_remote_peer(now_ms()) || (s_peers.count() == 0);
                     xSemaphoreGive(s_peers_mtx);
                     if (need_dup) {
                         vTaskDelay(pdMS_TO_TICKS(1));

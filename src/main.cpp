@@ -118,8 +118,9 @@ static uint32_t s_recovered_on_backup_ms = 0;
 // Debug Audio setting & anti-chatter audio alerts
 static bool     s_debug_audio = false; // false = Quiet Mode, true = Verbose Debug Alerts
 
-// Dynamic Adaptive PHY Rate (1M_L <-> LR 500k) with Hysteresis
-static bool     s_adaptive_rate = true;
+// Max Range Lock: Default to static locked LR 250k (-108 dBm max sensitivity).
+// Adaptive rate (LR 250k <-> LR 500k) can be toggled via console 'rate auto'.
+static bool     s_adaptive_rate = false;
 static uint32_t s_rate_promote_start_ms = 0;
 
 void update_adaptive_rate(uint32_t now) {
