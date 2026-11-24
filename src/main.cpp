@@ -1685,7 +1685,7 @@ void help() {
            "  s          status, peers, counters\n"
            "  ch N       radio channel 1..13 (all nodes must match)\n"
            "  backup N   set backup channel 0..13 (0 = disabled)\n"
-           "  rate [X]   switch PHY rate: 1m, 500k, 250k, auto (default)\n"
+           "  rate [X]   switch PHY rate: 1m, 500k, 250k (default, max range), auto\n"
            "  name X     set this node's name\n"
            "  loop       loopback test: hear your own voice through the codec\n"
            "  selftest   check headset streams and the audio path\n"
