@@ -172,12 +172,11 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         xSemaphoreGive(s_peers_mtx);
     }
 
-    // Audio, beacons, and distress are group broadcasts.
-    // Range responses, pings, pongs, voicemail, and pair acks can use targeted unicast when peers are known!
+    // Beacons, distress, and pairing beacons are always group broadcasts.
+    // Audio, range probes, pings, and voicemail use targeted unicast with hardware ACKs & 7x retries when peers are known!
     wt::Header h;
     bool is_bcast_type = wt::read_header(frame, len, h) && 
-        (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON || 
-         h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
+        (h.type == wt::MSG_BEACON || h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
     if (is_bcast_type) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
@@ -189,7 +188,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         if (e == ESP_OK) s_stats.tx++;
         else s_stats.tx_fail++;
         portEXIT_CRITICAL(&s_stats_mux);
-    } else if (n_direct > 1 && !force_broadcast) {
+    } else if (n_direct > 1 && n_direct <= 3 && !force_broadcast) {
         for (int i = 0; i < n_direct; i++) {
             esp_err_t e = esp_now_send(direct_macs[i], frame, len);
             if (e == ESP_ERR_ESPNOW_NO_MEM) {
@@ -202,7 +201,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
             portEXIT_CRITICAL(&s_stats_mux);
         }
     } else {
-        // Broadcast (for beacons, audio to multiple peers, discovery, or when no direct peers)
+        // Broadcast (for beacons, distress, or when no direct peers are known)
         esp_err_t e = esp_now_send(kBroadcast, frame, len);
         if (e == ESP_ERR_ESPNOW_NO_MEM) {
             vTaskDelay(1);
@@ -309,7 +308,7 @@ void task(void*) {
                     else s_stats.tx_fail++;
                     portEXIT_CRITICAL(&s_stats_mux);
                 } else {
-                    bool force_bcast = (t.type == wt::MSG_BEACON || t.type == wt::MSG_AUDIO || t.type == wt::MSG_DISTRESS);
+                    bool force_bcast = (t.type == wt::MSG_BEACON || t.type == wt::MSG_DISTRESS);
                     transmit(frame, n, force_bcast);
                     // Proactive 2x Audio Redundancy: send duplicate frame for maximum wall penetration and zero-loss audio
                     if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {

@@ -12,7 +12,7 @@ namespace wt {
 
 constexpr uint8_t kDefaultTtl = 3;   // origin + up to 2 relays
 constexpr int     kMaxPeers = 8;
-constexpr uint32_t kPeerTimeoutMs = 15000;
+constexpr uint32_t kPeerTimeoutMs = 120000; // 2 minutes: retain known peer MACs for unicast retries
 
 struct Peer {
     bool     used = false;

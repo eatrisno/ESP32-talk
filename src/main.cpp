@@ -1314,13 +1314,35 @@ void run_range_test(int count) {
     printf("  STARTING RANGE TEST (%d probes @ %s Ch %u)\n", count, radio::rate_mode_str(radio::rate_mode()), radio::channel());
     printf("===========================================================\n");
 
+    uint8_t target_mac[6] = {};
+    bool has_target = false;
+    radio::peers_lock();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+        if (p->used) {
+            bool valid = false;
+            for (int j = 0; j < 6; j++) {
+                if (p->mac[j] != 0) { valid = true; break; }
+            }
+            if (valid) {
+                memcpy(target_mac, p->mac, 6);
+                has_target = true;
+                break;
+            }
+        }
+    }
+    radio::peers_unlock();
+
     for (int i = 0; i < count; i++) {
         wt::RangeReq req;
         req.token = s_range_token;
         req.seq = i + 1;
         req.total = count;
         uint16_t rx_before = s_range_stats.received;
-        radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        if (has_target) {
+            radio::send_to(wt::MSG_RANGE_REQ, target_mac, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        } else {
+            radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
         if (s_range_stats.received == rx_before) {
             audio::tone(250, 30, 350);
