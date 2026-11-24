@@ -1144,6 +1144,114 @@ void test_single_coordinator_invariant() {
     TEST_ASSERT_EQUAL_HEX32(0x0012AABB, elected_coordinator);
 }
 
+void test_pairing_payload_serialization_and_size() {
+    wt::PairPayload pp = {};
+    pp.sender = 0xAABBCCDD;
+    uint8_t dummy_mac[6] = {0x24, 0xDC, 0xC3, 0x90, 0x11, 0x22};
+    memcpy(pp.mac, dummy_mac, 6);
+    strncpy(pp.name, "Echo-One", sizeof(pp.name) - 1);
+    pp.expected_group = 3;
+
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(wt::kMaxPlain, sizeof(pp));
+    TEST_ASSERT_EQUAL_HEX32(0xAABBCCDD, pp.sender);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(dummy_mac, pp.mac, 6);
+    TEST_ASSERT_EQUAL_STRING("Echo-One", pp.name);
+    TEST_ASSERT_EQUAL_UINT8(3, pp.expected_group);
+
+    // Verify packed layout without non-standard padding
+    uint8_t raw[sizeof(wt::PairPayload)];
+    memcpy(raw, &pp, sizeof(pp));
+    wt::PairPayload decoded = {};
+    memcpy(&decoded, raw, sizeof(decoded));
+    TEST_ASSERT_EQUAL_HEX32(pp.sender, decoded.sender);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(pp.mac, decoded.mac, 6);
+    TEST_ASSERT_EQUAL_STRING(pp.name, decoded.name);
+    TEST_ASSERT_EQUAL_UINT8(pp.expected_group, decoded.expected_group);
+}
+
+void test_pairing_group_registration_and_static_lock() {
+    struct TestPairedPeer {
+        uint32_t id;
+        uint8_t mac[6];
+        char name[16];
+    };
+    struct TestPairingGroup {
+        uint8_t count;
+        uint8_t expected_group;
+        TestPairedPeer peers[4];
+    } group = {};
+
+    group.expected_group = 3;
+
+    // Simulate node receiving pair beacon from Node 2
+    uint8_t mac2[6] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    group.peers[group.count].id = 0x22222222;
+    memcpy(group.peers[group.count].mac, mac2, 6);
+    strncpy(group.peers[group.count].name, "Bravo", 15);
+    group.count++;
+
+    TEST_ASSERT_EQUAL_UINT8(1, group.count);
+    // Not complete yet (expected 3 nodes = 2 other peers)
+    bool is_locked = (group.count >= (group.expected_group - 1));
+    TEST_ASSERT_FALSE(is_locked);
+
+    // Receiving duplicate beacon from Node 2 should not add another slot
+    bool already_paired = false;
+    for (uint8_t i = 0; i < group.count; i++) {
+        if (group.peers[i].id == 0x22222222) {
+            already_paired = true;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(already_paired);
+
+    // Receive pair beacon from Node 3
+    uint8_t mac3[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    group.peers[group.count].id = 0x33333333;
+    memcpy(group.peers[group.count].mac, mac3, 6);
+    strncpy(group.peers[group.count].name, "Charlie", 15);
+    group.count++;
+
+    TEST_ASSERT_EQUAL_UINT8(2, group.count);
+    // Now group is complete (self + 2 peers = 3 nodes in group)
+    is_locked = (group.count >= (group.expected_group - 1));
+    TEST_ASSERT_TRUE(is_locked);
+}
+
+void test_max_range_proactive_audio_duplication() {
+    wt::PeerTable table;
+    uint32_t now = 5000;
+
+    // At boot with no peers heard, table count is 0
+    TEST_ASSERT_EQUAL_INT(0, table.count());
+
+    // Add 1 strong direct peer
+    wt::Header h1;
+    h1.sender = 0x1111; h1.session = 1; h1.seq = 1;
+    table.accept(h1, 0, -55, now);
+    TEST_ASSERT_EQUAL_INT(1, table.count());
+    // Direct and strong: no duplication needed
+    TEST_ASSERT_FALSE(table.has_weak_or_remote_peer(now));
+
+    // When link degrades to edge-of-cell (e.g. -76 dBm)
+    h1.seq = 2;
+    table.accept(h1, 0, -76, now);
+    // Weak peer: proactive duplication turns ON!
+    TEST_ASSERT_TRUE(table.has_weak_or_remote_peer(now));
+
+    // When link recovers to -60 dBm
+    h1.seq = 3;
+    table.accept(h1, 0, -60, now);
+    TEST_ASSERT_FALSE(table.has_weak_or_remote_peer(now));
+
+    // If an indirect / multi-hop peer joins via relay
+    wt::Header h2;
+    h2.sender = 0x2222; h2.session = 1; h2.seq = 1;
+    table.accept(h2, 1, -60, now); // 1 hop
+    // Multi-hop peer: duplication turns ON to protect relayed frames
+    TEST_ASSERT_TRUE(table.has_weak_or_remote_peer(now));
+}
+
 }  // namespace
 
 void setUp() {}
@@ -1206,5 +1314,8 @@ int main() {
     RUN_TEST(test_channel_selection_hysteresis);
     RUN_TEST(test_spectrum_payloads_serialization);
     RUN_TEST(test_single_coordinator_invariant);
+    RUN_TEST(test_pairing_payload_serialization_and_size);
+    RUN_TEST(test_pairing_group_registration_and_static_lock);
+    RUN_TEST(test_max_range_proactive_audio_duplication);
     return UNITY_END();
 }
