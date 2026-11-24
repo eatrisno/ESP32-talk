@@ -179,6 +179,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         (h.type == wt::MSG_BEACON || h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
     if (is_bcast_type) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
+        register_unicast_peer(direct_macs[0]);
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
         if (e == ESP_ERR_ESPNOW_NO_MEM) {
             vTaskDelay(1);
@@ -190,6 +191,7 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         portEXIT_CRITICAL(&s_stats_mux);
     } else if (n_direct > 1 && n_direct <= 3 && !force_broadcast) {
         for (int i = 0; i < n_direct; i++) {
+            register_unicast_peer(direct_macs[i]);
             esp_err_t e = esp_now_send(direct_macs[i], frame, len);
             if (e == ESP_ERR_ESPNOW_NO_MEM) {
                 vTaskDelay(1);
