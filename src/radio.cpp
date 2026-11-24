@@ -31,9 +31,11 @@ struct Raw {
 struct Tx {
     uint8_t type;
     uint8_t len;
+    uint8_t dest_mac[6];
     uint8_t plain[wt::kMaxPlain];
 };
 
+static bool s_repeater_mode = false;
 QueueHandle_t s_rxq, s_txq;
 SemaphoreHandle_t s_peers_mtx;
 TaskHandle_t s_task;
@@ -151,31 +153,31 @@ void transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
         uint32_t now = now_ms();
         for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
-            if (p->used && p->hops == 0 && (now - p->last_ms <= wt::kPeerTimeoutMs)) {
-                // If link is marginal (RSSI < -80 dBm or Uplink < -85 dBm), avoid blocking on 7x hardware MAC retries;
-                // fallback to broadcast so frames are sent instantly and forwarded by the mesh relay!
-                if (p->rssi < -80 || (p->uplink_rssi != 0 && p->uplink_rssi < -85)) {
-                    continue;
-                }
+            if (p->used && (now - p->last_ms <= wt::kPeerTimeoutMs)) {
                 bool has_mac = false;
                 for (int i = 0; i < 6; i++) {
                     if (p->mac[i] != 0) { has_mac = true; break; }
                 }
                 if (has_mac && n_direct < wt::kMaxPeers) {
-                    memcpy(direct_macs[n_direct++], p->mac, 6);
+                    bool already = false;
+                    for (int j = 0; j < n_direct; j++) {
+                        if (memcmp(direct_macs[j], p->mac, 6) == 0) { already = true; break; }
+                    }
+                    if (!already) {
+                        memcpy(direct_macs[n_direct++], p->mac, 6);
+                    }
                 }
             }
         }
         xSemaphoreGive(s_peers_mtx);
     }
 
-    // Audio and beacons are inherently group broadcast frames: they should be transmitted to kBroadcast
-    // in 1 frame without blocking on unicast MAC ACK retries. Unicast is reserved for targeted control messages.
+    // Audio, beacons, and distress are group broadcasts.
+    // Range responses, pings, pongs, voicemail, and pair acks can use targeted unicast when peers are known!
     wt::Header h;
     bool is_bcast_type = wt::read_header(frame, len, h) && 
-        (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON || h.type == wt::MSG_RANGE_REQ || 
-         h.type == wt::MSG_RANGE_RESP || h.type == wt::MSG_PING || h.type == wt::MSG_PONG ||
-         h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON || h.type == wt::MSG_PAIR_ACK);
+        (h.type == wt::MSG_AUDIO || h.type == wt::MSG_BEACON || 
+         h.type == wt::MSG_DISTRESS || h.type == wt::MSG_PAIR_BEACON);
     if (is_bcast_type) force_broadcast = true;
     if (n_direct == 1 && !force_broadcast) {
         esp_err_t e = esp_now_send(direct_macs[0], frame, len);
@@ -240,6 +242,7 @@ void handle_raw(Raw& r) {
     rx.hdr = h;
     rx.hops = static_cast<uint8_t>(wt::kDefaultTtl - h.ttl);
     rx.rssi = r.rssi;
+    memcpy(rx.mac, r.mac, 6);
     rx.relay_id = (rx.hops > 0) ? (static_cast<uint32_t>(r.mac[2]) << 24 |
                                    static_cast<uint32_t>(r.mac[3]) << 16 |
                                    static_cast<uint32_t>(r.mac[4]) << 8  |
@@ -253,22 +256,22 @@ void handle_raw(Raw& r) {
     if (rx.hops == 0) {
         register_unicast_peer(r.mac);
     }
-    // Smart Selective Relay:
+    // Smart Selective Relay & Repeater Mode:
+    // When repeater mode is enabled, it ALWAYS relays any frame with ttl > 1 immediately (1-2ms hold-off).
     // Emergency / control frames (SOS, channel switch) always relay if ttl > 1.
-    // Routine frames (audio, beacon, ping/pong, range req/resp) only relay if there is a weak or multi-hop peer.
-    if (h.ttl > 1 && num_peers > 1) {
+    // Routine frames (audio, beacon, ping/pong, range req/resp) relay if there is a weak or multi-hop peer.
+    if (h.ttl > 1 && (num_peers > 1 || s_repeater_mode)) {
         bool do_relay = true;
-        if (h.type != wt::MSG_DISTRESS && h.type != wt::MSG_CHANNEL_SWITCH) {
+        if (!s_repeater_mode && h.type != wt::MSG_DISTRESS && h.type != wt::MSG_CHANNEL_SWITCH) {
             xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
             do_relay = s_peers.should_relay(h.sender, r.rssi, now_ms());
             xSemaphoreGive(s_peers_mtx);
         }
         if (do_relay) {
             r.data[3] = h.ttl - 1;
-            // 2..12 ms random hold-off; weaker receivers relay sooner because they are more
-            // likely at the edge of the group, where relays matter.
-            uint32_t base = r.rssi < -80 ? 2 : (r.rssi < -65 ? 5 : 8);
-            s_relay.push(r.data, r.len, now_ms() + base + esp_random() % 5);
+            // Expedite forwarding to 1..2 ms in repeater mode for high-speed seamless forwarding
+            uint32_t base = s_repeater_mode ? 1 : (r.rssi < -80 ? 2 : (r.rssi < -65 ? 5 : 8));
+            s_relay.push(r.data, r.len, now_ms() + base + (s_repeater_mode ? (esp_random() % 2) : (esp_random() % 5)));
         }
     }
     if (s_on_rx) s_on_rx(rx);
@@ -290,12 +293,29 @@ void task(void*) {
             h.seq = ++s_seq;
             size_t n;
             if (seal(h, t.plain, t.len, frame, &n)) {
-                bool force_bcast = (t.type == wt::MSG_BEACON);
-                transmit(frame, n, force_bcast);
-                // Proactive 2x Audio Redundancy: send duplicate frame for maximum wall penetration and zero-loss audio
-                if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                    transmit(frame, n, false);
+                bool is_explicit_dest = false;
+                for (int i = 0; i < 6; i++) {
+                    if (t.dest_mac[i] != 0) { is_explicit_dest = true; break; }
+                }
+                if (is_explicit_dest) {
+                    register_unicast_peer(t.dest_mac);
+                    esp_err_t e = esp_now_send(t.dest_mac, frame, n);
+                    if (e == ESP_ERR_ESPNOW_NO_MEM) {
+                        vTaskDelay(1);
+                        e = esp_now_send(t.dest_mac, frame, n);
+                    }
+                    portENTER_CRITICAL(&s_stats_mux);
+                    if (e == ESP_OK) s_stats.tx++;
+                    else s_stats.tx_fail++;
+                    portEXIT_CRITICAL(&s_stats_mux);
+                } else {
+                    bool force_bcast = (t.type == wt::MSG_BEACON || t.type == wt::MSG_AUDIO || t.type == wt::MSG_DISTRESS);
+                    transmit(frame, n, force_bcast);
+                    // Proactive 2x Audio Redundancy: send duplicate frame for maximum wall penetration and zero-loss audio
+                    if (cfg::kDuplicateAudioFrames && t.type == wt::MSG_AUDIO) {
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        transmit(frame, n, false);
+                    }
                 }
             }
         }
@@ -371,23 +391,26 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     esp_wifi_set_country(&country);
 
     ESP_ERROR_CHECK(esp_wifi_start());
-    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR)
+    set_channel(ch);
+
+    uint8_t proto = cfg::kLongRange ? (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR)
                                     : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, proto));
 
     // Disable power saving to keep radio awake at full readiness
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Set ESP-NOW PHY rate: Pure LR 250k (-108 dBm max sensitivity, maximum range)
-    esp_now_rate_config_t rc;
-    fill_rate_config(s_rate_mode, rc);
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, rc.rate);
-
     // Maximize TX power (+20 dBm / +21 dBm)
     esp_wifi_set_max_tx_power(cfg::kTxPowerQdBm);
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(on_recv);
     esp_now_register_send_cb(on_sent);
+
+    // Set ESP-NOW PHY rate: Pure LR 250k (-108 dBm max sensitivity, maximum range)
+    esp_now_rate_config_t rc;
+    fill_rate_config(s_rate_mode, rc);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, rc.rate);
+
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, kBroadcast, 6);
     p.ifidx = WIFI_IF_STA;
@@ -397,7 +420,6 @@ bool start(uint8_t ch, uint32_t session, RxHandler on_rx) {
     if (rerr != ESP_OK) {
         ESP_LOGE(TAG, "failed to set broadcast rate config: %s", esp_err_to_name(rerr));
     }
-    set_channel(ch);
     int8_t pwr = 0;
     esp_wifi_get_max_tx_power(&pwr);
     ESP_LOGI(TAG, "node %08lx session %lu ch %u (phy %s, tx %d = %.2f dBm)",
@@ -419,15 +441,32 @@ bool set_channel(uint8_t ch) {
 uint8_t channel() { return s_channel; }
 uint32_t self_id() { return s_self; }
 
-bool send(wt::MsgType type, const uint8_t* plain, size_t len) {
+void set_repeater_mode(bool on) {
+    s_repeater_mode = on;
+    xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
+    s_peers.set_repeater_mode(on);
+    xSemaphoreGive(s_peers_mtx);
+}
+
+bool is_repeater_mode() {
+    return s_repeater_mode;
+}
+
+bool send_to(wt::MsgType type, const uint8_t* dest_mac, const uint8_t* plain, size_t len) {
     if (len > wt::kMaxPlain) return false;
     Tx t;
     t.type = type;
     t.len = static_cast<uint8_t>(len);
+    if (dest_mac) memcpy(t.dest_mac, dest_mac, 6);
+    else memset(t.dest_mac, 0, 6);
     memcpy(t.plain, plain, len);
     if (xQueueSend(s_txq, &t, 0) != pdTRUE) return false;
     xTaskNotifyGive(s_task);
     return true;
+}
+
+bool send(wt::MsgType type, const uint8_t* plain, size_t len) {
+    return send_to(type, nullptr, plain, len);
 }
 
 wt::PeerTable& peers() { return s_peers; }

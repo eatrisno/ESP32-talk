@@ -78,14 +78,32 @@ bool PeerTable::accept(const Header& h, uint8_t hops, int8_t rssi, uint32_t now_
         return false;
     }
     sessions_.put(h.sender, h.session, h.seq, now_ms);
+
     if (hops == 0) {
-        p->hops = 0;
-        p->rssi = rssi;
-        p->relay_id = 0;
-        if (mac) memcpy(p->mac, mac, 6);
-    } else if (is_new || p->hops != 0 || (now_ms - p->last_ms > 5000)) {
-        p->hops = hops;
+        p->direct_rssi = rssi;
+        p->last_direct_ms = now_ms;
+        // Nearest path evaluation:
+        // Direct path is prioritized when healthy (>= -82 dBm), if we were already direct,
+        // if no relay path exists, or if direct signal is better than relay signal.
+        if (rssi >= -82 || p->hops == 0 || (now_ms - p->last_ms > 3000) || rssi >= p->relay_rssi) {
+            p->hops = 0;
+            p->rssi = rssi;
+            p->relay_id = 0;
+            if (mac) memcpy(p->mac, mac, 6);
+        }
+    } else {
+        // Relayed path evaluation:
+        p->relay_rssi = rssi;
         p->relay_id = relay_id;
+        // Seamlessly switch to relay if direct link is absent/stale (> 3s),
+        // or if direct link has degraded (<-85 dBm) and relay provides a significantly stronger link (+6 dB)
+        bool direct_stale = (p->last_direct_ms == 0 || (now_ms - p->last_direct_ms > 3000));
+        bool direct_weak = (p->direct_rssi < -85);
+        if (is_new || direct_stale || (direct_weak && rssi > p->direct_rssi + 6)) {
+            p->hops = hops;
+            p->rssi = rssi;
+            if (mac) memcpy(p->mac, mac, 6); // Next-hop MAC is the relay node
+        }
     }
     p->last_ms = now_ms;
     return true;
@@ -114,6 +132,8 @@ int PeerTable::count() const {
 }
 
 bool PeerTable::should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const {
+    if (repeater_mode_) return true; // Dedicated repeater ALWAYS forwards all valid multi-hop traffic!
+
     int active_others = 0;
     bool needs_relay = false;
     for (const auto& p : peers_) {
@@ -130,6 +150,13 @@ bool PeerTable::should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms
     // If the sender was heard weakly, we act as a bridge
     if (rx_rssi < -78) return true;
     return needs_relay;
+}
+
+const Peer* PeerTable::get_nearest_peer_path(uint32_t id) const {
+    for (const auto& p : peers_) {
+        if (p.used && p.id == id) return &p;
+    }
+    return nullptr;
 }
 
 bool PeerTable::has_weak_or_remote_peer(uint32_t now_ms) const {

@@ -87,6 +87,7 @@ enum MenuItem : uint8_t {
 static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
 static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
 static uint32_t s_last_ptt_ended_ms = 0; // timestamp when last PTT hold ended
+static bool s_repeater_mode = false;     // true = active dedicated repeater / range extender
 static bool s_menu_active = false;
 static MenuItem s_menu_item = MENU_VOICE_NOTE;
 static uint32_t s_last_menu_activity_ms = 0;
@@ -960,10 +961,8 @@ void on_rx(const radio::Rx& rx) {
         }
         case wt::MSG_PING:
             if (rx.len >= 4) {
-                // Ultra-low latency pong reply: immediate or 2ms stagger max to avoid RF collision
-                uint32_t stagger_ms = (radio::self_id() & 0x01) * 2;
-                if (stagger_ms > 0) vTaskDelay(pdMS_TO_TICKS(stagger_ms));
-                radio::send(wt::MSG_PONG, rx.plain, 4);
+                // Reply directly via unicast to the sender/relay MAC with 7x hardware retries
+                radio::send_to(wt::MSG_PONG, rx.mac, rx.plain, 4);
             }
             led::flash(led::Color::Cyan, 150);
             break;
@@ -1014,10 +1013,8 @@ void on_rx(const radio::Rx& rx) {
                 xSemaphoreTake(s_app_mtx, portMAX_DELAY);
                 strncpy(resp.name, s_name, sizeof(resp.name) - 1);
                 xSemaphoreGive(s_app_mtx);
-                // Stagger responder replies (5ms, 20ms, 35ms, 50ms) to eliminate simultaneous RF collision in mesh
-                uint32_t stagger_ms = (radio::self_id() & 0x03) * 15 + 5;
-                vTaskDelay(pdMS_TO_TICKS(stagger_ms));
-                radio::send(wt::MSG_RANGE_RESP, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
+                // Unicast response directly to requester/relay MAC with 7x hardware retries (zero task blocking)
+                radio::send_to(wt::MSG_RANGE_RESP, rx.mac, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
                 led::flash(led::Color::Cyan, 40);
             }
             break;
@@ -1324,7 +1321,7 @@ void run_range_test(int count) {
         req.total = count;
         uint16_t rx_before = s_range_stats.received;
         radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
-        vTaskDelay(pdMS_TO_TICKS(120));
+        vTaskDelay(pdMS_TO_TICKS(200));
         if (s_range_stats.received == rx_before) {
             audio::tone(250, 30, 350);
             printf("  probe #%-2u: [DROPPED / NO REPLY]\n", i + 1);
@@ -1543,10 +1540,11 @@ void print_status() {
     xSemaphoreTake(s_app_mtx, portMAX_DELAY);
     memcpy(name, s_name, sizeof name);
     xSemaphoreGive(s_app_mtx);
-    printf("\n%s  node %08lx  ch %u [STATIC LOCK Ch 13, Pure LR 250k]  vol %u%%  mic %s  mode %s%s%s\n", name, (unsigned long)radio::self_id(),
+    printf("\n%s  node %08lx  ch %u [STATIC LOCK Ch 13, Pure LR 250k]  vol %u%%  mic %s  mode %s%s%s%s\n", name, (unsigned long)radio::self_id(),
            radio::channel(),
            audio::volume(), audio::talking() ? "OPEN" : "muted",
            s_ptt_mode ? "PTT" : "VOX Hands-Free",
+           s_repeater_mode ? "  [REPEATER]" : "",
            s_debug_audio ? "  [DEBUG AUDIO]" : "  [QUIET AUDIO]",
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
@@ -1658,6 +1656,7 @@ void help() {
            "  sos        distress SOS on/off (same as holding button 2.5s)\n"
            "  range [N]  run range test with N probes (default 20, measures loss %% & RSSI)\n"
            "  walk       toggle walk range mode (1 probe/sec with acoustic tone)\n"
+           "  repeater   toggle active repeater / range extender mode (fast forwarding)\n"
            "  debug      toggle quiet mode vs verbose debug alerts\n"
            "  + / -      volume\n"
            "  p          ping all nodes\n"
@@ -1710,6 +1709,23 @@ void console_task(void*) {
             printf("Talk Mode: %s\n", s_ptt_mode ? "Toggle PTT" : "Hands-Free VOX");
             audio::prompt_clear();
             audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+        }
+        else if (!strncmp(line, "repeater", 8) || !strncmp(line, "rep", 3)) {
+            char* arg = line + (line[3] == 'e' ? 8 : 3);
+            while (*arg == ' ') arg++;
+            if (!strcmp(arg, "on") || !strcmp(arg, "1")) {
+                s_repeater_mode = true;
+            } else if (!strcmp(arg, "off") || !strcmp(arg, "0")) {
+                s_repeater_mode = false;
+            } else {
+                s_repeater_mode = !s_repeater_mode;
+            }
+            radio::set_repeater_mode(s_repeater_mode);
+            nvs_put_u8("rep", s_repeater_mode ? 1 : 0);
+            printf("\nRepeater Mode: %s\n", s_repeater_mode ? "ON (Active Range Extender, 1-2ms fast relay)" : "OFF (Normal Node)");
+            if (s_repeater_mode) {
+                printf("  Node will now forward all mesh traffic across boundaries with zero packet loss.\n\n");
+            }
         }
         else if (!strcmp(line, "debug")) {
             s_debug_audio = !s_debug_audio;
@@ -1878,6 +1894,11 @@ extern "C" void app_main() {
     s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = false; // Zero background probe: 100% airtime reserved for voice
     s_debug_audio = (nvs_u8("dbg", 0) != 0);
+    s_repeater_mode = (nvs_u8("rep", 0) != 0);
+    radio::set_repeater_mode(s_repeater_mode);
+    if (s_repeater_mode) {
+        ESP_LOGI(TAG, "Mode: ACTIVE REPEATER (Fast mesh range extender)");
+    }
     uint8_t mic_saved = nvs_u8("mic", 0);
 
     led::start();

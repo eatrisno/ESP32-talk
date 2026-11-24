@@ -17,7 +17,7 @@ constexpr uint32_t kPeerTimeoutMs = 15000;
 struct Peer {
     bool     used = false;
     uint32_t id = 0;
-    uint8_t  mac[6] = {};       // 6-byte MAC for unicast delivery with hardware retries
+    uint8_t  mac[6] = {};       // 6-byte next-hop MAC for unicast delivery with hardware retries
     char     name[12] = {};
     int8_t   rssi = 0;          // of the last packet heard directly from this peer
     uint8_t  hops = 0;          // 0 = heard directly
@@ -25,6 +25,9 @@ struct Peer {
     bool     talking = false;
     uint32_t relay_id = 0;      // ID of intermediate relay node (if hops > 0)
     int8_t   uplink_rssi = 0;   // Piggybacked Uplink RSSI reported by this peer
+    int8_t   direct_rssi = 0;   // Direct RSSI when heard directly
+    uint32_t last_direct_ms = 0;// Timestamp of last direct packet
+    int8_t   relay_rssi = 0;    // RSSI from relay when heard via relay
     ReplayWindow replay;
 };
 
@@ -62,11 +65,15 @@ public:
     int count() const;
     bool should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const;
     bool has_weak_or_remote_peer(uint32_t now_ms) const;
+    void set_repeater_mode(bool on) { repeater_mode_ = on; }
+    bool is_repeater_mode() const { return repeater_mode_; }
+    const Peer* get_nearest_peer_path(uint32_t id) const;
 
 private:
     Peer* slot_for(uint32_t id, uint32_t now_ms);
     Peer peers_[kMaxPeers];
     SessionMemory sessions_;
+    bool repeater_mode_ = false;
 };
 
 // Pending relays with cancellation. Owned by the radio task.

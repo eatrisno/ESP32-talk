@@ -1252,6 +1252,73 @@ void test_max_range_proactive_audio_duplication() {
     TEST_ASSERT_TRUE(table.has_weak_or_remote_peer(now));
 }
 
+void test_repeater_mode_and_fast_forwarding() {
+    wt::PeerTable table;
+    uint32_t now = 1000;
+    wt::Header h1, h2;
+    h1.sender = 0xAAAA; h1.session = 1; h1.seq = 1;
+    h2.sender = 0xBBBB; h2.session = 1; h2.seq = 1;
+
+    // Both peers are heard directly with strong RSSI (-60 dBm)
+    table.accept(h1, 0, -60, now);
+    table.accept(h2, 0, -60, now);
+
+    // In normal node mode: should_relay is false because both nodes are strong to this node
+    TEST_ASSERT_FALSE(table.is_repeater_mode());
+    TEST_ASSERT_FALSE(table.should_relay(0xAAAA, -60, now));
+
+    // When configured as an ACTIVE REPEATER:
+    table.set_repeater_mode(true);
+    TEST_ASSERT_TRUE(table.is_repeater_mode());
+    // Active repeater ALWAYS relays all multi-hop traffic, breaking the middle-node deadlock!
+    TEST_ASSERT_TRUE(table.should_relay(0xAAAA, -60, now));
+    TEST_ASSERT_TRUE(table.should_relay(0xBBBB, -60, now));
+}
+
+void test_nearest_path_route_selection() {
+    wt::PeerTable table;
+    uint32_t now = 1000;
+    const uint8_t direct_mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    const uint8_t relay_mac[6]  = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+
+    wt::Header h;
+    h.sender = 0x1234; h.session = 1; h.seq = 1;
+
+    // 1. Initially heard directly with strong signal (-70 dBm)
+    table.accept(h, 0, -70, now, direct_mac);
+    const wt::Peer* p = table.find(0x1234);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQUAL_UINT8(0, p->hops);
+    TEST_ASSERT_EQUAL_INT8(-70, p->rssi);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(direct_mac, p->mac, 6);
+
+    // 2. Node walks away, direct signal drops to -92 dBm
+    h.seq = 2;
+    now += 1000;
+    table.accept(h, 0, -92, now, direct_mac);
+    TEST_ASSERT_EQUAL_INT8(-92, p->direct_rssi);
+
+    // 3. Relayed copy arrives via Relay R (hops = 1, relay RSSI = -65 dBm)
+    h.seq = 3;
+    now += 100;
+    table.accept(h, 1, -65, now, relay_mac, 0x9999);
+    // Seamless route switch: active path is now through Relay R!
+    TEST_ASSERT_EQUAL_UINT8(1, p->hops);
+    TEST_ASSERT_EQUAL_INT8(-65, p->rssi);
+    TEST_ASSERT_EQUAL_UINT32(0x9999, p->relay_id);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(relay_mac, p->mac, 6); // next-hop MAC is relay MAC!
+
+    // 4. Node walks back in range (direct signal recovers to -72 dBm)
+    h.seq = 4;
+    now += 2000;
+    table.accept(h, 0, -72, now, direct_mac);
+    // Seamless route switch back to direct!
+    TEST_ASSERT_EQUAL_UINT8(0, p->hops);
+    TEST_ASSERT_EQUAL_INT8(-72, p->rssi);
+    TEST_ASSERT_EQUAL_UINT32(0, p->relay_id);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(direct_mac, p->mac, 6);
+}
+
 }  // namespace
 
 void setUp() {}
@@ -1317,5 +1384,7 @@ int main() {
     RUN_TEST(test_pairing_payload_serialization_and_size);
     RUN_TEST(test_pairing_group_registration_and_static_lock);
     RUN_TEST(test_max_range_proactive_audio_duplication);
+    RUN_TEST(test_repeater_mode_and_fast_forwarding);
+    RUN_TEST(test_nearest_path_route_selection);
     return UNITY_END();
 }

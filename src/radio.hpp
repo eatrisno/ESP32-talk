@@ -13,6 +13,7 @@ struct Rx {
     wt::Header hdr;
     uint8_t    hops;          // kDefaultTtl - ttl
     int8_t     rssi;
+    uint8_t    mac[6];        // 6-byte source MAC of transmitter (direct peer or relay)
     uint32_t   relay_id;      // 0 if direct, or ID of intermediate relay node
     uint8_t    plain[wt::kMaxPlain];
     size_t     len;
@@ -36,8 +37,13 @@ bool set_rate_mode(RateMode mode);
 RateMode rate_mode();
 const char* rate_mode_str(RateMode mode);
 
-// Encrypts and broadcasts. Safe from any task. Returns false if the queue is full.
+void set_repeater_mode(bool on);
+bool is_repeater_mode();
+
+// Encrypts and transmits. Safe from any task. Returns false if the queue is full.
 bool send(wt::MsgType type, const uint8_t* plain, size_t len);
+// Targeted unicast delivery with hardware retries and ACKs
+bool send_to(wt::MsgType type, const uint8_t* dest_mac, const uint8_t* plain, size_t len);
 
 wt::PeerTable& peers();   // read from the radio task or under peers_lock()
 void peers_lock();
