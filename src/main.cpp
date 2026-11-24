@@ -2141,9 +2141,32 @@ extern "C" void app_main() {
             req.total = 0;
             s_walk_pending = true;
             s_walk_probe_sent_ms = now;
-            radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+
+            uint8_t target_mac[6] = {};
+            bool has_target = false;
+            radio::peers_lock();
+            for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
+                if (p->used) {
+                    bool valid = false;
+                    for (int j = 0; j < 6; j++) {
+                        if (p->mac[j] != 0) { valid = true; break; }
+                    }
+                    if (valid) {
+                        memcpy(target_mac, p->mac, 6);
+                        has_target = true;
+                        break;
+                    }
+                }
+            }
+            radio::peers_unlock();
+
+            if (has_target) {
+                radio::send_to(wt::MSG_RANGE_REQ, target_mac, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+            } else {
+                radio::send(wt::MSG_RANGE_REQ, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+            }
         }
-        if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 400)) {
+        if (s_walk_mode && s_walk_pending && (now - s_walk_probe_sent_ms > 600)) {
             s_walk_pending = false;
             s_walk_miss_count++;
             if (s_walk_miss_count < 3) {

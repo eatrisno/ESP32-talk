@@ -210,3 +210,30 @@ When moving outdoors or into complex buildings:
      - Issue `repeater on` to Node 2.
      - Move Node 1 and Node 3 to opposite sides of the obstacle. Both nodes will seamlessly route packets through Node 2 via the new nearest-path routing algorithm.
 
+
+---
+
+## 7. Walk Mode vs. Live Talking Parity Analysis
+
+To guarantee that acoustic feedback in **Walk Mode** (`walk` command or audio menu) accurately reflects the real-world experience during **Live Talking** (voice conversation), both transmission pipelines have been unified:
+
+### Feature & Parameter Comparison Matrix
+
+| System Characteristic | Live Talking (`MSG_AUDIO`) | Walk Mode (`MSG_RANGE_REQ` / `RESP`) | Parity Status |
+| :--- | :--- | :--- | :--- |
+| **Radio Channel** | Primary Channel 13 (`2472 MHz`) | Primary Channel 13 (`2472 MHz`) | **Identical** |
+| **PHY Bitrate & Sensitivity**| Pure LR 250 kbps ($-108\text{ dBm}$ floor) | Pure LR 250 kbps ($-108\text{ dBm}$ floor) | **Identical** |
+| **Transmit Output Power** | $+20.00\text{ dBm}$ ($100\text{ mW}$) | $+20.00\text{ dBm}$ ($100\text{ mW}$) | **Identical** |
+| **Addressing Mode** | Targeted Unicast to Direct Peer MAC | Targeted Unicast to Direct Peer MAC | **Identical** (Unified) |
+| **Hardware MAC Retry Limit** | Up to 7 automatic retries with ACK | Up to 7 automatic retries with ACK | **Identical** (7x Retries) |
+| **AES-CCM Crypto & Auth** | Hardware AES-128-CCM (8-byte tag) | Hardware AES-128-CCM (8-byte tag) | **Identical** |
+| **Mesh Repeater Forwarding**| Expedited 1–2 ms hold-off relay | Expedited 1–2 ms hold-off relay | **Identical** |
+| **Airtime Management** | Voice takes priority; walk probes pause | Probing pauses automatically during voice | **Zero Airtime Collision** |
+| **Packet Redundancy** | 2x Frame Duplication (`kDuplicateAudioFrames`)| 600 ms ACK window + 3-miss hysteresis | **Matched Resilience** |
+
+### Signal Quality Mapping
+Walk Mode reports three acoustic zones and a computed link percentage:
+1. **NEAR (Strong)**: RSSI $\ge -75\text{ dBm}$ ($80\%\text{ to }100\%$ Link Margin). Crystal-clear audio with $> 33\text{ dB}$ margin above sensitivity floor. High double-chirp tone (800 Hz $\rightarrow$ 1000 Hz).
+2. **MID (Medium)**: RSSI $-75\text{ dBm}$ to $-90\text{ dBm}$ ($40\%\text{ to }80\%$ Link Margin). Completely readable voice through 2–3 interior walls. Solid single mid-tone (600 Hz).
+3. **FAR (Weak / Fringe)**: RSSI $-90\text{ dBm}$ to $-105\text{ dBm}$ ($5\%\text{ to }40\%$ Link Margin). Edge of coverage; audio jitter buffer applies concealment. Deep low warning pip (380 Hz).
+4. **OUT OF RANGE (Link Lost)**: RSSI $< -105\text{ dBm}$ or 3 consecutive dropped probes. Acoustic descending error buzz (200 Hz $\rightarrow$ 140 Hz) and spoken notification.
