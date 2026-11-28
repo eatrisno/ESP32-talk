@@ -84,7 +84,7 @@ bool JitterBuffer::pop(int16_t* out) {
     // A short burst (frames bunched up by the radio) drains by itself and is never cut.
     if (depth > kTargetDepth + 1) over_++;
     else over_ = 0;
-    if (over_ >= 25 && have) {
+    if (over_ >= 10 && have) {
         over_ = 0;
         s.full = false;
         next_++;

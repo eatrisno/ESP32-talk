@@ -106,6 +106,7 @@ struct PiggybackBeacon {
     int8_t   uplink_rssi;    // Piggybacked Uplink RSSI of peer
     uint32_t relay_id;       // Piggybacked Relay ID (0 if direct, or ID of relay hop)
     char     name[12];       // Node name
+    uint16_t voltage_mv;     // Supply/battery voltage in mV (0 = not wired / N/A)
 };
 #pragma pack(pop)
 static_assert(sizeof(VoicemailPayload) <= kMaxPlain, "VoicemailPayload exceeds max plain size");

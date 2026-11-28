@@ -27,6 +27,10 @@
 #include "led.hpp"
 #include "nvs.h"
 #include "driver/temperature_sensor.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_rom_sys.h"
 #include "nvs_flash.h"
 #include "radio.hpp"
 #include "range_test.hpp"
@@ -72,19 +76,79 @@ static uint32_t s_last_distress_rx_ms = 0;
 static volatile bool s_vm_recording = false;
 static bool s_vm_inbox_has_message = false;
 static temperature_sensor_handle_t s_temp_sensor = nullptr;
+static adc_oneshot_unit_handle_t s_volt_adc = nullptr;
+static adc_cali_handle_t s_volt_cali = nullptr;
+static adc_channel_t s_volt_chan = ADC_CHANNEL_4;
+static volatile uint16_t s_voltage_mv = 0;
+
+void init_voltage_adc() {
+    adc_unit_t unit = ADC_UNIT_1;
+    if (adc_oneshot_io_to_channel(cfg::kPinVoltAdc, &unit, &s_volt_chan) != ESP_OK || unit != ADC_UNIT_1) {
+        ESP_LOGW(TAG, "kPinVoltAdc GPIO%d is not an ADC1 pin; voltage sense disabled", cfg::kPinVoltAdc);
+        return;
+    }
+    adc_oneshot_unit_init_cfg_t ucfg = {};
+    ucfg.unit_id = ADC_UNIT_1;
+    if (adc_oneshot_new_unit(&ucfg, &s_volt_adc) != ESP_OK) return;
+
+    adc_oneshot_chan_cfg_t ccfg = {};
+    ccfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    ccfg.atten = ADC_ATTEN_DB_12;
+    if (adc_oneshot_config_channel(s_volt_adc, s_volt_chan, &ccfg) != ESP_OK) {
+        adc_oneshot_del_unit(s_volt_adc);
+        s_volt_adc = nullptr;
+        return;
+    }
+    adc_cali_curve_fitting_config_t cal_cfg = {};
+    cal_cfg.unit_id = ADC_UNIT_1;
+    cal_cfg.chan = s_volt_chan;
+    cal_cfg.atten = ADC_ATTEN_DB_12;
+    cal_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    if (adc_cali_create_scheme_curve_fitting(&cal_cfg, &s_volt_cali) != ESP_OK) {
+        s_volt_cali = nullptr;
+    }
+}
+
+uint16_t read_voltage_mv() {
+    if (!s_volt_adc) return 0;
+    // Brief internal pulldown test distinguishes an unwired floating pin (<250 mV)
+    // from an external 100k+100k resistor divider (~700-1300 mV under ~45k pulldown).
+    gpio_pulldown_en(cfg::kPinVoltAdc);
+    esp_rom_delay_us(150);
+    int raw = 0, mv = 0;
+    bool ok = (adc_oneshot_read(s_volt_adc, s_volt_chan, &raw) == ESP_OK);
+    if (ok && s_volt_cali) adc_cali_raw_to_voltage(s_volt_cali, raw, &mv);
+    else if (ok) mv = (raw * 3100) / 4095;
+    gpio_pulldown_dis(cfg::kPinVoltAdc);
+    if (!ok || mv < 250) return 0;
+
+    esp_rom_delay_us(300);
+    int sum_mv = 0;
+    int valid = 0;
+    for (int i = 0; i < 8; i++) {
+        if (adc_oneshot_read(s_volt_adc, s_volt_chan, &raw) == ESP_OK) {
+            int sample_mv = 0;
+            if (s_volt_cali) adc_cali_raw_to_voltage(s_volt_cali, raw, &sample_mv);
+            else sample_mv = (raw * 3100) / 4095;
+            sum_mv += sample_mv;
+            valid++;
+        }
+    }
+    if (valid == 0) return 0;
+    float scaled = (static_cast<float>(sum_mv) / valid) * cfg::kVoltDividerRatio;
+    if (scaled < 0.0f) scaled = 0.0f;
+    if (scaled > 65535.0f) scaled = 65535.0f;
+    return static_cast<uint16_t>(scaled + 0.5f);
+}
 
 // --- Audio Voice Menu & PTT state ---
 enum MenuItem : uint8_t {
     MENU_VOICE_NOTE = 0,
-    MENU_TALK_MODE,
-    MENU_RADAR,
     MENU_WALK,
-    MENU_PAIR,
-    MENU_EXIT,
     MENU_COUNT
 };
 
-static bool s_ptt_mode = false;          // false = Hands-Free VOX, true = Classic PTT
+constexpr bool s_ptt_mode = true;        // Single mode: Classic PTT
 static bool s_ptt_active = false;        // currently actively transmitting via PTT hold
 static uint32_t s_last_ptt_ended_ms = 0; // timestamp when last PTT hold ended
 static bool s_repeater_mode = false;     // true = active dedicated repeater / range extender
@@ -101,7 +165,7 @@ static bool     s_debug_audio = false; // false = Quiet Mode, true = Verbose Deb
 
 // Max Range Lock: Default to static locked LR 250k (-108 dBm max sensitivity).
 // Adaptive rate (LR 250k <-> LR 500k) can be toggled via console 'rate auto'.
-static bool     s_adaptive_rate = false;
+static bool     s_adaptive_rate = true;
 static uint32_t s_rate_promote_start_ms = 0;
 
 void update_adaptive_rate(uint32_t now) {
@@ -431,6 +495,7 @@ void build_piggyback_beacon(wt::PiggybackBeacon& pb) {
     pb.uplink_rssi = s_last_peer_rssi;
     pb.relay_id = 0;
     memcpy(pb.name, s_name, sizeof(pb.name));
+    pb.voltage_mv = s_voltage_mv;
 }
 
 void broadcast_state() {
@@ -786,28 +851,6 @@ void handle_press(wt::Press p, int which) {
         if (!s_menu_active) {
             if (p == wt::Press::Click) {
                 enter_menu();
-            } else if (p == wt::Press::Long || p == wt::Press::Hold) {
-                // Fast shortcut: Hold BOOT button toggles Talk Mode (PTT <-> Hands-Free VOX) immediately!
-                s_ptt_mode = !s_ptt_mode;
-                nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-                if (s_ptt_mode && audio::talking()) {
-                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                    audio::set_talking(false);
-                    audio::set_ptt_active(false);
-                    xSemaphoreGive(s_app_mtx);
-                    broadcast_state();
-                } else if (!s_ptt_mode) {
-                    uint8_t mic_saved = nvs_u8("mic", 0);
-                    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                    audio::set_talking(mic_saved != 0);
-                    audio::set_ptt_active(false);
-                    xSemaphoreGive(s_app_mtx);
-                    broadcast_state();
-                }
-                audio::prompt_clear();
-                audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
-                led::flash(s_ptt_mode ? led::Color::Green : led::Color::Blue, 250);
-                printf("[Fast Toggle] Talk mode changed to %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
             }
             return;
         }
@@ -923,9 +966,10 @@ void on_rx(const radio::Rx& rx) {
         case wt::MSG_BEACON:
         case wt::MSG_JOIN:
         case wt::MSG_LEAVE: {
-            if (rx.len >= sizeof(wt::PiggybackBeacon)) {
-                wt::PiggybackBeacon pb;
-                memcpy(&pb, rx.plain, sizeof(pb));
+            constexpr size_t kLegacyBeaconLen = sizeof(wt::PiggybackBeacon) - sizeof(uint16_t);
+            if (rx.len >= kLegacyBeaconLen) {
+                wt::PiggybackBeacon pb = {};
+                memcpy(&pb, rx.plain, rx.len >= sizeof(wt::PiggybackBeacon) ? sizeof(pb) : kLegacyBeaconLen);
                 pb.name[sizeof(pb.name) - 1] = 0;
                 radio::peers_lock();
                 wt::Peer* p = radio::peers().find(id);
@@ -935,6 +979,7 @@ void on_rx(const radio::Rx& rx) {
                 radio::peers().set_talking(id, now);
                 if (p) {
                     p->uplink_rssi = pb.uplink_rssi;
+                    p->voltage_mv = pb.voltage_mv;
                     if (rx.relay_id) p->relay_id = rx.relay_id;
                 }
                 radio::peers_unlock();
@@ -1452,21 +1497,8 @@ void announce_main_menu_item() {
         case MENU_VOICE_NOTE:
             audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
             break;
-        case MENU_TALK_MODE:
-            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
-            break;
-        case MENU_RADAR:
-            audio::prompt(wt::PROMPT_MENU_RADAR);
-            break;
         case MENU_WALK:
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
-            break;
-        case MENU_PAIR:
-            audio::prompt(wt::PROMPT_CONNECTED);
-            printf("[Menu] Item: 3-Node Pairing Mode (Hold to Start)\n");
-            break;
-        case MENU_EXIT:
-            audio::prompt(wt::PROMPT_MENU_EXIT);
             break;
         default:
             break;
@@ -1480,7 +1512,7 @@ void enter_menu() {
     audio::prompt_clear();
     audio::prompt(wt::PROMPT_MENU);
     audio::prompt(wt::PROMPT_MENU_VOICE_NOTE);
-    printf("[Menu] Entered Audio Menu. 1st: Voice Note. Click: next, Hold: action, Hold 2.5s: exit.\n");
+    printf("[Menu] Entered Audio Menu. 1: Voice Note, 2: Walk Mode. Click: next, Hold: action, Hold 2.5s: exit.\n");
 }
 
 void menu_next() {
@@ -1505,47 +1537,11 @@ void menu_action() {
             start_voicemail_recording();
             break;
 
-        case MENU_TALK_MODE:
-            s_ptt_mode = !s_ptt_mode;
-            nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-            if (s_ptt_mode && audio::talking()) {
-                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                audio::set_talking(false);
-                audio::set_ptt_active(false);
-                xSemaphoreGive(s_app_mtx);
-                broadcast_state();
-            } else if (!s_ptt_mode) {
-                uint8_t mic_saved = nvs_u8("mic", 0);
-                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                audio::set_talking(mic_saved != 0);
-                audio::set_ptt_active(false);
-                xSemaphoreGive(s_app_mtx);
-                broadcast_state();
-            }
-            audio::prompt_clear();
-            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
-            printf("[Menu] Talk mode toggled: %s\n", s_ptt_mode ? "Classic PTT" : "Hands-Free VOX");
-            break;
-
-        case MENU_RADAR:
-            printf("[Menu] Radar check triggered (staying in menu). Hold again to scan again, Click for next item.\n");
-            radar_check();
-            break;
-
         case MENU_WALK:
             toggle_walk_mode();
             audio::prompt_clear();
             audio::prompt(s_walk_mode ? wt::PROMPT_WALK_ON : wt::PROMPT_WALK_OFF);
             printf("[Menu] Walk mode toggled: %s\n", s_walk_mode ? "ON" : "OFF");
-            break;
-
-        case MENU_PAIR:
-            exit_menu(false);
-            start_pairing(3);
-            break;
-
-        case MENU_EXIT:
-            exit_menu(true);
             break;
 
         default:
@@ -1601,6 +1597,35 @@ void print_signal_strength() {
     printf("=========================================\n\n");
 }
 
+struct StatusPeerRow {
+    uint32_t id, age, relay_id;
+    uint16_t voltage_mv;
+    char name[12];
+    int8_t rssi, uplink_rssi;
+    bool relay, talking;
+};
+
+int snapshot_peers(StatusPeerRow* rows, int max_rows) {
+    int nrows = 0;
+    radio::peers_lock();  // copy only: printing here would stall the radio task
+    uint32_t now = now_ms();
+    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end() && nrows < max_rows; ++p) {
+        if (!p->used) continue;
+        StatusPeerRow& r = rows[nrows++];
+        r.id = p->id;
+        r.age = (now - p->last_ms) / 1000;
+        memcpy(r.name, p->name, sizeof r.name);
+        r.rssi = p->rssi;
+        r.uplink_rssi = p->uplink_rssi;
+        r.relay_id = p->relay_id;
+        r.voltage_mv = p->voltage_mv;
+        r.relay = p->hops != 0;
+        r.talking = p->talking;
+    }
+    radio::peers_unlock();
+    return nrows;
+}
+
 void print_status() {
     radio::Stats r = radio::stats();
     audio::Stats a = audio::stats();
@@ -1617,34 +1642,23 @@ void print_status() {
            audio::loopback() ? "  [loopback]" : "");
     usb_headset::print_info();
     printf("  peers:\n");
-    struct Row { uint32_t id, age; char name[12]; int8_t rssi, uplink_rssi; uint32_t relay_id; bool relay, talking; };
-    Row rows[wt::kMaxPeers];
-    int nrows = 0;
-    radio::peers_lock();  // copy only: printing here would stall the radio task
-    uint32_t now = now_ms();
-    for (const wt::Peer* p = radio::peers().begin(); p != radio::peers().end(); ++p) {
-        if (!p->used) continue;
-        Row& r = rows[nrows++];
-        r.id = p->id;
-        r.age = (now - p->last_ms) / 1000;
-        memcpy(r.name, p->name, sizeof r.name);
-        r.rssi = p->rssi;
-        r.uplink_rssi = p->uplink_rssi;
-        r.relay_id = p->relay_id;
-        r.relay = p->hops != 0;
-        r.talking = p->talking;
-    }
-    radio::peers_unlock();
+    StatusPeerRow rows[wt::kMaxPeers];
+    int nrows = snapshot_peers(rows, wt::kMaxPeers);
     for (int i = 0; i < nrows; i++) {
         char relay_str[24] = "direct";
         if (rows[i].relay) {
             snprintf(relay_str, sizeof(relay_str), "relay (via %04lx)", (unsigned long)(rows[i].relay_id & 0xFFFF));
         }
-        printf("    %-11s %08lx  %-16s  rssi %4d (%3d%%) [up %4d (%3d%%)]  seen %lus ago%s\n",
+        char volt_str[18] = "";
+        if (rows[i].voltage_mv > 0) {
+            snprintf(volt_str, sizeof(volt_str), "  volt %.2fV", rows[i].voltage_mv / 1000.0f);
+        }
+        printf("    %-11s %08lx  %-16s  rssi %4d (%3d%%) [up %4d (%3d%%)]%s  seen %lus ago%s\n",
                rows[i].name[0] ? rows[i].name : "?",
                (unsigned long)rows[i].id, relay_str,
                rows[i].rssi, wt::rssi_to_percent(rows[i].rssi),
                rows[i].uplink_rssi, wt::rssi_to_percent(rows[i].uplink_rssi),
+               volt_str,
                (unsigned long)rows[i].age, rows[i].talking ? "  talking" : "");
     }
     int8_t pwr = 0;
@@ -1666,10 +1680,13 @@ void print_status() {
     }
     float temp_c = 0.0f;
     if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
+    uint16_t volt_mv = s_voltage_mv;
+    char local_volt[24] = "N/A (GPIO5)";
+    if (volt_mv > 0) snprintf(local_volt, sizeof(local_volt), "%.2f V", volt_mv / 1000.0f);
     uint32_t free_ram = esp_get_free_heap_size() / 1024;
     uint32_t min_ram = esp_get_minimum_free_heap_size() / 1024;
-    printf("  system: Temp %.1f C | RAM Free %lu KB (min %lu KB)%s%s%s%s\n",
-           temp_c, (unsigned long)free_ram, (unsigned long)min_ram,
+    printf("  system: Temp %.1f C | Volt %s | RAM Free %lu KB (min %lu KB)%s%s%s%s\n",
+           temp_c, local_volt, (unsigned long)free_ram, (unsigned long)min_ram,
            s_menu_active ? "  [MENU ACTIVE]" : "",
            s_distress_active ? "  [DISTRESS ACTIVE]" : "",
            s_distress_peer != 0 ? "  [REMOTE SOS HEARD]" : "",
@@ -1677,6 +1694,44 @@ void print_status() {
     printf("  audio: sent %lu gated %lu played %lu lost %lu late %lu underrun %lu agc %.1fx\n\n",
            (unsigned long)a.frames_sent, (unsigned long)a.frames_gated, (unsigned long)a.frames_played,
            (unsigned long)a.lost, (unsigned long)a.late, (unsigned long)a.spk_underrun, a.agc_gain);
+}
+
+void print_telemetry() {
+    radio::Stats r = radio::stats();
+    audio::Stats a = audio::stats();
+    char name[sizeof s_name];
+    xSemaphoreTake(s_app_mtx, portMAX_DELAY);
+    memcpy(name, s_name, sizeof name);
+    xSemaphoreGive(s_app_mtx);
+
+    int8_t pwr = 0;
+    esp_wifi_get_max_tx_power(&pwr);
+    float temp_c = 0.0f;
+    if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
+
+    StatusPeerRow rows[wt::kMaxPeers];
+    int nrows = snapshot_peers(rows, wt::kMaxPeers);
+
+    printf("TELEM {\"node\":\"%s\",\"id\":\"%08lx\",\"ch\":%u,\"rate\":\"%s\","
+           "\"tx_dbm\":%.2f,\"volt_mv\":%u,\"temp_c\":%.1f,"
+           "\"tx\":%lu,\"rx\":%lu,\"tx_fail\":%lu,\"rx_drop\":%lu,\"relayed\":%lu,"
+           "\"audio_lost\":%lu,\"audio_underrun\":%lu,\"peers\":[",
+           name, (unsigned long)radio::self_id(), radio::channel(),
+           radio::rate_mode_str(radio::rate_mode()),
+           pwr * 0.25f, static_cast<unsigned>(s_voltage_mv), temp_c,
+           (unsigned long)r.tx, (unsigned long)r.rx, (unsigned long)r.tx_fail,
+           (unsigned long)r.rx_drop, (unsigned long)r.relayed,
+           (unsigned long)a.lost, (unsigned long)a.spk_underrun);
+    for (int i = 0; i < nrows; i++) {
+        printf("%s{\"name\":\"%s\",\"id\":\"%08lx\",\"rssi\":%d,\"up_rssi\":%d,"
+               "\"hops\":%u,\"volt_mv\":%u,\"age_s\":%lu}",
+               i > 0 ? "," : "",
+               rows[i].name[0] ? rows[i].name : "?",
+               (unsigned long)rows[i].id, rows[i].rssi, rows[i].uplink_rssi,
+               rows[i].relay ? 1u : 0u, static_cast<unsigned>(rows[i].voltage_mv),
+               (unsigned long)rows[i].age);
+    }
+    printf("]}\n");
 }
 
 void selftest() {
@@ -1767,19 +1822,9 @@ void console_task(void*) {
             else enter_menu();
         }
         else if (!strcmp(line, "ptt")) {
-            s_ptt_mode = !s_ptt_mode;
-            nvs_put_u8("ptt", s_ptt_mode ? 1 : 0);
-            if (audio::talking() || s_ptt_active) {
-                xSemaphoreTake(s_app_mtx, portMAX_DELAY);
-                s_ptt_active = false;
-                audio::set_ptt_active(false);
-                audio::set_talking(false);
-                xSemaphoreGive(s_app_mtx);
-                broadcast_state();
-            }
-            printf("Talk Mode: %s\n", s_ptt_mode ? "Toggle PTT" : "Hands-Free VOX");
+            printf("Talk Mode: Classic PTT (single mode)\n");
             audio::prompt_clear();
-            audio::prompt(s_ptt_mode ? wt::PROMPT_PTT_ON : wt::PROMPT_HANDS_FREE_ON);
+            audio::prompt(wt::PROMPT_PTT_ON);
         }
         else if (!strncmp(line, "repeater", 8) || !strncmp(line, "rep", 3)) {
             char* arg = line + (line[3] == 'e' ? 8 : 3);
@@ -1860,6 +1905,7 @@ void console_task(void*) {
         else if (!strcmp(line, "-")) volume_step(-10);
         else if (!strcmp(line, "p")) send_ping();
         else if (!strcmp(line, "s")) print_status();
+        else if (!strcmp(line, "telem")) print_telemetry();
         else if (!strcmp(line, "sig") || !strcmp(line, "signal") || !strcmp(line, "rssi")) print_signal_strength();
         else if (!strcmp(line, "loop")) {
             audio::set_loopback(!audio::loopback());
@@ -1963,10 +2009,8 @@ extern "C" void app_main() {
     s_primary_channel = ch;
     s_backup_channel = ch;
     audio::set_volume(nvs_u8("vol", cfg::kDefaultVolume));
-    s_ptt_mode = (nvs_u8("ptt", 1) != 0);
     s_walk_mode = false; // Zero background probe: 100% airtime reserved for voice
     s_debug_audio = (nvs_u8("dbg", 0) != 0);
-    uint8_t mic_saved = nvs_u8("mic", 0);
 
     led::start();
     led::set(led::Color::Blue);
@@ -1989,10 +2033,6 @@ extern "C" void app_main() {
         ESP_LOGI(TAG, "Mode: ACTIVE REPEATER (Fast mesh range extender)");
     }
     audio::start();
-    if (!s_ptt_mode && mic_saved) {
-        audio::set_talking(true);
-        ESP_LOGI(TAG, "Restored mic state: OPEN (Hands-Free VOX)");
-    }
     if (s_walk_mode) {
         s_range_token = esp_random();
         s_walk_seq = 0;
@@ -2002,6 +2042,8 @@ extern "C" void app_main() {
     if (temperature_sensor_install(&temp_cfg, &s_temp_sensor) == ESP_OK) {
         temperature_sensor_enable(s_temp_sensor);
     }
+    init_voltage_adc();
+    s_voltage_mv = read_voltage_mv();
     usb_headset::start(on_hid_buttons, on_headset_state);
     xTaskCreatePinnedToCore(console_task, "console", 8192, nullptr, 3, nullptr, 0);
     printf("\n%s ready on channel %u (mode: %s, audio: %s). Type 'h' for commands.\n", s_name, ch,
@@ -2013,10 +2055,14 @@ extern "C" void app_main() {
     uint8_t last_hid = 0;
     uint32_t hid_talk_start = 0;
     bool hid_talk_long_sent = false;
-    uint32_t last_beacon = 0, talk_since = 0;
+    uint32_t last_beacon = 0, last_volt_ms = 0, talk_since = 0;
     for (;;) {
         uint32_t now = now_ms();
         uint8_t hid = s_hid_down;
+        if (now - last_volt_ms >= 10000) {
+            last_volt_ms = now;
+            s_voltage_mv = read_voltage_mv();
+        }
 
         static bool s_ready_announced = false;
         if (!s_ready_announced && usb_headset::spk_ready()) {

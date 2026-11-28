@@ -13,6 +13,10 @@ constexpr gpio_num_t kPinVolDown = GPIO_NUM_2;
 constexpr gpio_num_t kPinLed = GPIO_NUM_48;     // WS2812 on ESP32-S3-DevKitC-1 (v1.0: 48, v1.1: 38)
 constexpr uint8_t kLedBrightness = 1;           // of 255; dim to absolute minimum (1 LSB) to eliminate 3V3 rail noise and save power
 
+// Optional supply/battery voltage sense via external resistor divider (e.g. 100k + 100k to GPIO5)
+constexpr gpio_num_t kPinVoltAdc = GPIO_NUM_5;  // ADC1_CH4
+constexpr float      kVoltDividerRatio = 2.0f;  // 2:1 divider (reports 0 / N/A until wired)
+
 // Radio: Hard-locked to Channel 13 (2472 MHz), Pure LR 250k, 20 dBm TX power, -108 dBm sensitivity.
 constexpr uint8_t kDefaultChannel = 13;          // Static Lock: Ch 13 (2472 MHz)
 constexpr uint8_t kDefaultBackupChannel = 13;   // Static Lock: Zero Channel Hopping
@@ -21,7 +25,7 @@ constexpr int8_t  kTxPowerQdBm = 84;            // 21 dBm (clamped to 20 dBm / 1
 // (vs -90 dBm on OFDM) for dramatically improved range through obstacles and distance.
 constexpr bool    kLongRange = true;
 constexpr bool    kDuplicateAudioFrames = true; // send voice frames with duplicate redundancy for resilience against packet loss at range edge
-constexpr uint32_t kBeaconMs = 3000;
+constexpr uint32_t kBeaconMs = 5000;
 
 // Talk
 constexpr uint32_t kMaxTalkMs = 0;              // 0 = disabled (never auto-mute, stay ON until user turns it OFF)

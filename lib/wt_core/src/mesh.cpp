@@ -159,11 +159,11 @@ const Peer* PeerTable::get_nearest_peer_path(uint32_t id) const {
     return nullptr;
 }
 
-bool PeerTable::has_weak_or_remote_peer(uint32_t now_ms) const {
+bool PeerTable::has_weak_or_remote_peer(uint32_t now_ms, int8_t weak_rssi_dbm) const {
     for (const auto& p : peers_) {
         if (!p.used) continue;
         if (now_ms - p.last_ms > kPeerTimeoutMs) continue;
-        if (p.hops > 0 || p.rssi < -75 || (p.uplink_rssi != 0 && p.uplink_rssi < -75)) {
+        if (p.hops > 0 || p.rssi < weak_rssi_dbm || (p.uplink_rssi != 0 && p.uplink_rssi < weak_rssi_dbm)) {
             return true;
         }
     }

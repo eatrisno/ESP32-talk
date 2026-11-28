@@ -1,0 +1,370 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": -95 },
+              { "color": "yellow", "value": -85 },
+              { "color": "green", "value": -75 }
+            ]
+          },
+          "unit": "dBm"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\" and r._field == \"downlink_rssi\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "Downlink RSSI",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": -95 },
+              { "color": "yellow", "value": -85 },
+              { "color": "green", "value": -75 }
+            ]
+          },
+          "unit": "dBm"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\" and r._field == \"uplink_rssi\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "Uplink RSSI",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 8 },
+              { "color": "red", "value": 15 }
+            ]
+          },
+          "unit": "dB"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\" and r._field == \"asymmetry_db\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> map(fn: (r) => ({ r with _value: if r._value < 0.0 then -r._value else r._value }))\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "Link Asymmetry |Δ|",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 10 },
+              { "color": "green", "value": 20 }
+            ]
+          },
+          "unit": "dB"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\" and r._field == \"margin_db\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "Margin above -108 dBm",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "noValue": "N/A (wire GPIO5)",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 3.4 },
+              { "color": "green", "value": 3.7 }
+            ]
+          },
+          "unit": "volt"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"node_health\" and r._field == \"voltage_v\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "Node Voltage",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 55 },
+              { "color": "red", "value": 70 }
+            ]
+          },
+          "unit": "celsius"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"node_health\" and r._field == \"temp_c\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> last()",
+          "refId": "A"
+        }
+      ],
+      "title": "ESP32-S3 Temp",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": true,
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "max": -10,
+          "min": -115,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": -95 },
+              { "color": "red", "value": -108 }
+            ]
+          },
+          "unit": "dBm"
+        }
+      },
+      "gridPos": { "h": 9, "w": 14, "x": 0, "y": 4 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "min", "max"] } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\")\n  |> filter(fn: (r) => r._field == \"downlink_rssi\" or r._field == \"uplink_rssi\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Range Signal Strength (Downlink vs Uplink RSSI)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true },
+          "unit": "dB"
+        }
+      },
+      "gridPos": { "h": 9, "w": 10, "x": 14, "y": 4 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "min", "max"] } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\")\n  |> filter(fn: (r) => r._field == \"margin_db\" or r._field == \"asymmetry_db\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Link Margin & Direction Asymmetry (dB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "spanNulls": true },
+          "noValue": "No voltage wired yet (connect divider to GPIO5)",
+          "unit": "volt"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min", "max"] } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"node_health\" and r._field == \"voltage_v\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Node Supply / Battery Voltage (GPIO5 2:1 Divider)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true },
+          "unit": "celsius"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"node_health\" and r._field == \"temp_c\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "ESP32-S3 Chip Temperature",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50 },
+          "max": 100,
+          "min": 0,
+          "unit": "percent"
+        }
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"rf_link\" and r._field == \"loss_pct\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Probe Packet Loss %",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+          "query": "from(bucket: \"rf_telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"node_health\")\n  |> filter(fn: (r) => r._field == \"tx_fail\" or r._field == \"rx_drop\" or r._field == \"audio_lost\")\n  |> filter(fn: (r) => r.label =~ /^${label:regex}$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Cumulative Radio / Audio Error Counters",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "2s",
+  "schemaVersion": 39,
+  "tags": ["esp32-s3", "walkie-talkie", "rf"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "influxdb", "uid": "influxdb-wt" },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"rf_telemetry\", tag: \"label\")",
+        "includeAll": true,
+        "multi": false,
+        "name": "label",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"rf_telemetry\", tag: \"label\")",
+        "refresh": 2,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "ESP32-S3 Walkie-Talkie — Range & Voltage",
+  "uid": "wt-range-voltage",
+  "version": 1
+}

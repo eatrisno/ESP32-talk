@@ -226,7 +226,7 @@ void hid_if_cb(hid_host_device_handle_t h, const hid_host_interface_event_t ev, 
         if (ev == HID_HOST_INTERFACE_EVENT_DISCONNECTED) hid_host_device_close(h);
         return;
     }
-    ESP_LOGI(TAG, "HID event: %d", (int)ev);
+    ESP_LOGD(TAG, "HID event: %d", (int)ev);
     if (ev == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
         uint8_t r[64];
         size_t len = 0;
@@ -237,7 +237,7 @@ void hid_if_cb(hid_host_device_handle_t h, const hid_host_interface_event_t ev, 
         }
         uint8_t mask = 0;
         uint8_t now = d->parser.decode(r, len, &mask);
-        ESP_LOGI(TAG, "HID in (%u B): now=0x%02x mask=0x%02x data=[%02x %02x %02x %02x]",
+        ESP_LOGD(TAG, "HID in (%u B): now=0x%02x mask=0x%02x data=[%02x %02x %02x %02x]",
                  (unsigned)len, now, mask, len > 0 ? r[0] : 0, len > 1 ? r[1] : 0,
                  len > 2 ? r[2] : 0, len > 3 ? r[3] : 0);
         // A report only says something about the buttons it carries: keep the others.

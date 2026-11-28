@@ -118,7 +118,7 @@ void mic_task(void*) {
             for (auto& s : frame) s = wt::clip16(dc.run(s));
             // Gate first, on the frame before gain, so a gain change never opens or closes it.
             bool voice = gate.update(frame, wt::kFrameSamples);  // learns the noise floor even when muted
-            agc.process(frame, wt::kFrameSamples, ptt || gate.speech_now());
+            agc.process(frame, wt::kFrameSamples, gate.speech_now());
             if (!active) continue;
             if (ptt && ptt_lead_mute_frames > 0) {
                 ptt_lead_mute_frames--;
@@ -136,7 +136,7 @@ void mic_task(void*) {
                 if (s_vm_cb) s_vm_cb(a);
                 continue;
             }
-            bool should_gate = !ptt && !cfg::kContinuousStream;
+            bool should_gate = !cfg::kContinuousStream;
             if (should_gate && (!voice || s_prompts.busy()) && !s_loopback) {
                 s_stats.frames_gated++;
                 if (was_sending) {

@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB-WalkieTalkie
+    uid: influxdb-wt
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    isDefault: true
+    editable: true
+    jsonData:
+      version: Flux
+      organization: walkie-talkie
+      defaultBucket: rf_telemetry
+      tlsSkipVerify: true
+    secureJsonData:
+      token: wt-local-dev-token-2026

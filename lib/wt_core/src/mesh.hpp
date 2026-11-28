@@ -28,6 +28,7 @@ struct Peer {
     int8_t   direct_rssi = 0;   // Direct RSSI when heard directly
     uint32_t last_direct_ms = 0;// Timestamp of last direct packet
     int8_t   relay_rssi = 0;    // RSSI from relay when heard via relay
+    uint16_t voltage_mv = 0;    // Peer supply/battery voltage in mV (0 = N/A)
     ReplayWindow replay;
 };
 
@@ -64,7 +65,7 @@ public:
     const Peer* end() const { return peers_ + kMaxPeers; }
     int count() const;
     bool should_relay(uint32_t sender_id, int8_t rx_rssi, uint32_t now_ms) const;
-    bool has_weak_or_remote_peer(uint32_t now_ms) const;
+    bool has_weak_or_remote_peer(uint32_t now_ms, int8_t weak_rssi_dbm = -75) const;
     void set_repeater_mode(bool on) { repeater_mode_ = on; }
     bool is_repeater_mode() const { return repeater_mode_; }
     const Peer* get_nearest_peer_path(uint32_t id) const;
