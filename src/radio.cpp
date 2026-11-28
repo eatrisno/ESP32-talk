@@ -20,6 +20,11 @@ namespace {
 
 const char* TAG = "radio";
 const uint8_t kBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Returns true if the MAC contains at least one non-zero byte (i.e. is not the zero MAC).
+static inline bool mac_valid(const uint8_t* mac) {
+    for (int i = 0; i < 6; i++) if (mac[i] != 0) return true;
+    return false;
+}
 constexpr psa_algorithm_t kAlg = PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, wt::kTagLen);
 
 struct Raw {
@@ -97,14 +102,26 @@ static void fill_rate_config(RateMode mode, esp_now_rate_config_t& rc) {
     }
 }
 
-void register_unicast_peer(const uint8_t* mac) {
-    if (!mac || esp_now_is_peer_exist(mac)) return;
-    if (memcmp(mac, kBroadcast, 6) == 0) return;
-    bool non_zero = false;
-    for (int i = 0; i < 6; i++) {
-        if (mac[i] != 0) { non_zero = true; break; }
+// Cache of unicast MACs already registered with ESP-NOW (radio task only; esp_now_del_peer is never called).
+constexpr int kRegMacCap = wt::kMaxPeers * 2;
+uint8_t s_reg_macs[kRegMacCap][6];
+int s_reg_mac_count = 0;
+
+void cache_registered_mac(const uint8_t* mac) {
+    if (s_reg_mac_count < kRegMacCap) {
+        memcpy(s_reg_macs[s_reg_mac_count++], mac, 6);
     }
-    if (!non_zero) return;
+}
+
+void register_unicast_peer(const uint8_t* mac) {
+    if (!mac || memcmp(mac, kBroadcast, 6) == 0 || !mac_valid(mac)) return;
+    for (int i = 0; i < s_reg_mac_count; i++) {
+        if (memcmp(s_reg_macs[i], mac, 6) == 0) return;
+    }
+    if (esp_now_is_peer_exist(mac)) {
+        cache_registered_mac(mac);
+        return;
+    }
 
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, mac, 6);
@@ -112,6 +129,7 @@ void register_unicast_peer(const uint8_t* mac) {
     p.channel = 0;  // follow current channel
     esp_err_t err = esp_now_add_peer(&p);
     if (err == ESP_OK) {
+        cache_registered_mac(mac);
         esp_now_rate_config_t rc;
         fill_rate_config(s_rate_mode, rc);
         esp_err_t rerr = esp_now_set_peer_rate_config(mac, &rc);
@@ -120,6 +138,8 @@ void register_unicast_peer(const uint8_t* mac) {
         }
         ESP_LOGI(TAG, "registered unicast peer %02x:%02x:%02x:%02x:%02x:%02x (rate: %s)",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rate_mode_str(s_rate_mode));
+    } else if (err == ESP_ERR_ESPNOW_EXIST) {
+        cache_registered_mac(mac);
     }
 }
 
@@ -168,11 +188,7 @@ bool transmit(const uint8_t* frame, size_t len, bool force_broadcast = false) {
         uint32_t now = now_ms();
         for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
             if (p->used && (now - p->last_ms <= kUnicastFreshMs)) {
-                bool has_mac = false;
-                for (int i = 0; i < 6; i++) {
-                    if (p->mac[i] != 0) { has_mac = true; break; }
-                }
-                if (has_mac && n_direct < wt::kMaxPeers) {
+                if (mac_valid(p->mac) && n_direct < wt::kMaxPeers) {
                     bool already = false;
                     for (int j = 0; j < n_direct; j++) {
                         if (memcmp(direct_macs[j], p->mac, 6) == 0) { already = true; break; }
@@ -289,10 +305,7 @@ void task(void*) {
             h.seq = ++s_seq;
             size_t n;
             if (seal(h, t.plain, t.len, frame, &n)) {
-                bool is_explicit_dest = false;
-                for (int i = 0; i < 6; i++) {
-                    if (t.dest_mac[i] != 0) { is_explicit_dest = true; break; }
-                }
+                bool is_explicit_dest = mac_valid(t.dest_mac);
                 if (is_explicit_dest) {
                     register_unicast_peer(t.dest_mac);
                     send_espnow(t.dest_mac, frame, n, t.type != wt::MSG_AUDIO);
@@ -511,11 +524,7 @@ bool set_rate_mode(RateMode mode) {
     xSemaphoreTake(s_peers_mtx, portMAX_DELAY);
     for (const wt::Peer* p = s_peers.begin(); p != s_peers.end(); ++p) {
         if (p->used && p->hops == 0) {
-            bool has_mac = false;
-            for (int i = 0; i < 6; i++) {
-                if (p->mac[i] != 0) { has_mac = true; break; }
-            }
-            if (has_mac) {
+            if (mac_valid(p->mac)) {
                 esp_now_set_peer_rate_config(p->mac, &rc);
             }
         }

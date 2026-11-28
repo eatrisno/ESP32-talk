@@ -1,6 +1,12 @@
 #include "dsp.hpp"
 
 #include <cmath>
+#include <cstring>
+
+// IRAM_ATTR is defined by ESP-IDF; on host (native tests) it is a no-op.
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
 
 namespace wt {
 
@@ -42,10 +48,10 @@ void Resampler::init(uint32_t in_rate, uint32_t out_rate) {
     if (filter_out_) lp_.design(static_cast<float>(out_), 0.425f * lower);
 }
 
-size_t Resampler::process(const int16_t* in, size_t n, int16_t* out, size_t out_max) {
+size_t IRAM_ATTR Resampler::process(const int16_t* in, size_t n, int16_t* out, size_t out_max) {
     if (in_ == out_) {
         size_t m = n < out_max ? n : out_max;
-        for (size_t i = 0; i < m; i++) out[i] = in[i];
+        memmove(out, in, m * sizeof(int16_t));
         return m;
     }
     // buf_[0] is the last sample of the previous block, buf_[1..m] the new ones.
@@ -130,8 +136,18 @@ bool ToneQueue::render(int16_t* out, size_t n, float vol_scale) {
         uint32_t ramp = kVoiceRate / 200;  // 5 ms fade in/out, no clicks
         if (ramp * 2 > total) ramp = total / 2;
         float base_amp = (s.amp > 0 ? static_cast<float>(s.amp) : 9000.f) * vol_scale;
+        // Precompute angle-addition factors once per segment (avoids sinf per sample)
+        const float dw = 2.f * static_cast<float>(M_PI) * (s.freq != 0 ? s.freq : 0) / kVoiceRate;
+        float osc_s = sinf(phase_);
+        float osc_c = cosf(phase_);
+        const float sin_dw = sinf(dw);
+        const float cos_dw = cosf(dw);
         for (; i < n && pos_ < total; i++, pos_++) {
-            if (s.freq == 0) continue;
+            if (s.freq != 0) {
+                float ns = osc_s * cos_dw + osc_c * sin_dw;
+                float nc = osc_c * cos_dw - osc_s * sin_dw;
+                osc_s = ns; osc_c = nc;
+            }
             float amp = base_amp;
             if (ramp > 0 && pos_ < ramp) {
                 float x = static_cast<float>(pos_) / ramp;
@@ -141,12 +157,13 @@ bool ToneQueue::render(int16_t* out, size_t n, float vol_scale) {
                 float x = static_cast<float>(total - pos_) / ramp;
                 amp *= 0.5f * (1.f - cosf(static_cast<float>(M_PI) * x));
             }
-            phase_ += 2.f * static_cast<float>(M_PI) * s.freq / kVoiceRate;
-            if (phase_ > 2.f * static_cast<float>(M_PI)) phase_ -= 2.f * static_cast<float>(M_PI);
-            int32_t v = out[i] + static_cast<int32_t>(sinf(phase_) * amp);
+            if (s.freq == 0) continue;
+            int32_t v = out[i] + static_cast<int32_t>(osc_s * amp);
             out[i] = static_cast<int16_t>(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
             any = true;
         }
+        // Re-sync phase_ from oscillator state (once per segment, not per sample)
+        phase_ = atan2f(osc_s, osc_c);
         if (pos_ >= total) {
             head_ = (head_ + 1) % kCap;
             pos_ = 0;

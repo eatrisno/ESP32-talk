@@ -2,6 +2,11 @@
 
 #include <cstring>
 
+// IRAM_ATTR is defined by ESP-IDF; on host (native tests) it is a no-op.
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
+
 namespace wt {
 namespace {
 
@@ -43,10 +48,11 @@ void JitterBuffer::put(const AudioPayload& a) {
     }
     Slot& s = slots_[a.frame_no % kSlots];
     if (s.full && s.frame_no == a.frame_no) return;  // duplicate
-    AdpcmState st;
-    st.predictor = a.adpcm_pred;
-    st.index = static_cast<int8_t>(a.adpcm_index);
-    adpcm_decode(a.data, a.data_len, s.pcm, st);
+    // Store raw ADPCM bytes and encoder state; decoding is deferred to pop_slot()
+    // so the radio RX path (ISR context) does no floating-point work. (C2)
+    s.enc_state.predictor = a.adpcm_pred;
+    s.enc_state.index = static_cast<int8_t>(a.adpcm_index);
+    memcpy(s.adpcm, a.data, a.data_len);
     s.frame_no = a.frame_no;
     s.full = true;
     if (dist(a.frame_no, newest_) > 0) newest_ = a.frame_no;
@@ -58,7 +64,7 @@ int JitterBuffer::depth() const {
     return d < 0 ? 0 : d;
 }
 
-bool JitterBuffer::pop(int16_t* out) {
+bool IRAM_ATTR JitterBuffer::pop(int16_t* out) {
     if (!have_any_) return false;
     int depth = dist(newest_, next_) + 1;
     if (!started_) {
@@ -109,34 +115,42 @@ bool JitterBuffer::pop(int16_t* out) {
     return true;
 }
 
-bool JitterBuffer::pop_slot(Slot& s, int16_t* out) {
+bool IRAM_ATTR JitterBuffer::pop_slot(Slot& s, int16_t* out) {
+    // Decode ADPCM now (deferred from put) — radio RX path stays lean. (C2)
+    AdpcmState st = s.enc_state;
+    adpcm_decode(s.adpcm, kAdpcmBytes, out, st);
     if (concealed_ > 0) {
-        // Coming back from concealment: cross-fade over the first 5 ms so there is no step.
+        // Coming back from concealment: cross-fade over the first 5 ms (40 samples)
+        // to avoid a step discontinuity. Precompute reciprocal to avoid per-sample division. (B1)
         const size_t kFade = kFrameSamples / 8;
+        const float inv = 1.f / static_cast<float>(kFade + 1);
         for (size_t i = 0; i < kFade; i++) {
-            float a = static_cast<float>(i + 1) / (kFade + 1);
-            s.pcm[i] = static_cast<int16_t>(s.pcm[i] * a + tail_ * (1.f - a));
+            float a = static_cast<float>(i + 1) * inv;
+            out[i] = static_cast<int16_t>(out[i] * a + tail_ * (1.f - a));
         }
     }
-    memcpy(out, s.pcm, sizeof(s.pcm));
-    memcpy(last_, s.pcm, sizeof(s.pcm));
-    tail_ = s.pcm[kFrameSamples - 1];
+    memcpy(last_, out, kFrameSamples * sizeof(int16_t));
+    tail_ = out[kFrameSamples - 1];
     s.full = false;
     concealed_ = 0;
     next_++;
     return true;
 }
 
-void JitterBuffer::conceal(int16_t* out) {
+void IRAM_ATTR JitterBuffer::conceal(int16_t* out) {
     // First lost frame: repeat the last one, fading from its end level to 0 so neither edge
     // steps. Further lost frames: silence.
+    // Precompute reciprocals to replace per-sample division with multiply. (B2)
     concealed_++;
     if (concealed_ == 1) {
+        const float inv_n = 1.f / static_cast<float>(kFrameSamples);       // fade-out gain step
+        const float inv_8 = 8.f / static_cast<float>(kFrameSamples);       // = 1 / (kFrameSamples/8) lead-in blend
+        const size_t kBlend = kFrameSamples / 8;
         for (size_t i = 0; i < kFrameSamples; i++) {
-            float g = 1.f - static_cast<float>(i + 1) / kFrameSamples;
+            float g = 1.f - static_cast<float>(i + 1) * inv_n;
             // Start from where playback stopped (tail_), then follow the repeated frame.
-            float x = i < kFrameSamples / 8
-                          ? tail_ + (last_[i] - tail_) * (static_cast<float>(i + 1) / (kFrameSamples / 8))
+            float x = i < kBlend
+                          ? tail_ + (last_[i] - tail_) * (static_cast<float>(i + 1) * inv_8)
                           : last_[i];
             out[i] = static_cast<int16_t>(x * g);
         }
@@ -147,3 +161,4 @@ void JitterBuffer::conceal(int16_t* out) {
 }
 
 }  // namespace wt
+

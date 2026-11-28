@@ -40,7 +40,9 @@ struct Peer {
 // random value, possibly lower) is heard again after at most this long.
 class SessionMemory {
 public:
-    static constexpr int kCap = 64;
+    // kCap: max unique senders remembered for anti-replay after peer table eviction.
+    // Groups are bounded by kMaxPeers (8); 16 provides 2× headroom without wasting ~1 KB. (C3)
+    static constexpr int kCap = 16;
     static constexpr uint32_t kForgetMs = 10u * 60u * 1000u;
     // False if (session, seq) is not newer than the newest frame remembered for sender.
     bool newer(uint32_t sender, uint32_t session, uint32_t seq, uint32_t now_ms) const;

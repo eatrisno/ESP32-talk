@@ -362,6 +362,8 @@ size_t mic_read(uint8_t* buf, size_t max, uint32_t timeout_ms) {
 
 bool spk_write(const uint8_t* buf, size_t len, uint32_t timeout_ms) {
     if (!s_spk.ready) return false;
+    // const_cast: uac_host_device_write takes uint8_t* but does not write through it.
+    // The cast is safe as long as the driver API does not mutate the buffer (verified in driver source).
     return uac_host_device_write(s_spk.h, const_cast<uint8_t*>(buf), len, pdMS_TO_TICKS(timeout_ms)) == ESP_OK;
 }
 

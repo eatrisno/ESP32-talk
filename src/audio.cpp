@@ -1,5 +1,6 @@
 #include "audio.hpp"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "adpcm.hpp"
@@ -62,6 +63,8 @@ void mic_task(void*) {
     uint8_t voice_id = static_cast<uint8_t>(esp_random());
     uint16_t frame_no = 0;
     bool was_sending = false;
+    bool was_ptt_active = false;      // task-local: resets on task restart (B4)
+    int ptt_lead_mute_frames = 0;     // task-local: resets on task restart (B4)
     for (;;) {
         if (!usb_headset::mic_ready()) {
             cur_rate = 0;
@@ -94,7 +97,8 @@ void mic_task(void*) {
         s_stats.mic_bytes += got;
         size_t n = wt::pcm_to_mono(raw, got, f, mono, 1024, &pick);
         for (size_t i = 0; i < n; i++) {
-            int16_t a = mono[i] < 0 ? static_cast<int16_t>(mono[i] == -32768 ? 32767 : -mono[i]) : mono[i];
+            // Use int32_t abs to avoid UB: negating INT16_MIN as int16_t overflows. (B3)
+            int16_t a = static_cast<int16_t>(std::abs(static_cast<int32_t>(mono[i])));
             if (a > peak_acc) peak_acc = a;
         }
         if (++peak_blocks >= 100) {  // ~1 s
@@ -105,8 +109,7 @@ void mic_task(void*) {
         size_t m = rs.process(mono, n, v8, 512);
         bool ptt = s_ptt_active;
         bool active = s_talking || ptt || s_loopback || s_recording_vm;
-        static bool was_ptt_active = false;
-        static int ptt_lead_mute_frames = 0;
+        // Task-local (not static): resets correctly if the task were ever restarted. (B4)
         if (ptt && !was_ptt_active) {
             ptt_lead_mute_frames = 1;  // Discard first 1 frame (~40ms) to eliminate mechanical button click sound without extra lag
         }

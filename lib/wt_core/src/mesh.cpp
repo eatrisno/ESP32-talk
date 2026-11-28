@@ -20,6 +20,9 @@ Peer* PeerTable::slot_for(uint32_t id, uint32_t now_ms) {
         }
         if (!oldest || now_ms - p.last_ms > now_ms - oldest->last_ms) oldest = &p;
     }
+    // oldest is always non-null: peers_ has kMaxPeers > 0 entries, so at minimum
+    // the first entry is taken as either a free slot or the LRU used slot. (D1)
+    if (!oldest) return nullptr;  // unreachable with kMaxPeers > 0; guard against future resize
     *oldest = Peer();
     oldest->used = true;
     oldest->id = id;
@@ -193,6 +196,8 @@ void RelayQueue::cancel(const uint8_t* frame, size_t len) {
     for (auto& it : items_) {
         if (!it.used || it.sender != h.sender || it.session != h.session || it.seq != h.seq) continue;
         if (it.len != len) continue;
+        // Compare all bytes except byte 3 (TTL), which relays decrement legitimately.
+        // A forged header with a different TTL cannot therefore cancel real relays.
         if (memcmp(it.data, frame, 3) == 0 && memcmp(it.data + 4, frame + 4, len - 4) == 0)
             it.used = false;
     }

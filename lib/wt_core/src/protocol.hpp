@@ -109,7 +109,9 @@ struct PiggybackBeacon {
     uint16_t voltage_mv;     // Supply/battery voltage in mV (0 = not wired / N/A)
 };
 #pragma pack(pop)
-static_assert(sizeof(VoicemailPayload) <= kMaxPlain, "VoicemailPayload exceeds max plain size");
+// VoicemailPayload is currently 184 B; kMaxPlain is 226 B — 42 B headroom.
+// Assert fires when headroom drops below 10 B so we notice before hitting the actual limit.
+static_assert(sizeof(VoicemailPayload) + 10 <= kMaxPlain, "VoicemailPayload within 10 B of frame limit — check payload size");
 static_assert(sizeof(PiggybackBeacon) <= kMaxPlain, "PiggybackBeacon exceeds max plain size");
 
 struct Header {

@@ -31,12 +31,16 @@ public:
 
 private:
     struct Slot {
-        bool     full = false;
-        uint16_t frame_no = 0;
-        int16_t  pcm[kFrameSamples];
+        bool      full = false;
+        uint16_t  frame_no = 0;
+        // Store raw ADPCM (160 B) + state rather than decoded PCM (640 B):
+        // 4× smaller per slot → ~40 KB freed across all talker jitter buffers.
+        // Decoding is deferred to pop_slot() so the radio RX path stays lean.
+        uint8_t    adpcm[kAdpcmBytes];
+        AdpcmState enc_state;  // predictor + step index at frame start
     };
-    bool pop_slot(Slot& s, int16_t* out);
-    void conceal(int16_t* out);
+    bool IRAM_ATTR pop_slot(Slot& s, int16_t* out);
+    void IRAM_ATTR conceal(int16_t* out);
     Slot     slots_[kSlots];
     bool     started_ = false;
     bool     have_any_ = false;

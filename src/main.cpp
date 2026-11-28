@@ -43,6 +43,10 @@ const char* TAG = "app";
 
 char s_name[12] = "";
 nvs_handle_t s_nvs;
+// Deferred NVS commit: set dirty after any write, flush after 2 s of inactivity in the
+// main loop. Avoids a flash erase-write cycle on every volume step or PTT click.
+static bool     s_nvs_dirty = false;
+static uint32_t s_nvs_dirty_ms = 0;
 // Guards s_name, s_ping_* and the talk toggle: app task, console task and radio task use them.
 SemaphoreHandle_t s_app_mtx;
 volatile uint8_t s_hid_down = 0;
@@ -80,6 +84,15 @@ static adc_oneshot_unit_handle_t s_volt_adc = nullptr;
 static adc_cali_handle_t s_volt_cali = nullptr;
 static adc_channel_t s_volt_chan = ADC_CHANNEL_4;
 static volatile uint16_t s_voltage_mv = 0;
+
+// Per-peer Exponential Moving Average filter for RSSI smoothing (Fix: moved from static
+// local in on_rx() so it correctly resets when a peer is evicted from the table).
+struct PeerRssiFilter {
+    uint32_t id = 0;
+    float    smoothed_rssi = 0.f;
+    bool     inited = false;
+};
+static PeerRssiFilter s_peer_rssi_filters[wt::kMaxPeers];
 
 void init_voltage_adc() {
     adc_unit_t unit = ADC_UNIT_1;
@@ -279,7 +292,9 @@ uint8_t nvs_u8(const char* k, uint8_t def) {
 }
 void nvs_put_u8(const char* k, uint8_t v) {
     nvs_set_u8(s_nvs, k, v);
-    nvs_commit(s_nvs);
+    // Mark dirty; the main loop commits after 2 s of no further writes (reduces flash wear).
+    s_nvs_dirty = true;
+    s_nvs_dirty_ms = now_ms();
 }
 
 // --- Pairing Group & Zero-Scan Static Lock ---
@@ -388,17 +403,21 @@ void sound_all_clear() {
     audio::prompt(wt::PROMPT_EMERGENCY_OFF);
 }
 
+// File-scope so they reset cleanly across distress activations (not stuck in mid-blink)
+static uint32_t s_led_distress_flash_ms = 0;
+static bool     s_led_distress_red_on   = false;
+static uint32_t s_led_vm_flash_ms       = 0;
+static bool     s_led_vm_amber_on       = false;
+
 void update_led() {
     using led::Color;
     if (s_distress_active || s_distress_peer != 0) {
-        static uint32_t s_last_distress_flash = 0;
-        static bool s_red_on = false;
         uint32_t now = now_ms();
-        if (now - s_last_distress_flash >= 250) {
-            s_last_distress_flash = now;
-            s_red_on = !s_red_on;
+        if (now - s_led_distress_flash_ms >= 250) {
+            s_led_distress_flash_ms = now;
+            s_led_distress_red_on = !s_led_distress_red_on;
         }
-        led::set(s_red_on ? Color::Red : Color::Off);
+        led::set(s_led_distress_red_on ? Color::Red : Color::Off);
         return;
     }
 
@@ -409,14 +428,12 @@ void update_led() {
 
     // Voice Note recording: gentle soft Amber pulse to clearly show recording in progress
     if (s_vm_recording) {
-        static uint32_t s_last_vm_flash = 0;
-        static bool s_amber_on = false;
         uint32_t now = now_ms();
-        if (now - s_last_vm_flash >= 300) {
-            s_last_vm_flash = now;
-            s_amber_on = !s_amber_on;
+        if (now - s_led_vm_flash_ms >= 300) {
+            s_led_vm_flash_ms = now;
+            s_led_vm_amber_on = !s_led_vm_amber_on;
         }
-        led::set(s_amber_on ? Color::Amber : Color::Off);
+        led::set(s_led_vm_amber_on ? Color::Amber : Color::Off);
         return;
     }
 
@@ -457,6 +474,9 @@ void toggle_distress() {
     audio::prompt_clear();
     if (s_distress_active) {
         s_distress_activated_ms = now_ms();
+        // Reset LED blink state so the cycle always starts cleanly on activation
+        s_led_distress_flash_ms = 0;
+        s_led_distress_red_on   = false;
         printf("\n*** [DISTRESS ACTIVATED] Emergency SOS broadcasting! Click button to cancel. ***\n\n");
         audio::prompt(wt::PROMPT_EMERGENCY_ON);
         // Automatically enable microphone when emergency is activated!
@@ -584,6 +604,10 @@ static bool s_vm_outbox_pending = false;
 static VmStorage* s_vm_inbox = nullptr;
 static uint32_t s_last_received_vm_id = 0;
 static TaskHandle_t s_vm_playback_task = nullptr;
+// Graceful stop: set to true to request the playback worker to self-delete at the next frame
+// boundary. Never call vTaskDelete() on it directly — the worker may be inside audio::on_audio()
+// holding s_mtx, which would cause a permanent deadlock in the speaker task.
+static volatile bool s_vm_stop_requested = false;
 static constexpr uint32_t kVmLocalSender = 0xFFFFFFFE;
 
 void radar_check() {
@@ -718,8 +742,13 @@ void start_voicemail_recording() {
     printf("\n*** [VOICE MAIL RECORDING] Speak your message now (max 10s). Click button 1x when done to SEND. ***\n\n");
 }
 
-void flush_voicemail_to_mesh() {
-    if (!s_vm_storage || s_vm_storage->total_frames == 0) return;
+void vm_send_worker(void* arg) {
+    // Runs in its own task so the app task (buttons, LED, beacons) stays responsive
+    // during voicemail transmission. 250 frames × 15 ms = up to 3.75 s of airtime.
+    if (!s_vm_storage || s_vm_storage->total_frames == 0) {
+        vTaskDelete(nullptr);
+        return;
+    }
     uint16_t total = s_vm_storage->total_frames;
     printf("[Voice Mail] Broadcasting %u frames (%.1fs) to mesh...\n", total, total * 0.04f);
     for (uint16_t i = 0; i < total; i++) {
@@ -740,6 +769,13 @@ void flush_voicemail_to_mesh() {
     free(s_vm_storage);
     s_vm_storage = nullptr;
     s_vm_outbox_pending = false;
+    vTaskDelete(nullptr);
+}
+
+void flush_voicemail_to_mesh() {
+    if (!s_vm_storage || s_vm_storage->total_frames == 0) return;
+    // Dispatch to a background task; returns immediately so the app loop is not blocked.
+    xTaskCreate(vm_send_worker, "vm_send", 3072, nullptr, 4, nullptr);
 }
 
 void send_voicemail() {
@@ -786,7 +822,7 @@ void vm_playback_worker(void* arg) {
     led::flash(led::Color::Cyan, 120);
 
     for (uint16_t i = 0; i < total; i++) {
-        if (!s_vm_inbox_has_message) break;
+        if (!s_vm_inbox_has_message || s_vm_stop_requested) break;  // graceful stop
         const VmFrame& f = s_vm_inbox->frames[i];
         wt::AudioPayload a;
         a.voice_id = voice_id;
@@ -806,19 +842,26 @@ void vm_playback_worker(void* arg) {
 void play_inbox_voicemail() {
     if (!s_vm_inbox || s_vm_inbox->total_frames == 0) return;
     if (s_vm_playback_task) {
-        vTaskDelete(s_vm_playback_task);
+        // Request graceful stop: worker checks s_vm_stop_requested at each frame boundary
+        // and self-deletes. Never call vTaskDelete() — the worker may hold s_mtx inside
+        // audio::on_audio() and force-killing it would permanently deadlock the speaker task.
+        s_vm_stop_requested = true;
+        vTaskDelay(pdMS_TO_TICKS(50));  // give the worker up to 50 ms to exit cleanly
         s_vm_playback_task = nullptr;
     }
     audio::clear_talker(kVmLocalSender);
+    s_vm_stop_requested = false;
     xTaskCreate(vm_playback_worker, "vm_play", 3072, nullptr, 4, &s_vm_playback_task);
 }
 
 void dismiss_inbox_voicemail() {
     if (s_vm_playback_task) {
-        vTaskDelete(s_vm_playback_task);
+        s_vm_stop_requested = true;
+        vTaskDelay(pdMS_TO_TICKS(50));  // graceful stop (see play_inbox_voicemail)
         s_vm_playback_task = nullptr;
     }
     audio::clear_talker(kVmLocalSender);
+    s_vm_stop_requested = false;
     s_vm_inbox_has_message = false;
     if (s_vm_inbox) {
         free(s_vm_inbox);
@@ -1140,39 +1183,36 @@ void on_rx(const radio::Rx& rx) {
                         eff_rssi = static_cast<float>(resp.req_rssi);
                     }
 
-                    // Per-peer Exponential Moving Average filter to smooth out indoor multipath reflections
-                    static struct PeerRssiFilter {
-                        uint32_t id;
-                        float smoothed_rssi;
-                        bool inited;
-                    } s_peer_filters[wt::kMaxPeers] = {};
-
+                    // Per-peer Exponential Moving Average filter (file-scope array: resets on peer eviction)
                     int f_idx = -1;
                     for (int i = 0; i < wt::kMaxPeers; i++) {
-                        if (s_peer_filters[i].inited && s_peer_filters[i].id == id) {
+                        if (s_peer_rssi_filters[i].inited && s_peer_rssi_filters[i].id == id) {
                             f_idx = i;
                             break;
                         }
                     }
                     if (f_idx == -1) {
                         for (int i = 0; i < wt::kMaxPeers; i++) {
-                            if (!s_peer_filters[i].inited) {
+                            if (!s_peer_rssi_filters[i].inited) {
                                 f_idx = i;
-                                s_peer_filters[i].id = id;
-                                s_peer_filters[i].smoothed_rssi = eff_rssi;
-                                s_peer_filters[i].inited = true;
+                                s_peer_rssi_filters[i].id = id;
+                                s_peer_rssi_filters[i].smoothed_rssi = eff_rssi;
+                                s_peer_rssi_filters[i].inited = true;
                                 break;
                             }
                         }
                     } else {
-                        s_peer_filters[f_idx].smoothed_rssi = 0.65f * s_peer_filters[f_idx].smoothed_rssi + 0.35f * eff_rssi;
+                        s_peer_rssi_filters[f_idx].smoothed_rssi =
+                            0.65f * s_peer_rssi_filters[f_idx].smoothed_rssi + 0.35f * eff_rssi;
                     }
-                    float smoothed_rssi = (f_idx >= 0) ? s_peer_filters[f_idx].smoothed_rssi : eff_rssi;
+                    float smoothed_rssi = (f_idx >= 0) ? s_peer_rssi_filters[f_idx].smoothed_rssi : eff_rssi;
 
                     // Calibrated Log-Distance Path-Loss for ESP32-S3 (+20 dBm TX):
                     // Reference RSSI at 1 meter: ~ -46 dBm
                     // Path loss exponent n = 2.3 (indoor/outdoor corridor propagation)
-                    float est_m = powf(10.0f, (-46.0f - smoothed_rssi) / 23.0f);
+                    // expf equivalent to powf(10, x): avoids log step, ~2x faster on ESP32-S3 FPU
+                    constexpr float kLn10Over23 = 2.302585f / 23.0f;
+                    float est_m = expf((-46.0f - smoothed_rssi) * kLn10Over23);
                     if (est_m < 0.2f) est_m = 0.2f;
 
                     char who[20] = "";
@@ -1293,6 +1333,7 @@ void on_rx(const radio::Rx& rx) {
                         memcpy(p.mac, pp.mac, 6);
                         strncpy(p.name, pp.name, sizeof(p.name) - 1);
                         p.name[sizeof(p.name) - 1] = 0;
+                        // s_pairing_staging.count counts remote peers (excluding self); +1 and s_pairing_target_count include self.
                         printf("  -> Paired with [%s] (ID %08lx, MAC %02x:%02x:%02x:%02x:%02x:%02x) [%u/%u]\n",
                                p.name, (unsigned long)p.id, p.mac[0], p.mac[1], p.mac[2], p.mac[3], p.mac[4], p.mac[5],
                                s_pairing_staging.count + 1, s_pairing_target_count);
@@ -1330,6 +1371,7 @@ void on_rx(const radio::Rx& rx) {
                         memcpy(p.mac, pp.mac, 6);
                         strncpy(p.name, pp.name, sizeof(p.name) - 1);
                         p.name[sizeof(p.name) - 1] = 0;
+                        // count excludes self; +1 and s_pairing_target_count include self.
                         printf("  -> ACK from [%s] (ID %08lx) [%u/%u]\n",
                                p.name, (unsigned long)p.id, s_pairing_staging.count + 1, s_pairing_target_count);
                         audio::tone(1046, 30, 200);
@@ -1798,7 +1840,7 @@ void help() {
 }
 
 void console_task(void*) {
-    char line[48];
+    char line[64];  // 64 bytes: comfortable headroom for all current commands + future growth
     size_t n = 0;
     for (;;) {
         int c = getchar();
@@ -1950,7 +1992,9 @@ void console_task(void*) {
             strncpy(s_name, line + 5, sizeof s_name - 1);
             s_name[sizeof s_name - 1] = 0;
             nvs_set_str(s_nvs, "name", s_name);
-            nvs_commit(s_nvs);
+            // Deferred commit: will flush within 2 s (see main loop)
+            s_nvs_dirty = true;
+            s_nvs_dirty_ms = now_ms();
             xSemaphoreGive(s_app_mtx);
             broadcast_state();
             printf("name %.11s\n", line + 5);
@@ -2062,6 +2106,13 @@ extern "C" void app_main() {
         if (now - last_volt_ms >= 10000) {
             last_volt_ms = now;
             s_voltage_mv = read_voltage_mv();
+        }
+
+        // Deferred NVS commit: flush if dirty and no new writes in the last 2 s.
+        // Groups rapid writes (e.g. volume scroll, PTT clicks) into a single flash sector write.
+        if (s_nvs_dirty && (now - s_nvs_dirty_ms >= 2000)) {
+            nvs_commit(s_nvs);
+            s_nvs_dirty = false;
         }
 
         static bool s_ready_announced = false;

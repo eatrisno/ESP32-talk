@@ -10,9 +10,10 @@
 namespace wt {
 
 bool VoiceGate::update(const int16_t* x, size_t n) {
-    double acc = 0;
-    for (size_t i = 0; i < n; i++) acc += static_cast<double>(x[i]) * x[i];
-    rms_ = n ? sqrtf(static_cast<float>(acc / n)) : 0.f;
+    // float is sufficient: max 32767²×320 ≈ 3.4e11, well within float precision for relative comparisons.
+    float acc = 0.f;
+    for (size_t i = 0; i < n; i++) acc += static_cast<float>(x[i]) * static_cast<float>(x[i]);
+    rms_ = n ? sqrtf(acc / static_cast<float>(n)) : 0.f;
     if (frames_ < 25) {  // first second: take the quietest frame as the floor, send nothing
         floor_ = frames_ == 0 || rms_ < floor_ ? rms_ : floor_;
         if (floor_ < 30.f) floor_ = 30.f;
@@ -43,8 +44,10 @@ float pipeline_selftest(uint32_t mic_rate, uint32_t spk_rate) {
     static int16_t mic[960], v8[400], pending[kFrameSamples], frame[kFrameSamples];
     static int16_t up[kFrameSamples * 13];
     const double kHz = 1000.0, kAmp = 12000.0;
-    // Static, not on the stack: the jitter buffer alone is 11 KB and the console task that
-    // runs this on the device has 8 KB. Not reentrant (one self-test at a time).
+    // Static (~12 KB), not on-stack: the console task has 8 KB and JitterBuffer alone is ~11 KB.
+    // Trade-off: this permanently occupies RAM. An alternative is malloc/free around the call, but
+    // the self-test runs once at boot so the persistent cost is accepted to keep the code simple.
+    // Not reentrant (only one self-test at a time is expected).
     static Resampler down, upr;
     static JitterBuffer jb;
     down.init(mic_rate, kVoiceRate);
